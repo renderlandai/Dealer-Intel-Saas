@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Image from "next/image";
 import Link from "next/link";
@@ -51,7 +51,7 @@ interface Match {
   is_modified: boolean;
 }
 
-export default function MatchesPage() {
+function MatchesContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const statusFilter = searchParams.get("status") || "";
@@ -378,5 +378,29 @@ export default function MatchesPage() {
         </Card>
       </div>
     </div>
+  );
+}
+
+function MatchesLoading() {
+  return (
+    <div className="min-h-screen">
+      <Header
+        title="Matches"
+        description="Review and manage discovered asset matches"
+      />
+      <div className="p-8">
+        <div className="p-12 text-center text-muted-foreground text-sm">
+          Loading...
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default function MatchesPage() {
+  return (
+    <Suspense fallback={<MatchesLoading />}>
+      <MatchesContent />
+    </Suspense>
   );
 }
