@@ -1,0 +1,29 @@
+# Dealer Intel SaaS - Backend Dependencies
+# Python 3.11+
+
+# Web Framework
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Database & Auth
+supabase
+python-dotenv
+
+# AI / LLM
+langchain
+anthropic>=0.40.0  # Anthropic Claude Sonnet for all image analysis
+
+# Apify Integration
+apify-client
+
+# Image Processing
+pillow
+httpx
+aiohttp
+imagehash>=4.3.1
+
+# Utilities
+pydantic
+pydantic-settings
+numpy

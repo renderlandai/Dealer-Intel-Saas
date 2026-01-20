@@ -1,0 +1,295 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Sora:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Refined dark palette - deep slate with warm amber accent */
+    --background: 220 20% 4%;
+    --foreground: 45 15% 92%;
+
+    --card: 220 18% 7%;
+    --card-foreground: 45 15% 92%;
+
+    --popover: 220 18% 7%;
+    --popover-foreground: 45 15% 92%;
+
+    /* Warm amber/gold accent - distinctive and refined */
+    --primary: 38 92% 55%;
+    --primary-foreground: 220 20% 4%;
+
+    --secondary: 220 15% 12%;
+    --secondary-foreground: 45 15% 85%;
+
+    --muted: 220 15% 12%;
+    --muted-foreground: 220 10% 50%;
+
+    --accent: 38 92% 55%;
+    --accent-foreground: 220 20% 4%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 45 15% 92%;
+
+    --success: 158 64% 42%;
+    --success-foreground: 220 20% 4%;
+
+    --border: 220 15% 14%;
+    --input: 220 15% 12%;
+    --ring: 38 92% 55%;
+
+    --radius: 0.5rem;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Sora', system-ui, sans-serif;
+    font-feature-settings: "ss01" 1, "cv01" 1;
+    letter-spacing: -0.01em;
+  }
+
+  /* Refined typography scale */
+  h1, h2, h3, h4 {
+    font-weight: 600;
+    letter-spacing: -0.025em;
+  }
+
+  /* Monospace for data/numbers */
+  .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+@layer utilities {
+  /* Subtle noise texture overlay */
+  .texture-overlay {
+    position: relative;
+  }
+
+  .texture-overlay::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
+    opacity: 0.02;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* Geometric accent line */
+  .accent-line {
+    position: relative;
+  }
+
+  .accent-line::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    bottom: -2px;
+    width: 24px;
+    height: 2px;
+    background: hsl(var(--primary));
+  }
+
+  /* Data display styling */
+  .data-value {
+    @apply font-mono text-3xl font-semibold tracking-tight;
+  }
+
+  /* Sharp card style */
+  .card-sharp {
+    @apply relative overflow-hidden border border-border bg-card;
+    border-radius: 2px;
+  }
+
+  .card-sharp::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 3px;
+    height: 100%;
+    background: hsl(var(--primary));
+    opacity: 0;
+    transition: opacity 0.2s ease;
+  }
+
+  .card-sharp:hover::before {
+    opacity: 1;
+  }
+
+  /* Stat card with geometric design */
+  .stat-card {
+    @apply relative overflow-hidden bg-card p-5;
+    border: 1px solid hsl(var(--border));
+    border-radius: 2px;
+  }
+
+  .stat-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(
+      90deg,
+      transparent 0%,
+      hsl(var(--primary) / 0.5) 20%,
+      hsl(var(--primary)) 50%,
+      hsl(var(--primary) / 0.5) 80%,
+      transparent 100%
+    );
+  }
+
+  /* Grid background pattern */
+  .grid-bg {
+    background-image: 
+      linear-gradient(hsl(var(--border) / 0.3) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--border) / 0.3) 1px, transparent 1px);
+    background-size: 40px 40px;
+  }
+
+  /* Subtle gradient for sections */
+  .section-gradient {
+    background: linear-gradient(
+      180deg,
+      hsl(var(--background)) 0%,
+      hsl(220 18% 5%) 100%
+    );
+  }
+
+  /* Status indicators */
+  .status-dot {
+    @apply inline-block w-2 h-2 rounded-full;
+  }
+
+  .status-dot.active {
+    @apply bg-emerald-500;
+    box-shadow: 0 0 8px hsl(158 64% 42% / 0.5);
+  }
+
+  .status-dot.warning {
+    @apply bg-amber-500;
+    box-shadow: 0 0 8px hsl(38 92% 55% / 0.5);
+  }
+
+  .status-dot.error {
+    @apply bg-red-500;
+    box-shadow: 0 0 8px hsl(0 72% 51% / 0.5);
+  }
+
+  /* Hover lift effect */
+  .hover-lift {
+    @apply transition-all duration-200;
+  }
+
+  .hover-lift:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px hsl(220 20% 4% / 0.4);
+  }
+
+  /* Focus ring style */
+  .focus-ring {
+    @apply focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-1 focus-visible:ring-offset-background;
+  }
+}
+
+/* Custom scrollbar - minimal */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(220 15% 20%);
+  border-radius: 0;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(220 15% 30%);
+}
+
+/* Selection color */
+::selection {
+  background: hsl(38 92% 55% / 0.3);
+  color: hsl(45 15% 92%);
+}
+
+/* Animation keyframes */
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes slide-in-left {
+  from {
+    opacity: 0;
+    transform: translateX(-12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes pulse-soft {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+@keyframes number-tick {
+  0% { transform: translateY(100%); opacity: 0; }
+  100% { transform: translateY(0); opacity: 1; }
+}
+
+/* Animation utilities */
+.animate-fade-up {
+  animation: fade-up 0.4s ease-out forwards;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.3s ease-out forwards;
+}
+
+.animate-slide-in {
+  animation: slide-in-left 0.3s ease-out forwards;
+}
+
+.animate-pulse-soft {
+  animation: pulse-soft 2s ease-in-out infinite;
+}
+
+/* Stagger delays */
+.delay-75 { animation-delay: 75ms; }
+.delay-150 { animation-delay: 150ms; }
+.delay-225 { animation-delay: 225ms; }
+.delay-300 { animation-delay: 300ms; }
+.delay-375 { animation-delay: 375ms; }
+.delay-450 { animation-delay: 450ms; }
