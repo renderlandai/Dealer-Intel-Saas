@@ -206,6 +206,33 @@
   }
 }
 
+/* Mapbox popup overrides */
+.dealer-map-popup .mapboxgl-popup-content {
+  background: hsl(220 18% 7%);
+  border: 1px solid hsl(220 15% 14%);
+  border-radius: 6px;
+  padding: 8px 12px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.dealer-map-popup .mapboxgl-popup-tip {
+  border-top-color: hsl(220 18% 7%);
+}
+
+.mapboxgl-ctrl-group {
+  background: hsl(220 18% 7%) !important;
+  border: 1px solid hsl(220 15% 14%) !important;
+  border-radius: 4px !important;
+}
+
+.mapboxgl-ctrl-group button {
+  border-bottom-color: hsl(220 15% 14%) !important;
+}
+
+.mapboxgl-ctrl-group button span {
+  filter: invert(1);
+}
+
 /* Custom scrollbar - minimal */
 ::-webkit-scrollbar {
   width: 6px;

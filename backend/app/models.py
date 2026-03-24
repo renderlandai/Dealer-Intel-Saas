@@ -66,6 +66,7 @@ class OrganizationCreate(OrganizationBase):
 
 class Organization(OrganizationBase):
     id: UUID
+    logo_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -86,7 +87,7 @@ class CampaignBase(BaseModel):
 
 
 class CampaignCreate(CampaignBase):
-    organization_id: UUID
+    organization_id: Optional[UUID] = None
 
 
 class CampaignUpdate(BaseModel):
@@ -160,7 +161,7 @@ class DistributorBase(BaseModel):
 
 
 class DistributorCreate(DistributorBase):
-    organization_id: UUID
+    organization_id: Optional[UUID] = None
 
 
 class DistributorUpdate(BaseModel):
@@ -194,7 +195,7 @@ class Distributor(DistributorBase):
 # ============================================
 
 class ScanJobCreate(BaseModel):
-    organization_id: UUID
+    organization_id: Optional[UUID] = None
     campaign_id: Optional[UUID] = None
     source: ScanSource
     distributor_ids: Optional[List[UUID]] = None
@@ -210,9 +211,10 @@ class ScanJob(BaseModel):
     completed_at: Optional[datetime]
     total_items: int
     processed_items: int
-    matches_count: int = 0  # Actual matches found against campaign assets
+    matches_count: int = 0
     error_message: Optional[str]
     apify_run_id: Optional[str]
+    pipeline_stats: Optional[Dict[str, Any]] = None
     created_at: datetime
 
     class Config:
@@ -245,6 +247,9 @@ class Match(MatchBase):
     created_at: datetime
     reviewed_at: Optional[datetime]
     reviewed_by: Optional[UUID]
+    last_seen_at: Optional[datetime] = None
+    scan_count: int = 1
+    previous_compliance_status: Optional[str] = None
     
     # Joined fields
     asset_name: Optional[str] = None
@@ -385,6 +390,39 @@ class AnalysisSettingsResponse(BaseModel):
     borderline_match_upper: int
     calibration_factors: Dict[str, float]
     ensemble_weights: Dict[str, float]
+
+
+# ============================================
+# COMPLIANCE REPORTS
+# ============================================
+
+class ReportFormat(str, Enum):
+    PDF = "pdf"
+    CSV = "csv"
+
+
+class ReportScope(str, Enum):
+    FULL = "full"
+    CAMPAIGN = "campaign"
+    DISTRIBUTOR = "distributor"
+
+
+class ReportRequest(BaseModel):
+    format: ReportFormat = ReportFormat.PDF
+    scope: ReportScope = ReportScope.FULL
+    campaign_id: Optional[UUID] = None
+    distributor_id: Optional[UUID] = None
+    days: int = Field(default=30, ge=1, le=365)
+
+
+class ReportMeta(BaseModel):
+    generated_at: datetime
+    scope: str
+    format: str
+    days: int
+    total_matches: int
+    compliance_rate: float
+    violations_count: int
 
 
 

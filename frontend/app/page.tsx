@@ -1,5 +1,6 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
 import {
   Megaphone,
@@ -13,13 +14,23 @@ import {
   Search,
   Activity,
   Zap,
+  FileText,
+  Download,
 } from "lucide-react";
 import { Header } from "@/components/layout/header";
 import { StatCard } from "@/components/dashboard/stat-card";
 import { RecentMatches } from "@/components/dashboard/recent-matches";
 import { AlertsPanel } from "@/components/dashboard/alerts-panel";
 import { ChannelChart } from "@/components/dashboard/channel-chart";
-import DealerMap from "@/components/dashboard/DealerMap";
+import dynamic from "next/dynamic";
+const DealerMap = dynamic(() => import("@/components/dashboard/DealerMap"), {
+  ssr: false,
+  loading: () => (
+    <div className="h-[400px] w-full bg-secondary/20 animate-pulse flex items-center justify-center text-muted-foreground">
+      Loading Map...
+    </div>
+  ),
+});
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import {
@@ -30,6 +41,7 @@ import {
   useCampaigns,
   useDistributors,
 } from "@/lib/hooks";
+import { downloadComplianceReport } from "@/lib/api";
 
 interface Campaign {
   id: string;
@@ -48,16 +60,28 @@ export default function DashboardPage() {
     compliance_rate: 0,
     matches_today: 0,
     violations_count: 0,
-  }, isLoading: statsLoading } = useDashboardStats();
+  }, isLoading: statsLoading, isError: statsError } = useDashboardStats();
   
-  const { data: matches = [] } = useRecentMatches(10);
+  const { data: matches = [] } = useRecentMatches(6);
   const { data: alerts = [] } = useRecentAlerts(5);
   const { data: channelData = [] } = useChannelCoverage();
-  const { data: allCampaigns = [] } = useCampaigns();
-  const { data: distributors = [] } = useDistributors();
+  const { data: allCampaigns = [], isError: campaignsError } = useCampaigns();
+  const { data: distributors = [], isError: distributorsError } = useDistributors();
   
   const campaigns = allCampaigns.filter((c: Campaign) => c.status === "active");
   const loading = statsLoading;
+  const [downloading, setDownloading] = useState<string | null>(null);
+
+  const handleDownload = async (format: "pdf" | "csv") => {
+    setDownloading(format);
+    try {
+      await downloadComplianceReport(format);
+    } catch (error) {
+      console.error("Download failed:", error);
+    } finally {
+      setDownloading(null);
+    }
+  };
 
   return (
     <div className="min-h-screen">
@@ -67,6 +91,22 @@ export default function DashboardPage() {
       />
 
       <div className="p-8 space-y-8">
+        {/* Connection Error Banner */}
+        {(statsError || campaignsError || distributorsError) && (
+          <div className="flex items-center gap-3 p-4 border border-destructive/30 bg-destructive/5 opacity-0 animate-fade-up">
+            <AlertTriangle className="h-5 w-5 text-destructive flex-shrink-0" />
+            <div className="flex-1">
+              <p className="text-sm font-medium">Unable to connect to the server</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Make sure the backend is running on port 8000. Data shown below may be incomplete.
+              </p>
+            </div>
+            <Button size="sm" variant="outline" onClick={() => window.location.reload()}>
+              Retry
+            </Button>
+          </div>
+        )}
+
         {/* Top Key Metrics */}
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           <Link href="/matches?status=compliant" className="stat-card opacity-0 animate-fade-up delay-150 hover:border-success/40 transition-colors cursor-pointer">
@@ -107,100 +147,95 @@ export default function DashboardPage() {
 
         {/* War Room: Map + Feed */}
         <div className="grid gap-6 lg:grid-cols-3">
-          <div className="lg:col-span-2 opacity-0 animate-fade-up delay-100" style={{ animationFillMode: 'forwards' }}>
-            <Card className="h-full border-border/60">
-              <CardHeader className="pb-3 border-b border-border/50">
-                <CardTitle className="text-base flex items-center gap-2">
-                  <Radar className="h-5 w-5 text-primary" />
-                  Dealer Network Compliance Map
-                </CardTitle>
-                <CardDescription className="text-xs">
-                  Geospatial view of compliant (green) vs violating (red) dealers
-                </CardDescription>
-              </CardHeader>
-              <CardContent className="p-0">
-                <DealerMap distributors={distributors} />
-              </CardContent>
-            </Card>
-          </div>
-          <div className="opacity-0 animate-fade-up delay-200 space-y-6" style={{ animationFillMode: 'forwards' }}>
-            <RecentMatches matches={matches} />
-            <AlertsPanel alerts={alerts} />
-          </div>
-        </div>
+          <div className="lg:col-span-2 space-y-6">
+            <div className="opacity-0 animate-fade-up delay-100" style={{ animationFillMode: 'forwards' }}>
+              <Card className="border-border/60">
+                <CardHeader className="pb-3 border-b border-border/50">
+                  <CardTitle className="text-base flex items-center gap-2">
+                    <Radar className="h-5 w-5 text-primary" />
+                    Dealer Network Compliance Map
+                  </CardTitle>
+                  <CardDescription className="text-xs">
+                    Geospatial view of compliant (green) vs violating (red) dealers
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="p-0">
+                  <DealerMap distributors={distributors} />
+                </CardContent>
+              </Card>
+            </div>
 
-        {/* Secondary Stats */}
-        <div className="grid gap-4 md:grid-cols-2">
-          <StatCard
-            title="Tracked Assets"
-            value={stats.total_assets}
-            icon={ImageIcon}
-            iconColor="text-blue-400"
-          />
-          <StatCard
-            title="Total Matches"
-            value={stats.total_matches}
-            change={`${stats.matches_today} today`}
-            changeType="positive"
-            icon={Search}
-            iconColor="text-primary"
-          />
-        </div>
+            {/* Secondary Stats */}
+            <div className="grid gap-4 grid-cols-2">
+              <StatCard
+                title="Tracked Assets"
+                value={stats.total_assets}
+                icon={ImageIcon}
+                iconColor="text-blue-400"
+              />
+              <StatCard
+                title="Total Matches"
+                value={stats.total_matches}
+                change={`${stats.matches_today} today`}
+                changeType="positive"
+                icon={Search}
+                iconColor="text-primary"
+              />
+            </div>
 
-        {/* Channel Chart + Asset Coverage */}
-        <div className="grid gap-6 lg:grid-cols-2">
-          <ChannelChart data={channelData} />
-          
-          {/* Asset Coverage */}
-          <Card className="opacity-0 animate-fade-up delay-75">
-            <CardHeader className="border-b border-border">
-              <CardTitle className="accent-line pb-2">Asset Coverage</CardTitle>
-              <p className="text-xs text-muted-foreground mt-1">
-                Matches by platform
-              </p>
-            </CardHeader>
-            <CardContent className="pt-6">
-              <div className="space-y-4">
-                {[
-                  { name: "Google Ads", key: "google_ads", color: "bg-amber-500" },
-                  { name: "Facebook", key: "facebook", color: "bg-blue-500" },
-                  { name: "Instagram", key: "instagram", color: "bg-pink-500" },
-                  { name: "Websites", key: "website", color: "bg-emerald-500" },
-                ].map((channel, index) => {
-                  const count = channelData.find((c: any) => c.channel === channel.key)?.count || 0;
-                  const maxCount = Math.max(...channelData.map((c: any) => c.count), 1);
-                  const percentage = (count / maxCount) * 100;
-                  
-                  return (
-                    <div 
-                      key={channel.key} 
-                      className="opacity-0 animate-fade-up"
-                      style={{ animationDelay: `${100 + index * 50}ms`, animationFillMode: 'forwards' }}
-                    >
-                      <div className="flex justify-between items-center mb-2">
-                        <div className="flex items-center gap-2">
-                          <div className={`w-2 h-2 ${channel.color}`} />
-                          <span className="text-sm text-muted-foreground">{channel.name}</span>
-                        </div>
-                        <span className="text-sm font-mono font-medium">{count}</span>
-                      </div>
-                      <div className="h-1 bg-secondary overflow-hidden">
+            {/* Channel Chart + Asset Coverage */}
+            <div className="grid gap-6 grid-cols-2">
+              <ChannelChart data={channelData} />
+              
+              {/* Asset Coverage */}
+              <Card className="opacity-0 animate-fade-up delay-75">
+                <CardHeader className="border-b border-border">
+                  <CardTitle className="accent-line pb-2">Asset Coverage</CardTitle>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Matches by platform
+                  </p>
+                </CardHeader>
+                <CardContent className="pt-6">
+                  <div className="space-y-4">
+                    {[
+                      { name: "Google Ads", key: "google_ads", color: "bg-amber-500" },
+                      { name: "Facebook", key: "facebook", color: "bg-blue-500" },
+                      { name: "Instagram", key: "instagram", color: "bg-pink-500" },
+                      { name: "Websites", key: "website", color: "bg-emerald-500" },
+                    ].map((channel, index) => {
+                      const count = channelData.find((c: any) => c.channel === channel.key)?.count || 0;
+                      const maxCount = Math.max(...channelData.map((c: any) => c.count), 1);
+                      const percentage = (count / maxCount) * 100;
+                      
+                      return (
                         <div 
-                          className={`h-full ${channel.color} transition-all duration-700 ease-out`}
-                          style={{ width: `${percentage}%` }}
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
+                          key={channel.key} 
+                          className="opacity-0 animate-fade-up"
+                          style={{ animationDelay: `${100 + index * 50}ms`, animationFillMode: 'forwards' }}
+                        >
+                          <div className="flex justify-between items-center mb-2">
+                            <div className="flex items-center gap-2">
+                              <div className={`w-2 h-2 ${channel.color}`} />
+                              <span className="text-sm text-muted-foreground">{channel.name}</span>
+                            </div>
+                            <span className="text-sm font-mono font-medium">{count}</span>
+                          </div>
+                          <div className="h-1 bg-secondary overflow-hidden">
+                            <div 
+                              className={`h-full ${channel.color} transition-all duration-700 ease-out`}
+                              style={{ width: `${percentage}%` }}
+                            />
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
 
-        {/* Scan Action Card */}
-        <div>
-          <Card className="border-primary/20 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-0 animate-fade-up">
+            {/* Scan Action Card */}
+            <Card className="border-primary/20 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-0 animate-fade-up">
               <CardHeader className="pb-4">
                 <div className="flex items-center gap-3">
                   <div className="flex h-10 w-10 items-center justify-center bg-primary">
@@ -228,8 +263,8 @@ export default function DashboardPage() {
                     </Link>
                   </div>
                 ) : (
-                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                    {campaigns.slice(0, 3).map((campaign: Campaign, index: number) => (
+                  <div className="grid gap-3 grid-cols-2">
+                    {campaigns.slice(0, 4).map((campaign: Campaign, index: number) => (
                       <Link key={campaign.id} href={`/campaigns/${campaign.id}?tab=scans`}>
                         <div 
                           className="group p-4 border border-border bg-card hover:border-primary/50 hover:bg-secondary/50 transition-all cursor-pointer opacity-0 animate-fade-up"
@@ -249,11 +284,11 @@ export default function DashboardPage() {
                         </div>
                       </Link>
                     ))}
-                    {campaigns.length > 3 && (
+                    {campaigns.length > 4 && (
                       <Link href="/campaigns">
                         <div className="p-4 border border-dashed border-border hover:border-primary/50 transition-colors cursor-pointer flex items-center justify-center h-full">
                           <span className="text-xs text-muted-foreground">
-                            +{campaigns.length - 3} more campaigns
+                            +{campaigns.length - 4} more campaigns
                           </span>
                         </div>
                       </Link>
@@ -262,6 +297,51 @@ export default function DashboardPage() {
                 )}
               </CardContent>
             </Card>
+            {/* Compliance Report Card */}
+            <Card className="border-border/60 opacity-0 animate-fade-up">
+              <CardHeader className="pb-4">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center bg-secondary border border-border">
+                    <FileText className="h-5 w-5 text-muted-foreground" />
+                  </div>
+                  <div>
+                    <CardTitle className="text-base">Compliance Report</CardTitle>
+                    <CardDescription className="text-xs">
+                      Export match data and compliance analytics
+                    </CardDescription>
+                  </div>
+                </div>
+              </CardHeader>
+              <CardContent>
+                <div className="flex gap-3">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1"
+                    onClick={() => handleDownload("pdf")}
+                    disabled={downloading !== null}
+                  >
+                    <Download className="mr-2 h-3.5 w-3.5" />
+                    {downloading === "pdf" ? "Generating..." : "PDF Report"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="flex-1"
+                    onClick={() => handleDownload("csv")}
+                    disabled={downloading !== null}
+                  >
+                    <Download className="mr-2 h-3.5 w-3.5" />
+                    {downloading === "csv" ? "Generating..." : "CSV Export"}
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+          <div className="opacity-0 animate-fade-up delay-200 space-y-6" style={{ animationFillMode: 'forwards' }}>
+            <RecentMatches matches={matches} />
+            <AlertsPanel alerts={alerts} />
+          </div>
         </div>
 
       </div>

@@ -5,22 +5,6 @@ for r in result.data:
     print(f"ID: {r['id']}")
     print(f"Status: {r['status']}")
     print(f"Error: {r.get('error_message')}")
-    print(f"Apify Run ID: {r.get('apify_run_id')}")
+    print(f"Total items: {r.get('total_items', 0)}")
+    print(f"Matches: {r.get('matches_count', 0)}")
     print('---')
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

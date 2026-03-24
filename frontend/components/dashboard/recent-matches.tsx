@@ -51,7 +51,7 @@ export function RecentMatches({ matches }: RecentMatchesProps) {
         </div>
       </CardHeader>
       <CardContent className="p-0">
-        <div className="divide-y divide-border">
+        <div className="divide-y divide-border max-h-[480px] overflow-y-auto scrollbar-thin scrollbar-thumb-border scrollbar-track-transparent">
           {matches.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-12 text-center px-5">
               <div className="h-12 w-12 flex items-center justify-center bg-secondary border border-border mb-4">

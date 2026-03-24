@@ -1,11 +1,111 @@
 """Scanning and analysis routes."""
-from fastapi import APIRouter, HTTPException, BackgroundTasks
+from datetime import datetime, timezone
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 
+from ..auth import AuthUser, get_current_user
 from ..database import supabase
 from ..models import ScanJobCreate, ScanJob, ScanSource
-from ..services import apify_service, ai_service
+from ..services import screenshot_service, extraction_service, ai_service, serpapi_service, apify_meta_service, apify_instagram_service
+from ..services.notification_service import notify_scan_complete
+import logging
+
+log = logging.getLogger("dealer_intel.scanning")
+
+
+def _utc_now() -> str:
+    """Return current UTC timestamp as ISO-8601 string for Supabase."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _send_scan_notifications(
+    scan_job_id: UUID,
+    scan_source: str = "",
+    pipeline_stats: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Query scan results and send a combined scan report + violations email."""
+    try:
+        job = supabase.table("scan_jobs")\
+            .select("organization_id, total_items, processed_items, matches_count")\
+            .eq("id", str(scan_job_id))\
+            .single().execute()
+        job_data = job.data or {}
+        org_id = job_data.get("organization_id")
+        if not org_id:
+            return
+
+        stats = pipeline_stats or {}
+        total_matches = stats.get("matched_new", 0) + stats.get("matched_confirmed", 0)
+        if not total_matches:
+            total_matches = job_data.get("matches_count", 0)
+
+        all_matches = supabase.table("matches")\
+            .select("compliance_status")\
+            .eq("discovered_images.scan_job_id", str(scan_job_id))\
+            .execute()
+
+        compliant = 0
+        violation_count = 0
+        if all_matches.data:
+            for m in all_matches.data:
+                if m.get("compliance_status") == "compliant":
+                    compliant += 1
+                elif m.get("compliance_status") == "violation":
+                    violation_count += 1
+        else:
+            compliant = total_matches
+            violation_count = 0
+
+        total_images = stats.get("total_images", job_data.get("processed_items", 0))
+        total_all = compliant + violation_count
+        rate = round(compliant / max(total_all, 1) * 100, 1) if total_all > 0 else 100.0
+
+        summary = {
+            "total_images": total_images,
+            "matches": total_matches,
+            "compliant": compliant,
+            "violations": violation_count,
+            "compliance_rate": rate,
+            "pages_scanned": stats.get("pages_scanned", 0),
+        }
+
+        violations_formatted: List[Dict[str, Any]] = []
+        if violation_count > 0:
+            try:
+                v_matches = supabase.table("matches")\
+                    .select("*")\
+                    .eq("compliance_status", "violation")\
+                    .execute()
+                for m in (v_matches.data or []):
+                    img = supabase.table("discovered_images")\
+                        .select("scan_job_id")\
+                        .eq("id", m.get("discovered_image_id", ""))\
+                        .single().execute()
+                    if img.data and img.data.get("scan_job_id") == str(scan_job_id):
+                        analysis = m.get("ai_analysis", {}) or {}
+                        comp_summary = ""
+                        if isinstance(analysis, dict):
+                            comp_summary = analysis.get("compliance", {}).get("summary", "")
+                        violations_formatted.append({
+                            "asset_name": m.get("asset_name", "Unknown"),
+                            "distributor_name": m.get("distributor_name", "Unknown"),
+                            "channel": m.get("channel", scan_source),
+                            "confidence_score": m.get("confidence_score", 0),
+                            "compliance_summary": comp_summary,
+                        })
+            except Exception as ve:
+                log.warning("Could not fetch violation details: %s", ve)
+
+        notify_scan_complete(
+            organization_id=UUID(org_id),
+            scan_source=scan_source,
+            summary=summary,
+            violations=violations_formatted,
+        )
+    except Exception as e:
+        log.warning("Failed to send scan notifications for %s: %s", scan_job_id, e)
+
 
 router = APIRouter(prefix="/scans", tags=["scanning"])
 
@@ -13,19 +113,21 @@ router = APIRouter(prefix="/scans", tags=["scanning"])
 @router.post("/start", response_model=ScanJob)
 async def start_scan(
     scan_request: ScanJobCreate,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    user: AuthUser = Depends(get_current_user),
 ):
     """
     Start a new scan job.
     
     This will:
     1. Create a scan job record
-    2. Trigger the appropriate Apify scraper
-    3. Return the job ID for status tracking
+    2. Capture screenshots via ScreenshotOne
+    3. Auto-analyze discovered images against campaign assets
+    4. Return the job ID for status tracking
     """
     # Create scan job record
     job_data = {
-        "organization_id": str(scan_request.organization_id),
+        "organization_id": str(user.org_id),
         "campaign_id": str(scan_request.campaign_id) if scan_request.campaign_id else None,
         "source": scan_request.source.value,
         "status": "pending"
@@ -44,7 +146,7 @@ async def start_scan(
     else:
         distributors = supabase.table("distributors")\
             .select("*")\
-            .eq("organization_id", str(scan_request.organization_id))\
+            .eq("organization_id", str(user.org_id))\
             .eq("status", "active")\
             .execute()
     
@@ -59,8 +161,8 @@ async def start_scan(
             for d in distributor_list
         }
         
-        print(f"[Scan] Starting Google Ads scan for {len(names)} advertisers")
-        print(f"[Scan] Campaign ID for auto-analysis: {scan_request.campaign_id}")
+        log.info("Starting Google Ads scan for %d advertisers", len(names))
+        log.info("Campaign ID for auto-analysis: %s", scan_request.campaign_id)
         
         # Start scrape in background
         background_tasks.add_task(
@@ -71,23 +173,47 @@ async def start_scan(
             scan_request.campaign_id  # Pass campaign_id for auto-analysis!
         )
         
-    elif scan_request.source in [ScanSource.FACEBOOK, ScanSource.INSTAGRAM]:
-        # Get Facebook URLs
+    elif scan_request.source == ScanSource.INSTAGRAM:
+        # Instagram organic posts via apify/instagram-scraper
+        urls = [d["instagram_url"] for d in distributor_list if d.get("instagram_url")]
+        mapping = {}
+        for d in distributor_list:
+            ig_url = d.get("instagram_url")
+            if ig_url:
+                username = apify_instagram_service._extract_username(ig_url)
+                if username:
+                    mapping[username.lower()] = UUID(d["id"])
+                mapping[d["name"].lower()] = UUID(d["id"])
+
+        log.info("Starting Instagram organic scan for %d profiles", len(urls))
+        log.info("Campaign ID for auto-analysis: %s", scan_request.campaign_id)
+
+        background_tasks.add_task(
+            run_instagram_scan,
+            urls,
+            scan_job_id,
+            mapping,
+            scan_request.campaign_id,
+        )
+
+    elif scan_request.source == ScanSource.FACEBOOK:
+        # Facebook ads via Meta Ad Library
         urls = [d["facebook_url"] for d in distributor_list if d.get("facebook_url")]
         mapping = {
             d["name"].lower(): UUID(d["id"])
             for d in distributor_list
         }
         
-        print(f"[Scan] Starting Facebook scan for {len(urls)} pages")
-        print(f"[Scan] Campaign ID for auto-analysis: {scan_request.campaign_id}")
+        log.info("Starting Facebook scan for %d pages", len(urls))
+        log.info("Campaign ID for auto-analysis: %s", scan_request.campaign_id)
         
         background_tasks.add_task(
             run_facebook_scan,
             urls,
             scan_job_id,
             mapping,
-            scan_request.campaign_id  # Pass campaign_id for auto-analysis!
+            scan_request.campaign_id,
+            "facebook",
         )
         
     elif scan_request.source == ScanSource.WEBSITE:
@@ -98,8 +224,8 @@ async def start_scan(
             for d in distributor_list if d.get("website_url")
         }
         
-        print(f"[Scan] Starting website scan for {len(urls)} URLs: {urls}")
-        print(f"[Scan] Campaign ID for auto-analysis: {scan_request.campaign_id}")
+        log.info("Starting website scan for %d URLs: %s", len(urls), urls)
+        log.info("Campaign ID for auto-analysis: %s", scan_request.campaign_id)
         
         background_tasks.add_task(
             run_website_scan,
@@ -112,63 +238,62 @@ async def start_scan(
     return scan_job
 
 
+async def _fetch_campaign_assets(campaign_id: Optional[UUID]) -> List[Dict]:
+    """Fetch campaign assets from the database for AI localization."""
+    if not campaign_id:
+        return []
+    try:
+        result = supabase.table("assets")\
+            .select("id, name, file_url")\
+            .eq("campaign_id", str(campaign_id))\
+            .execute()
+        return result.data or []
+    except Exception as e:
+        log.error("Failed to fetch campaign assets: %s", e)
+        return []
+
+
 async def run_google_ads_scan(
-    advertiser_names: List[str],
+    advertiser_ids: List[str],
     scan_job_id: UUID,
     distributor_mapping: Dict[str, UUID],
-    campaign_id: Optional[UUID] = None
+    campaign_id: Optional[UUID] = None,
 ):
-    """Background task to run Google Ads scan."""
+    """Background task — fetch ad creatives via SerpApi, then analyse."""
     try:
-        run_id = await apify_service.start_google_ads_scrape(
-            advertiser_names,
-            scan_job_id
-        )
-        
-        # Wait for completion (poll status)
-        import asyncio
-        while True:
-            status = await apify_service.get_run_status(run_id)
-            if status["status"] in ["SUCCEEDED", "FAILED", "ABORTED"]:
-                break
-            await asyncio.sleep(10)
-        
-        if status["status"] == "SUCCEEDED":
-            await apify_service.process_google_ads_results(
-                run_id,
-                scan_job_id,
-                distributor_mapping
+        campaign_assets = await _fetch_campaign_assets(campaign_id)
+
+        from ..config import get_settings
+        _settings = get_settings()
+
+        if _settings.serpapi_api_key:
+            log.info("Using SerpApi for Google Ads scan")
+            discovered_count = await serpapi_service.scan_google_ads(
+                advertiser_ids, scan_job_id, distributor_mapping,
+                campaign_assets=campaign_assets,
             )
-            # Auto-analyze if campaign is specified
-            if campaign_id:
-                try:
-                    await auto_analyze_scan(scan_job_id, campaign_id)
-                    supabase.table("scan_jobs").update({
-                        "status": "completed",
-                        "completed_at": "now()"
-                    }).eq("id", str(scan_job_id)).execute()
-                except Exception as analysis_error:
-                    print(f"[Google Ads Scan] Analysis failed: {analysis_error}")
-                    supabase.table("scan_jobs").update({
-                        "status": "failed",
-                        "error_message": f"Analysis failed: {str(analysis_error)}"
-                    }).eq("id", str(scan_job_id)).execute()
-            else:
-                # No campaign - mark as completed without analysis
-                supabase.table("scan_jobs").update({
-                    "status": "completed",
-                    "completed_at": "now()"
-                }).eq("id", str(scan_job_id)).execute()
         else:
-            supabase.table("scan_jobs").update({
-                "status": "failed",
-                "error_message": f"Apify run {status['status']}"
-            }).eq("id", str(scan_job_id)).execute()
-            
+            log.info("SerpApi key not set — falling back to Playwright extraction")
+            discovered_count = await extraction_service.scan_google_ads(
+                advertiser_ids, scan_job_id, distributor_mapping,
+                campaign_assets=campaign_assets,
+            )
+
+        if campaign_id and discovered_count > 0:
+            await auto_analyze_scan(scan_job_id, campaign_id)
+
+        supabase.table("scan_jobs").update({
+            "status": "completed",
+            "completed_at": _utc_now(),
+        }).eq("id", str(scan_job_id)).execute()
+
+        _send_scan_notifications(scan_job_id, scan_source="google_ads")
+
     except Exception as e:
+        log.error("Google Ads scan failed: %s", e, exc_info=True)
         supabase.table("scan_jobs").update({
             "status": "failed",
-            "error_message": str(e)
+            "error_message": str(e),
         }).eq("id", str(scan_job_id)).execute()
 
 
@@ -176,140 +301,412 @@ async def run_facebook_scan(
     page_urls: List[str],
     scan_job_id: UUID,
     distributor_mapping: Dict[str, UUID],
-    campaign_id: Optional[UUID] = None
+    campaign_id: Optional[UUID] = None,
+    channel: str = "facebook",
 ):
-    """Background task to run Facebook scan."""
+    """Background task — extract ad images from Meta Ad Library pages."""
     try:
-        run_id = await apify_service.start_facebook_ads_scrape(
-            page_urls,
-            scan_job_id
-        )
-        
-        import asyncio
-        while True:
-            status = await apify_service.get_run_status(run_id)
-            if status["status"] in ["SUCCEEDED", "FAILED", "ABORTED"]:
-                break
-            await asyncio.sleep(10)
-        
-        if status["status"] == "SUCCEEDED":
-            await apify_service.process_facebook_results(
-                run_id,
-                scan_job_id,
-                distributor_mapping
+        campaign_assets = await _fetch_campaign_assets(campaign_id)
+
+        from ..config import get_settings
+        _settings = get_settings()
+
+        if _settings.apify_api_key:
+            log.info("Using Apify Meta Ads Scraper Pro for %s scan", channel)
+            discovered_count = await apify_meta_service.scan_meta_ads(
+                page_urls, scan_job_id, distributor_mapping,
+                channel=channel,
+                campaign_assets=campaign_assets,
             )
-            # Auto-analyze if campaign is specified
-            if campaign_id:
-                try:
-                    await auto_analyze_scan(scan_job_id, campaign_id)
-                    supabase.table("scan_jobs").update({
-                        "status": "completed",
-                        "completed_at": "now()"
-                    }).eq("id", str(scan_job_id)).execute()
-                except Exception as analysis_error:
-                    print(f"[Facebook Scan] Analysis failed: {analysis_error}")
-                    supabase.table("scan_jobs").update({
-                        "status": "failed",
-                        "error_message": f"Analysis failed: {str(analysis_error)}"
-                    }).eq("id", str(scan_job_id)).execute()
-            else:
-                # No campaign - mark as completed without analysis
-                supabase.table("scan_jobs").update({
-                    "status": "completed",
-                    "completed_at": "now()"
-                }).eq("id", str(scan_job_id)).execute()
         else:
-            supabase.table("scan_jobs").update({
-                "status": "failed",
-                "error_message": f"Apify run {status['status']}"
-            }).eq("id", str(scan_job_id)).execute()
-            
+            log.info("Apify key not set — falling back to Playwright extraction")
+            discovered_count = await extraction_service.scan_facebook_ads(
+                page_urls, scan_job_id, distributor_mapping,
+                campaign_assets=campaign_assets,
+            )
+
+        if campaign_id and discovered_count > 0:
+            await auto_analyze_scan(scan_job_id, campaign_id)
+
+        supabase.table("scan_jobs").update({
+            "status": "completed",
+            "completed_at": _utc_now(),
+        }).eq("id", str(scan_job_id)).execute()
+
+        _send_scan_notifications(scan_job_id, scan_source="facebook")
+
     except Exception as e:
+        log.error("Facebook scan failed: %s", e, exc_info=True)
         supabase.table("scan_jobs").update({
             "status": "failed",
-            "error_message": str(e)
+            "error_message": str(e),
         }).eq("id", str(scan_job_id)).execute()
+
+
+async def run_instagram_scan(
+    profile_urls: List[str],
+    scan_job_id: UUID,
+    distributor_mapping: Dict[str, UUID],
+    campaign_id: Optional[UUID] = None,
+):
+    """Background task — extract organic post images from Instagram profiles."""
+    try:
+        campaign_assets = await _fetch_campaign_assets(campaign_id)
+
+        discovered_count = await apify_instagram_service.scan_instagram_organic(
+            profile_urls, scan_job_id, distributor_mapping,
+            campaign_assets=campaign_assets,
+        )
+
+        if campaign_id and discovered_count > 0:
+            await auto_analyze_scan(scan_job_id, campaign_id)
+
+        supabase.table("scan_jobs").update({
+            "status": "completed",
+            "completed_at": _utc_now(),
+        }).eq("id", str(scan_job_id)).execute()
+
+        _send_scan_notifications(scan_job_id, scan_source="instagram")
+
+    except Exception as e:
+        log.error("Instagram scan failed: %s", e, exc_info=True)
+        supabase.table("scan_jobs").update({
+            "status": "failed",
+            "error_message": str(e),
+        }).eq("id", str(scan_job_id)).execute()
+
+
+async def _analyze_single_image(
+    image: Dict,
+    campaign_assets: List[Dict],
+    brand_rules: Dict[str, Any],
+    organization_id: Optional[str],
+    scan_job_id: str,
+    asset_hashes: Dict,
+    asset_embeddings: Dict,
+    pipeline_stats: Dict[str, Any],
+) -> Optional[str]:
+    """Process one image through the AI pipeline and create/update match records.
+
+    Mutates *pipeline_stats* in place.
+    Returns the matched asset_id (str) when a match is recorded, else None.
+    """
+    try:
+        result, stage = await ai_service.process_discovered_image(
+            image["id"],
+            image["image_url"],
+            campaign_assets,
+            brand_rules,
+            source_type=image.get("source_type"),
+            channel=image.get("channel"),
+            asset_hashes_cache=asset_hashes,
+            asset_embeddings_cache=asset_embeddings,
+        )
+
+        if stage != "matched":
+            pipeline_stats[stage] = pipeline_stats.get(stage, 0) + 1
+
+        matched_asset_id: Optional[str] = None
+
+        if result:
+            log.info(
+                "Match found for image %s — asset=%s confidence=%s%% type=%s compliance=%s",
+                image["id"], result["asset_id"], result["confidence_score"],
+                result["match_type"], result["compliance_status"],
+            )
+            try:
+                existing = supabase.table("matches")\
+                    .select("id, compliance_status, confidence_score, scan_count")\
+                    .eq("asset_id", str(result["asset_id"]))\
+                    .eq("source_url", image.get("source_url", ""))\
+                    .execute()
+
+                if existing.data:
+                    old = existing.data[0]
+                    old_status = old.get("compliance_status")
+                    new_status = result["compliance_status"]
+                    new_count = (old.get("scan_count") or 1) + 1
+
+                    update_payload = {
+                        "last_seen_at": _utc_now(),
+                        "scan_count": new_count,
+                        "confidence_score": result["confidence_score"],
+                        "match_type": result["match_type"],
+                        "is_modified": result["is_modified"],
+                        "modifications": result["modifications"],
+                        "compliance_status": new_status,
+                        "compliance_issues": result["compliance_issues"],
+                        "ai_analysis": result["ai_analysis"],
+                    }
+
+                    has_drift = old_status and old_status != new_status
+                    if has_drift:
+                        update_payload["previous_compliance_status"] = old_status
+                        pipeline_stats["drift_detected"] = pipeline_stats.get("drift_detected", 0) + 1
+                        log.warning(
+                            "Compliance DRIFT on match %s: %s → %s",
+                            old["id"], old_status, new_status,
+                        )
+
+                    supabase.table("matches").update(update_payload)\
+                        .eq("id", old["id"]).execute()
+
+                    pipeline_stats["matched_confirmed"] = pipeline_stats.get("matched_confirmed", 0) + 1
+                    matched_asset_id = str(result["asset_id"])
+                    log.info(
+                        "Existing match %s confirmed (seen %dx)%s",
+                        old["id"], new_count,
+                        f" — DRIFT: {old_status}→{new_status}" if has_drift else "",
+                    )
+
+                    if has_drift and new_status == "violation":
+                        org_id = organization_id or image.get("organization_id")
+                        if org_id:
+                            supabase.table("alerts").insert({
+                                "organization_id": org_id,
+                                "match_id": old["id"],
+                                "distributor_id": image.get("distributor_id"),
+                                "alert_type": "compliance_drift",
+                                "severity": "high",
+                                "title": "Compliance drift detected — was compliant, now violation",
+                                "description": result["ai_analysis"].get("compliance", {}).get("summary", ""),
+                            }).execute()
+                else:
+                    match_record = supabase.table("matches").insert({
+                        "asset_id": str(result["asset_id"]),
+                        "discovered_image_id": image["id"],
+                        "distributor_id": image.get("distributor_id"),
+                        "confidence_score": result["confidence_score"],
+                        "match_type": result["match_type"],
+                        "is_modified": result["is_modified"],
+                        "modifications": result["modifications"],
+                        "channel": image.get("channel"),
+                        "source_url": image.get("source_url"),
+                        "screenshot_url": image.get("image_url"),
+                        "compliance_status": result["compliance_status"],
+                        "compliance_issues": result["compliance_issues"],
+                        "ai_analysis": result["ai_analysis"],
+                        "discovered_at": image.get("discovered_at"),
+                        "last_seen_at": _utc_now(),
+                        "scan_count": 1,
+                    }).execute()
+
+                    pipeline_stats["matched_new"] = pipeline_stats.get("matched_new", 0) + 1
+                    matched_asset_id = str(result["asset_id"])
+                    log.info("Match record created: %s",
+                             match_record.data[0]["id"] if match_record.data else "unknown")
+
+                    if result["compliance_status"] == "violation":
+                        org_id = organization_id or image.get("organization_id")
+                        if org_id:
+                            supabase.table("alerts").insert({
+                                "organization_id": org_id,
+                                "match_id": match_record.data[0]["id"] if match_record.data else None,
+                                "distributor_id": image.get("distributor_id"),
+                                "alert_type": "compliance_violation",
+                                "severity": "warning",
+                                "title": "Compliance violation detected",
+                                "description": result["ai_analysis"].get("compliance", {}).get("summary", ""),
+                            }).execute()
+            except Exception as db_error:
+                log.error("Failed to create/update match record: %s", db_error)
+                pipeline_stats["errors"] = pipeline_stats.get("errors", 0) + 1
+
+        supabase.table("discovered_images").update({
+            "is_processed": True
+        }).eq("id", image["id"]).execute()
+
+        return matched_asset_id
+
+    except Exception as e:
+        log.error("Error analyzing image %s: %s", image["id"], e, exc_info=True)
+        pipeline_stats["errors"] = pipeline_stats.get("errors", 0) + 1
+        supabase.table("discovered_images").update({
+            "is_processed": True
+        }).eq("id", image["id"]).execute()
+        return None
 
 
 async def run_website_scan(
     website_urls: List[str],
     scan_job_id: UUID,
     distributor_mapping: Dict[str, UUID],
-    campaign_id: Optional[UUID] = None
+    campaign_id: Optional[UUID] = None,
 ):
-    """Background task to run website scan."""
-    print(f"[Website Scan] Background task started for job {scan_job_id}")
-    print(f"[Website Scan] URLs to scan: {website_urls}")
-    print(f"[Website Scan] Campaign ID: {campaign_id}")
-    
+    """Background task — extract images from dealer websites via Playwright.
+
+    Supports **early stopping**: when all campaign assets have been matched,
+    remaining pages are skipped to save time and API costs.
+    """
+    log.info("Website scan started for job %s — URLs: %s, campaign: %s",
+             scan_job_id, website_urls, campaign_id)
+
     try:
-        run_id = await apify_service.start_website_crawl(
-            website_urls,
-            scan_job_id
-        )
-        
-        print(f"[Website Scan] Apify run started: {run_id}")
-        
-        import asyncio
-        poll_count = 0
-        while True:
-            status = await apify_service.get_run_status(run_id)
-            poll_count += 1
-            print(f"[Website Scan] Poll #{poll_count}: Status = {status['status']}")
-            
-            if status["status"] in ["SUCCEEDED", "FAILED", "ABORTED"]:
-                break
-            await asyncio.sleep(10)
-        
-        if status["status"] == "SUCCEEDED":
-            print(f"[Website Scan] Apify run succeeded, processing results...")
-            discovered_count = await apify_service.process_website_results(
-                run_id,
-                scan_job_id,
-                distributor_mapping
+        from ..config import get_settings
+        _settings = get_settings()
+
+        campaign_assets = await _fetch_campaign_assets(campaign_id)
+        if campaign_assets:
+            log.info("Loaded %d campaign asset(s)", len(campaign_assets))
+
+        expanded_urls = await extraction_service.discover_website_urls(website_urls)
+        total_pages = len(expanded_urls)
+        log.info("Discovered %d pages to scan", total_pages)
+
+        can_early_stop = bool(campaign_id and campaign_assets)
+        all_asset_ids = {str(a["id"]) for a in campaign_assets} if can_early_stop else set()
+        matched_asset_ids: set = set()
+
+        asset_hashes: Dict = {}
+        asset_embeddings: Dict = {}
+        brand_rules: Dict[str, Any] = {}
+        org_id: Optional[str] = None
+
+        if can_early_stop:
+            log.info("Early stopping enabled — will stop after all %d assets are matched", len(all_asset_ids))
+            asset_hashes = await ai_service._precompute_asset_hashes(campaign_assets)
+            asset_embeddings = await ai_service._precompute_asset_embeddings(campaign_assets)
+            log.info("Cached %d hash sets, %d CLIP embeddings", len(asset_hashes), len(asset_embeddings))
+
+            job_data = supabase.table("scan_jobs")\
+                .select("organization_id").eq("id", str(scan_job_id)).single().execute()
+            org_id = job_data.data.get("organization_id") if job_data.data else None
+
+            if org_id:
+                rules = supabase.table("compliance_rules")\
+                    .select("*").eq("organization_id", org_id)\
+                    .eq("is_active", True).execute()
+                for rule in (rules.data or []):
+                    if rule["rule_type"] == "required_element":
+                        brand_rules.setdefault("required_elements", []).append(
+                            rule["rule_config"].get("element"))
+                    elif rule["rule_type"] == "forbidden_element":
+                        brand_rules.setdefault("forbidden_elements", []).append(
+                            rule["rule_config"].get("element"))
+
+        pipeline_stats: Dict[str, Any] = {
+            "total_images": 0,
+            "download_failed": 0,
+            "hash_rejected": 0,
+            "clip_rejected": 0,
+            "filter_rejected": 0,
+            "below_threshold": 0,
+            "verification_rejected": 0,
+            "matched_new": 0,
+            "matched_confirmed": 0,
+            "drift_detected": 0,
+            "errors": 0,
+            "pages_discovered": total_pages,
+            "pages_scanned": 0,
+            "pages_skipped": 0,
+            "early_stopped": False,
+        }
+
+        total_discovered = 0
+        early_stopped = False
+
+        supabase.table("scan_jobs").update({
+            "status": "running",
+            "started_at": _utc_now(),
+        }).eq("id", str(scan_job_id)).execute()
+
+        for page_idx, page_url in enumerate(expanded_urls):
+            log.info("[Page %d/%d] Extracting: %s", page_idx + 1, total_pages, page_url)
+
+            distributor_id = extraction_service._match_distributor_by_domain(
+                page_url, distributor_mapping)
+
+            count, evidence_url = await extraction_service.extract_dealer_website(
+                page_url, scan_job_id, distributor_id,
+                campaign_assets=campaign_assets,
             )
-            print(f"[Website Scan] Processed results: {discovered_count} images discovered")
-            
-            # Auto-analyze if campaign is specified
-            if campaign_id:
-                print(f"[Website Scan] Starting auto-analysis for campaign {campaign_id}...")
-                try:
-                    await auto_analyze_scan(scan_job_id, campaign_id)
-                    print(f"[Website Scan] Auto-analysis completed successfully")
-                    # Mark as completed AFTER analysis succeeds
-                    supabase.table("scan_jobs").update({
-                        "status": "completed",
-                        "completed_at": "now()"
-                    }).eq("id", str(scan_job_id)).execute()
-                except Exception as analysis_error:
-                    print(f"[Website Scan] Auto-analysis FAILED: {analysis_error}")
-                    import traceback
-                    traceback.print_exc()
-                    supabase.table("scan_jobs").update({
-                        "status": "failed",
-                        "error_message": f"Analysis failed: {str(analysis_error)}"
-                    }).eq("id", str(scan_job_id)).execute()
-            else:
-                print(f"[Website Scan] No campaign_id provided, skipping auto-analysis")
-                # Mark as completed (no analysis needed)
-                supabase.table("scan_jobs").update({
-                    "status": "completed",
-                    "completed_at": "now()"
-                }).eq("id", str(scan_job_id)).execute()
-        else:
-            print(f"[Website Scan] Apify run failed with status: {status['status']}")
-            supabase.table("scan_jobs").update({
-                "status": "failed",
-                "error_message": f"Apify run {status['status']}"
-            }).eq("id", str(scan_job_id)).execute()
-            
+
+            if count == 0 and _settings.enable_tiling_fallback and evidence_url:
+                log.info("Zero images from %s — inserting screenshot for tiling", page_url)
+                supabase.table("discovered_images").insert({
+                    "scan_job_id": str(scan_job_id),
+                    "distributor_id": str(distributor_id) if distributor_id else None,
+                    "source_url": page_url,
+                    "image_url": evidence_url,
+                    "source_type": "page_screenshot",
+                    "channel": "website",
+                    "metadata": {
+                        "capture_method": "playwright_fallback",
+                        "full_page": True,
+                        "reason": "no_images_extracted",
+                    },
+                }).execute()
+                count = 1
+
+            total_discovered += count
+            pipeline_stats["pages_scanned"] += 1
+
+            if can_early_stop and count > 0:
+                page_images = supabase.table("discovered_images")\
+                    .select("*")\
+                    .eq("scan_job_id", str(scan_job_id))\
+                    .eq("source_url", page_url)\
+                    .eq("is_processed", False)\
+                    .execute()
+
+                for image in (page_images.data or []):
+                    pipeline_stats["total_images"] += 1
+                    log.info("[Page %d/%d] Analyzing image %s",
+                             page_idx + 1, total_pages, image["id"])
+                    asset_id = await _analyze_single_image(
+                        image, campaign_assets, brand_rules,
+                        org_id, str(scan_job_id),
+                        asset_hashes, asset_embeddings, pipeline_stats,
+                    )
+                    if asset_id:
+                        matched_asset_ids.add(asset_id)
+
+                if all_asset_ids and matched_asset_ids >= all_asset_ids:
+                    remaining = total_pages - (page_idx + 1)
+                    pipeline_stats["early_stopped"] = True
+                    pipeline_stats["pages_skipped"] = remaining
+                    log.info(
+                        "EARLY STOP: All %d assets matched after %d/%d pages (%d skipped)",
+                        len(all_asset_ids), page_idx + 1, total_pages, remaining,
+                    )
+                    early_stopped = True
+                    break
+
+        if not can_early_stop and campaign_id and total_discovered > 0:
+            log.info("Starting batch analysis for campaign %s", campaign_id)
+            await auto_analyze_scan(scan_job_id, campaign_id)
+
+        total_matches = pipeline_stats["matched_new"] + pipeline_stats["matched_confirmed"]
+
+        cache_stats = ai_service.get_image_cache_stats()
+        pipeline_stats["image_cache"] = cache_stats
+
+        log.info(
+            "Website scan complete — pages=%d/%d images=%d matches=%d "
+            "(new=%d confirmed=%d) early_stop=%s",
+            pipeline_stats["pages_scanned"], total_pages,
+            pipeline_stats["total_images"], total_matches,
+            pipeline_stats["matched_new"], pipeline_stats["matched_confirmed"],
+            early_stopped,
+        )
+        log.info("Pipeline funnel: %s", pipeline_stats)
+
+        supabase.table("scan_jobs").update({
+            "status": "completed",
+            "completed_at": _utc_now(),
+            "total_items": total_discovered,
+            "processed_items": pipeline_stats["total_images"],
+            "matches_count": total_matches,
+            "pipeline_stats": pipeline_stats,
+        }).eq("id", str(scan_job_id)).execute()
+
+        _send_scan_notifications(scan_job_id, scan_source="website", pipeline_stats=pipeline_stats)
+
     except Exception as e:
-        print(f"[Website Scan] ERROR: {str(e)}")
-        import traceback
-        traceback.print_exc()
+        log.error("Website scan failed: %s", e, exc_info=True)
         supabase.table("scan_jobs").update({
             "status": "failed",
-            "error_message": str(e)
+            "error_message": str(e),
         }).eq("id", str(scan_job_id)).execute()
 
 
@@ -320,10 +717,7 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
     This function is called automatically when a campaign-linked scan completes.
     It matches discovered images against campaign assets and performs compliance checks.
     """
-    print(f"[Auto-Analyze] ========================================")
-    print(f"[Auto-Analyze] Starting analysis for scan {scan_job_id}")
-    print(f"[Auto-Analyze] Campaign ID: {campaign_id}")
-    print(f"[Auto-Analyze] ========================================")
+    log.info("Starting auto-analysis for scan %s, campaign %s", scan_job_id, campaign_id)
     
     try:
         # Get scan job details
@@ -334,11 +728,11 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             .execute()
         
         if not job.data:
-            print(f"[Auto-Analyze] ERROR: Scan job {scan_job_id} not found")
+            log.error("Scan job %s not found", scan_job_id)
             return
         
-        print(f"[Auto-Analyze] Scan job found: {job.data.get('status')}")
-        print(f"[Auto-Analyze] Organization ID: {job.data.get('organization_id')}")
+        log.info("Scan job found: %s", job.data.get('status'))
+        log.info("Organization ID: %s", job.data.get('organization_id'))
         
         # Get unprocessed discovered images
         images = supabase.table("discovered_images")\
@@ -347,10 +741,10 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             .eq("is_processed", False)\
             .execute()
         
-        print(f"[Auto-Analyze] Found {len(images.data) if images.data else 0} unprocessed images")
+        log.info("Found %d unprocessed images", len(images.data) if images.data else 0)
         
         if not images.data:
-            print(f"[Auto-Analyze] No unprocessed images found for scan {scan_job_id}")
+            log.info("No unprocessed images found for scan %s", scan_job_id)
             # Update scan job to show 0 processed
             supabase.table("scan_jobs").update({
                 "processed_items": 0
@@ -358,13 +752,13 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             return
         
         # Log discovered images
-        print(f"[Auto-Analyze] Discovered images to analyze:")
+        log.debug("Discovered images to analyze:")
         for idx, img in enumerate(images.data):
-            print(f"[Auto-Analyze]   [{idx+1}] ID: {img.get('id')}")
-            print(f"[Auto-Analyze]       URL: {img.get('image_url', 'N/A')[:100]}...")
-            print(f"[Auto-Analyze]       Source: {img.get('source_url', 'N/A')[:80]}")
-            print(f"[Auto-Analyze]       Type: {img.get('source_type', 'N/A')}")
-            print(f"[Auto-Analyze]       Channel: {img.get('channel', 'N/A')}")
+            log.debug("  [%d] ID: %s", idx + 1, img.get('id'))
+            log.debug("      URL: %s", img.get('image_url', 'N/A')[:100])
+            log.debug("      Source: %s", img.get('source_url', 'N/A')[:80])
+            log.debug("      Type: %s", img.get('source_type', 'N/A'))
+            log.debug("      Channel: %s", img.get('channel', 'N/A'))
         
         # Get campaign assets
         assets = supabase.table("assets")\
@@ -372,12 +766,10 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             .eq("campaign_id", str(campaign_id))\
             .execute()
         
-        print(f"[Auto-Analyze] Found {len(assets.data) if assets.data else 0} campaign assets")
+        log.info("Found %d campaign assets", len(assets.data) if assets.data else 0)
         
         if not assets.data:
-            print(f"[Auto-Analyze] *** ERROR: No assets found for campaign {campaign_id} ***")
-            print(f"[Auto-Analyze] Cannot perform audit without campaign assets to match against!")
-            print(f"[Auto-Analyze] Please upload assets to the campaign first.")
+            log.warning("No assets found for campaign %s — cannot audit without campaign assets", campaign_id)
             # Mark images as processed anyway to avoid re-processing
             for img in images.data:
                 supabase.table("discovered_images").update({
@@ -390,15 +782,15 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             return
         
         # Log campaign assets with accessibility check
-        print(f"[Auto-Analyze] Campaign assets to match against:")
+        log.debug("Campaign assets to match against:")
         for idx, asset in enumerate(assets.data):
             asset_url = asset.get('file_url', 'N/A')
-            print(f"[Auto-Analyze]   [{idx+1}] ID: {asset.get('id')}")
-            print(f"[Auto-Analyze]       Name: {asset.get('name', 'N/A')}")
-            print(f"[Auto-Analyze]       URL: {asset_url[:100]}...")
+            log.debug("  [%d] ID: %s", idx + 1, asset.get('id'))
+            log.debug("      Name: %s", asset.get('name', 'N/A'))
+            log.debug("      URL: %s", asset_url[:100])
             # Check if URL looks like a Supabase storage URL
             if 'supabase' in asset_url.lower() and '/storage/v1/' in asset_url:
-                print(f"[Auto-Analyze]       WARNING: Supabase storage URL - ensure bucket is public")
+                log.warning("Supabase storage URL for asset %s — ensure bucket is public", asset.get('id'))
         
         # Get brand rules
         rules = supabase.table("compliance_rules")\
@@ -407,7 +799,7 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             .eq("is_active", True)\
             .execute()
         
-        print(f"[Auto-Analyze] Found {len(rules.data) if rules.data else 0} compliance rules")
+        log.info("Found %d compliance rules", len(rules.data) if rules.data else 0)
         
         brand_rules = {}
         for rule in rules.data:
@@ -420,10 +812,8 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
                     rule["rule_config"].get("element")
                 )
         
-        print(f"[Auto-Analyze] Brand rules: {brand_rules}")
-        print(f"[Auto-Analyze] ----------------------------------------")
-        print(f"[Auto-Analyze] Starting Gemini image analysis...")
-        print(f"[Auto-Analyze] ----------------------------------------")
+        log.debug("Brand rules: %s", brand_rules)
+        log.info("Starting Claude image analysis")
         
         # Run analysis
         await run_image_analysis(
@@ -439,16 +829,10 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             "processed_items": len(images.data)
         }).eq("id", str(scan_job_id)).execute()
         
-        print(f"[Auto-Analyze] ========================================")
-        print(f"[Auto-Analyze] COMPLETED for scan {scan_job_id}")
-        print(f"[Auto-Analyze] Processed: {len(images.data)} images")
-        print(f"[Auto-Analyze] ========================================")
+        log.info("Auto-analysis completed for scan %s — processed %d images", scan_job_id, len(images.data))
         
     except Exception as e:
-        print(f"[Auto-Analyze] *** CRITICAL ERROR for scan {scan_job_id} ***")
-        print(f"[Auto-Analyze] Error: {e}")
-        import traceback
-        traceback.print_exc()
+        log.error("Critical error in auto-analysis for scan %s: %s", scan_job_id, e, exc_info=True)
         # Update scan job with error
         supabase.table("scan_jobs").update({
             "error_message": f"Analysis failed: {str(e)}"
@@ -457,15 +841,13 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
 
 @router.get("", response_model=List[ScanJob])
 async def list_scan_jobs(
-    organization_id: Optional[UUID] = None,
     status: Optional[str] = None,
-    limit: int = 20
+    limit: int = 20,
+    user: AuthUser = Depends(get_current_user),
 ):
     """List scan jobs."""
     query = supabase.table("scan_jobs").select("*")
-    
-    if organization_id:
-        query = query.eq("organization_id", str(organization_id))
+    query = query.eq("organization_id", str(user.org_id))
     if status:
         query = query.eq("status", status)
     
@@ -523,7 +905,11 @@ async def delete_scan_job(job_id: UUID):
 async def delete_all_scans():
     """
     Delete all scan jobs and associated data. Use with caution - for testing purposes.
+    Only available when ENABLE_DANGEROUS_ENDPOINTS=true.
     """
+    from ..config import get_settings
+    if not get_settings().enable_dangerous_endpoints:
+        raise HTTPException(status_code=403, detail="Bulk delete is disabled in this environment")
     # First delete all matches that reference discovered images
     supabase.table("matches")\
         .delete()\
@@ -551,9 +937,9 @@ async def analyze_discovered_images(
     Analyze discovered images from a completed scan.
     
     This will:
-    1. Filter images with Gemini Flash
-    2. Match against campaign assets
-    3. Run compliance checks with Gemini Pro
+    1. Filter images for relevance
+    2. Match against campaign assets via ensemble matching
+    3. Run compliance checks with Claude
     4. Create match records
     """
     # Get scan job
@@ -634,132 +1020,80 @@ async def run_image_analysis(
     organization_id: Optional[str] = None,
     scan_job_id: Optional[str] = None
 ):
-    """Background task to analyze images and create matches."""
-    print(f"[Image Analysis] ========================================")
-    print(f"[Image Analysis] Starting analysis")
-    print(f"[Image Analysis] - Images to analyze: {len(discovered_images)}")
-    print(f"[Image Analysis] - Assets to match: {len(campaign_assets)}")
-    print(f"[Image Analysis] - Organization: {organization_id}")
-    print(f"[Image Analysis] - Scan Job ID: {scan_job_id}")
-    print(f"[Image Analysis] ========================================")
-    
-    matches_created = 0
-    violations_found = 0
-    skipped = 0
-    errors = 0
-    
+    """Background task to analyze images and create matches.
+
+    Used by Facebook / Google / manual analysis paths.
+    Website scans use inline page-by-page analysis with early stopping instead.
+    """
+    log.info("Starting image analysis — %d images, %d assets, org=%s, job=%s",
+             len(discovered_images), len(campaign_assets), organization_id, scan_job_id)
+
+    log.info("Pre-computing asset hashes and CLIP embeddings...")
+    asset_hashes = await ai_service._precompute_asset_hashes(campaign_assets)
+    asset_embeddings = await ai_service._precompute_asset_embeddings(campaign_assets)
+    log.info("Cached %d hash sets, %d CLIP embeddings", len(asset_hashes), len(asset_embeddings))
+
+    pipeline_stats: Dict[str, Any] = {
+        "total_images": len(discovered_images),
+        "download_failed": 0,
+        "hash_rejected": 0,
+        "clip_rejected": 0,
+        "filter_rejected": 0,
+        "below_threshold": 0,
+        "verification_rejected": 0,
+        "matched_new": 0,
+        "matched_confirmed": 0,
+        "drift_detected": 0,
+        "errors": 0,
+    }
+
     for idx, image in enumerate(discovered_images):
-        print(f"\n[Image Analysis] [{idx + 1}/{len(discovered_images)}] Processing image: {image['id']}")
-        print(f"[Image Analysis]   URL: {image['image_url'][:100]}...")
-        print(f"[Image Analysis]   Source Type: {image.get('source_type', 'unknown')}")
-        print(f"[Image Analysis]   Channel: {image.get('channel', 'unknown')}")
-        
-        try:
-            result = await ai_service.process_discovered_image(
-                image["id"],
-                image["image_url"],
-                campaign_assets,
-                brand_rules,
-                source_type=image.get("source_type"),  # Pass source type for screenshot detection
-                channel=image.get("channel")  # Pass channel for calibration
-            )
-            
-            if result:
-                print(f"[Image Analysis]   MATCH FOUND!")
-                print(f"[Image Analysis]     Asset ID: {result['asset_id']}")
-                print(f"[Image Analysis]     Confidence: {result['confidence_score']}%")
-                print(f"[Image Analysis]     Match Type: {result['match_type']}")
-                print(f"[Image Analysis]     Compliance: {result['compliance_status']}")
-                
-                # DEDUPLICATION DISABLED FOR TESTING - always create new match
-                try:
-                    match_record = supabase.table("matches").insert({
-                        "asset_id": str(result["asset_id"]),
-                        "discovered_image_id": image["id"],
-                        "distributor_id": image.get("distributor_id"),
-                        "confidence_score": result["confidence_score"],
-                        "match_type": result["match_type"],
-                        "is_modified": result["is_modified"],
-                        "modifications": result["modifications"],
-                        "channel": image.get("channel"),
-                        "source_url": image.get("source_url"),
-                        "screenshot_url": image.get("image_url"),  # The discovered image URL for visual comparison
-                        "compliance_status": result["compliance_status"],
-                        "compliance_issues": result["compliance_issues"],
-                        "ai_analysis": result["ai_analysis"],
-                        "discovered_at": image.get("discovered_at")
-                    }).execute()
-                    
-                    print(f"[Image Analysis]     Match record created: {match_record.data[0]['id'] if match_record.data else 'unknown'}")
-                    matches_created += 1
-                    
-                    # Create alert if violation
-                    if result["compliance_status"] == "violation":
-                        org_id = organization_id or image.get("organization_id")
-                        if org_id:
-                            supabase.table("alerts").insert({
-                                "organization_id": org_id,
-                                "match_id": match_record.data[0]["id"] if match_record.data else None,
-                                "distributor_id": image.get("distributor_id"),
-                                "alert_type": "compliance_violation",
-                                "severity": "warning",
-                                "title": f"Compliance violation detected",
-                                "description": result["ai_analysis"].get("compliance", {}).get("summary", "")
-                            }).execute()
-                        violations_found += 1
-                        print(f"[Image Analysis]     VIOLATION ALERT created!")
-                except Exception as db_error:
-                    print(f"[Image Analysis]     Failed to create match record: {db_error}")
-                    errors += 1
-            else:
-                print(f"[Image Analysis]   No match (below threshold or not relevant)")
-                skipped += 1
-                # Only create matches for actual confident matches - no noise
-            
-            # Mark image as processed
-            supabase.table("discovered_images").update({
-                "is_processed": True
-            }).eq("id", image["id"]).execute()
-            
-        except Exception as e:
-            print(f"[Image Analysis]   ERROR: {e}")
-            import traceback
-            traceback.print_exc()
-            errors += 1
-            # Still mark as processed to avoid infinite retry loops
-            supabase.table("discovered_images").update({
-                "is_processed": True
-            }).eq("id", image["id"]).execute()
-            continue
-    
-    print(f"\n[Image Analysis] ========================================")
-    print(f"[Image Analysis] ANALYSIS COMPLETE")
-    print(f"[Image Analysis] ----------------------------------------")
-    print(f"[Image Analysis] Total processed: {len(discovered_images)}")
-    print(f"[Image Analysis] Matches created: {matches_created}")
-    print(f"[Image Analysis] Violations found: {violations_found}")
-    print(f"[Image Analysis] Skipped (no match): {skipped}")
-    print(f"[Image Analysis] Errors: {errors}")
-    print(f"[Image Analysis] ========================================")
-    
-    # Update scan job with matches count
-    # Get scan_job_id from the first discovered image if not passed directly
+        log.info("[%d/%d] Processing image %s — URL: %s, source: %s, channel: %s",
+                 idx + 1, len(discovered_images), image["id"],
+                 image["image_url"][:100], image.get("source_type", "unknown"),
+                 image.get("channel", "unknown"))
+
+        await _analyze_single_image(
+            image, campaign_assets, brand_rules,
+            organization_id, scan_job_id,
+            asset_hashes, asset_embeddings, pipeline_stats,
+        )
+
+    total_matches = pipeline_stats["matched_new"] + pipeline_stats["matched_confirmed"]
+
+    cache_stats = ai_service.get_image_cache_stats()
+    pipeline_stats["image_cache"] = cache_stats
+
+    log.info(
+        "Image analysis complete — processed=%d new=%d confirmed=%d drift=%d errors=%d",
+        len(discovered_images), pipeline_stats["matched_new"],
+        pipeline_stats["matched_confirmed"], pipeline_stats["drift_detected"],
+        pipeline_stats["errors"],
+    )
+    log.info("Pipeline funnel: %s", pipeline_stats)
+    log.info("Image cache: %d hits, %d misses (%.1f%% hit rate, %.2f MB cached)",
+             cache_stats["hits"], cache_stats["misses"],
+             cache_stats["hit_rate"], cache_stats["cached_mb"])
+
     job_id = scan_job_id
     if not job_id and discovered_images:
         job_id = discovered_images[0].get("scan_job_id")
-    
+
     if job_id:
-        print(f"[Image Analysis] Updating scan job {job_id} with matches_count={matches_created}")
+        log.info("Updating scan job %s with matches_count=%d (new=%d, confirmed=%d)",
+                 job_id, total_matches,
+                 pipeline_stats["matched_new"], pipeline_stats["matched_confirmed"])
         supabase.table("scan_jobs").update({
-            "matches_count": matches_created
+            "matches_count": total_matches,
+            "pipeline_stats": pipeline_stats,
         }).eq("id", str(job_id)).execute()
 
 
 @router.post("/quick-scan")
 async def quick_scan(
-    organization_id: UUID,
     source: ScanSource,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    user: AuthUser = Depends(get_current_user),
 ):
     """
     Quick scan - starts a scan and immediately begins analysis.
@@ -769,10 +1103,11 @@ async def quick_scan(
     # Create scan job
     job = await start_scan(
         ScanJobCreate(
-            organization_id=organization_id,
+            organization_id=user.org_id,
             source=source
         ),
-        background_tasks
+        background_tasks,
+        user
     )
     
     return {
@@ -862,13 +1197,11 @@ async def reprocess_unprocessed_images(
 async def debug_scan(scan_id: UUID):
     """
     Debug endpoint to inspect scan details and identify issues.
-    
-    Returns detailed information about:
-    - Scan job status
-    - Discovered images
-    - Campaign assets
-    - Matches created
+    Only available when ENABLE_DANGEROUS_ENDPOINTS=true.
     """
+    from ..config import get_settings
+    if not get_settings().enable_dangerous_endpoints:
+        raise HTTPException(status_code=403, detail="Debug endpoint is disabled in this environment")
     # Get scan job
     job = supabase.table("scan_jobs")\
         .select("*")\
@@ -915,7 +1248,6 @@ async def debug_scan(scan_id: UUID):
             "processed_items": job.data.get("processed_items", 0),
             "matches_count": job.data.get("matches_count", 0),
             "error_message": job.data.get("error_message"),
-            "apify_run_id": job.data.get("apify_run_id"),
         },
         "discovered_images": {
             "count": len(discovered.data) if discovered.data else 0,
@@ -1002,4 +1334,3 @@ def _get_scan_issues(job, discovered, assets, matches):
         issues.append(f"Scan failed: {job.get('error_message', 'Unknown error')}")
     
     return issues if issues else ["No issues detected"]
-

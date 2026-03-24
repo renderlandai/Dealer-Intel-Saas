@@ -1,11 +1,11 @@
 """Campaign and Asset routes."""
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks
+import logging
+from datetime import datetime, timezone
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks, Depends
 from typing import List, Optional
 from uuid import UUID
-import httpx
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
+from ..auth import AuthUser, get_current_user
 from ..database import supabase
 from ..models import (
     Campaign, CampaignCreate, CampaignUpdate,
@@ -13,16 +13,9 @@ from ..models import (
     ScanJob, ScanSource, ScanJobCreate
 )
 
+log = logging.getLogger("dealer_intel.campaigns")
+
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
-
-# Thread pool for parallel DB queries
-_executor = ThreadPoolExecutor(max_workers=10)
-
-
-async def run_in_thread(func):
-    """Run a synchronous function in a thread pool."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_executor, func)
 
 
 # ============================================
@@ -31,73 +24,55 @@ async def run_in_thread(func):
 
 @router.get("", response_model=List[Campaign])
 async def list_campaigns(
-    organization_id: Optional[UUID] = None,
-    status: Optional[str] = None
+    status: Optional[str] = None,
+    user: AuthUser = Depends(get_current_user),
 ):
     """List all campaigns."""
-    def get_campaigns():
-        query = supabase.table("campaigns").select("*")
-        if organization_id:
-            query = query.eq("organization_id", str(organization_id))
-        if status:
-            query = query.eq("status", status)
-        return query.order("created_at", desc=True).execute()
-    
-    def get_asset_counts():
-        # Get all asset counts in one query grouped by campaign
-        return supabase.table("assets").select("campaign_id").execute()
-    
-    # Run both queries in parallel
-    campaigns_result, assets_result = await asyncio.gather(
-        run_in_thread(get_campaigns),
-        run_in_thread(get_asset_counts),
-    )
-    
+    query = supabase.table("campaigns").select("*")
+    query = query.eq("organization_id", str(user.org_id))
+    if status:
+        query = query.eq("status", status)
+    campaigns_result = query.order("created_at", desc=True).execute()
+
+    assets_result = supabase.table("assets").select("campaign_id").execute()
+
     # Count assets per campaign
     asset_counts = {}
     for asset in assets_result.data:
         cid = asset.get("campaign_id")
         if cid:
             asset_counts[cid] = asset_counts.get(cid, 0) + 1
-    
+
     # Add asset counts to campaigns
     campaigns = []
     for camp in campaigns_result.data:
         camp["asset_count"] = asset_counts.get(camp["id"], 0)
         campaigns.append(camp)
-    
+
     return campaigns
 
 
 @router.get("/{campaign_id}", response_model=Campaign)
 async def get_campaign(campaign_id: UUID):
     """Get a specific campaign."""
-    def get_campaign_data():
-        return supabase.table("campaigns").select("*").eq("id", str(campaign_id)).execute()
-    
-    def get_asset_count():
-        return supabase.table("assets").select("id", count="exact").eq("campaign_id", str(campaign_id)).execute()
-    
-    # Run both queries in parallel
-    result, asset_count = await asyncio.gather(
-        run_in_thread(get_campaign_data),
-        run_in_thread(get_asset_count),
-    )
-    
+    result = supabase.table("campaigns").select("*").eq("id", str(campaign_id)).execute()
+
     if not result.data:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    
+
+    asset_count = supabase.table("assets").select("id", count="exact").eq("campaign_id", str(campaign_id)).execute()
+
     campaign_data = result.data[0]
     campaign_data["asset_count"] = asset_count.count or 0
-    
+
     return campaign_data
 
 
 @router.post("", response_model=Campaign)
-async def create_campaign(campaign: CampaignCreate):
+async def create_campaign(campaign: CampaignCreate, user: AuthUser = Depends(get_current_user)):
     """Create a new campaign."""
     data = campaign.model_dump()
-    data["organization_id"] = str(data["organization_id"])
+    data["organization_id"] = str(user.org_id)
     
     if data.get("start_date"):
         data["start_date"] = data["start_date"].isoformat()
@@ -176,9 +151,27 @@ async def upload_asset(
     import uuid as uuid_lib
     import time
     import base64
-    
-    # Read file content
+
+    ALLOWED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp", "image/svg+xml"}
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+    if file.content_type and file.content_type not in ALLOWED_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type '{file.content_type}' not allowed. Accepted: {', '.join(sorted(ALLOWED_TYPES))}",
+        )
+
     content = await file.read()
+
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large ({len(content) / 1024 / 1024:.1f} MB). Maximum is {MAX_FILE_SIZE // 1024 // 1024} MB.",
+        )
+
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="File is empty.")
+
     file_name = file.filename or "unnamed"
     asset_name = name or file_name
     
@@ -205,7 +198,7 @@ async def upload_asset(
         file_url = bucket.get_public_url(storage_path)
         
     except Exception as storage_error:
-        print(f"Storage upload failed: {storage_error}")
+        log.error("Storage upload failed: %s", storage_error)
         # Fallback: use base64 data URL (works without storage bucket)
         base64_content = base64.b64encode(content).decode('utf-8')
         file_url = f"data:{file.content_type};base64,{base64_content}"
@@ -225,8 +218,8 @@ async def upload_asset(
         
     except Exception as e:
         error_str = str(e)
-        print(f"Database error: {type(e).__name__}: {error_str}")
-        raise HTTPException(status_code=500, detail=f"Failed to save asset: {error_str}")
+        log.error("Database error: %s: %s", type(e).__name__, error_str)
+        raise HTTPException(status_code=500, detail="Failed to save asset. Please try again.")
 
 
 @router.get("/assets/{asset_id}", response_model=Asset)
@@ -264,7 +257,8 @@ async def start_campaign_scan(
     campaign_id: UUID,
     source: ScanSource,
     background_tasks: BackgroundTasks,
-    distributor_ids: Optional[List[UUID]] = None
+    distributor_ids: Optional[List[UUID]] = None,
+    user: AuthUser = Depends(get_current_user),
 ):
     """
     Start a scan specifically for this campaign.
@@ -325,7 +319,8 @@ async def start_campaign_scan(
         return scan_job
     
     # Import scan functions from scanning router
-    from .scanning import run_google_ads_scan, run_facebook_scan, run_website_scan
+    from .scanning import run_google_ads_scan, run_facebook_scan, run_instagram_scan, run_website_scan
+    from ..services import apify_instagram_service
     
     # Build distributor mappings and trigger scans (passing campaign_id for auto-analysis)
     if source == ScanSource.GOOGLE_ADS:
@@ -335,8 +330,20 @@ async def start_campaign_scan(
             for d in distributor_list
         }
         background_tasks.add_task(run_google_ads_scan, names, scan_job_id, mapping, campaign_id)
-        
-    elif source in [ScanSource.FACEBOOK, ScanSource.INSTAGRAM]:
+
+    elif source == ScanSource.INSTAGRAM:
+        urls = [d["instagram_url"] for d in distributor_list if d.get("instagram_url")]
+        mapping = {}
+        for d in distributor_list:
+            ig_url = d.get("instagram_url")
+            if ig_url:
+                username = apify_instagram_service._extract_username(ig_url)
+                if username:
+                    mapping[username.lower()] = UUID(d["id"])
+                mapping[d["name"].lower()] = UUID(d["id"])
+        background_tasks.add_task(run_instagram_scan, urls, scan_job_id, mapping, campaign_id)
+
+    elif source == ScanSource.FACEBOOK:
         urls = [d["facebook_url"] for d in distributor_list if d.get("facebook_url")]
         mapping = {d["name"].lower(): UUID(d["id"]) for d in distributor_list}
         background_tasks.add_task(run_facebook_scan, urls, scan_job_id, mapping, campaign_id)
@@ -352,7 +359,7 @@ async def start_campaign_scan(
     # Update job status to running
     supabase.table("scan_jobs").update({
         "status": "running",
-        "started_at": "now()"
+        "started_at": datetime.now(timezone.utc).isoformat()
     }).eq("id", str(scan_job_id)).execute()
     scan_job["status"] = "running"
     
@@ -363,7 +370,8 @@ async def start_campaign_scan(
 async def list_campaign_scans(
     campaign_id: UUID,
     status: Optional[str] = None,
-    limit: int = 20
+    limit: int = 20,
+    user: AuthUser = Depends(get_current_user),
 ):
     """List all scan jobs for a specific campaign."""
     query = supabase.table("scan_jobs")\
@@ -378,7 +386,7 @@ async def list_campaign_scans(
 
 
 @router.get("/{campaign_id}/scans/{scan_id}", response_model=ScanJob)
-async def get_campaign_scan(campaign_id: UUID, scan_id: UUID):
+async def get_campaign_scan(campaign_id: UUID, scan_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get details of a specific scan job for a campaign."""
     result = supabase.table("scan_jobs")\
         .select("*")\
@@ -397,7 +405,8 @@ async def get_campaign_scan(campaign_id: UUID, scan_id: UUID):
 async def analyze_campaign_scan(
     campaign_id: UUID,
     scan_id: UUID,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    user: AuthUser = Depends(get_current_user),
 ):
     """
     Analyze discovered images from a campaign scan.
@@ -471,7 +480,8 @@ async def analyze_campaign_scan(
 async def get_campaign_matches(
     campaign_id: UUID,
     compliance_status: Optional[str] = None,
-    limit: int = 50
+    limit: int = 50,
+    user: AuthUser = Depends(get_current_user),
 ):
     """Get all matches found for this campaign's assets."""
     query = supabase.table("matches")\
@@ -501,47 +511,37 @@ async def get_campaign_matches(
 
 
 @router.get("/{campaign_id}/scan-stats")
-async def get_campaign_scan_stats(campaign_id: UUID):
+async def get_campaign_scan_stats(campaign_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get scan statistics for a campaign."""
     cid = str(campaign_id)
-    
-    def get_all_scans():
-        return supabase.table("scan_jobs").select("status").eq("campaign_id", cid).execute()
-    
-    def get_matches():
-        return supabase.table("matches")\
-            .select("compliance_status, assets!inner(campaign_id)")\
-            .eq("assets.campaign_id", cid)\
-            .execute()
-    
-    def get_last_scan():
-        return supabase.table("scan_jobs")\
-            .select("*")\
-            .eq("campaign_id", cid)\
-            .order("created_at", desc=True)\
-            .limit(1)\
-            .execute()
-    
-    # Run all queries in parallel
-    scans_result, matches_result, last_scan_result = await asyncio.gather(
-        run_in_thread(get_all_scans),
-        run_in_thread(get_matches),
-        run_in_thread(get_last_scan),
-    )
-    
+
+    scans_result = supabase.table("scan_jobs").select("status").eq("campaign_id", cid).execute()
+
+    matches_result = supabase.table("matches")\
+        .select("compliance_status, assets!inner(campaign_id)")\
+        .eq("assets.campaign_id", cid)\
+        .execute()
+
+    last_scan_result = supabase.table("scan_jobs")\
+        .select("*")\
+        .eq("campaign_id", cid)\
+        .order("created_at", desc=True)\
+        .limit(1)\
+        .execute()
+
     # Count scan statuses
     status_counts = {"completed": 0, "running": 0, "failed": 0, "pending": 0}
     for scan in scans_result.data:
         status = scan.get("status", "pending")
         if status in status_counts:
             status_counts[status] += 1
-    
+
     # Count match statuses
     total_matches = len(matches_result.data)
     violations = len([m for m in matches_result.data if m.get("compliance_status") == "violation"])
     compliant = len([m for m in matches_result.data if m.get("compliance_status") == "compliant"])
     pending_review = len([m for m in matches_result.data if m.get("compliance_status") in ["pending", "review"]])
-    
+
     return {
         "total_scans": len(scans_result.data),
         "completed_scans": status_counts["completed"],

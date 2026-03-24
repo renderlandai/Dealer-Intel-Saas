@@ -12,6 +12,10 @@ import {
   ExternalLink,
   ImageIcon,
   Clock,
+  ThumbsUp,
+  ThumbsDown,
+  Brain,
+  Loader2,
 } from "lucide-react";
 import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
@@ -19,6 +23,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import { getMatch, approveMatch, flagMatch } from "@/lib/api";
+import { useSubmitFeedback } from "@/lib/hooks";
 import { getMatchTypeBadge, getComplianceStatusBadge, formatDateTime } from "@/lib/utils";
 
 interface Match {
@@ -34,7 +39,7 @@ interface Match {
   channel?: string;
   source_url?: string;
   screenshot_url?: string;
-  discovered_image_url?: string;  // From the view - fallback to discovered_images.image_url
+  discovered_image_url?: string;
   is_modified: boolean;
   modifications: string[];
   ai_analysis?: any;
@@ -48,6 +53,8 @@ export default function MatchDetailPage() {
 
   const [match, setMatch] = useState<Match | null>(null);
   const [loading, setLoading] = useState(true);
+  const [feedbackSent, setFeedbackSent] = useState<"correct" | "incorrect" | null>(null);
+  const feedbackMutation = useSubmitFeedback();
 
   useEffect(() => {
     loadMatch();
@@ -79,6 +86,21 @@ export default function MatchDetailPage() {
       loadMatch();
     } catch (error) {
       console.error("Failed to flag:", error);
+    }
+  };
+
+  const handleFeedback = async (wasCorrect: boolean) => {
+    try {
+      await feedbackMutation.mutateAsync({
+        matchId,
+        feedback: {
+          was_correct: wasCorrect,
+          actual_verdict: wasCorrect ? "true_positive" : "false_positive",
+        },
+      });
+      setFeedbackSent(wasCorrect ? "correct" : "incorrect");
+    } catch (error) {
+      console.error("Failed to submit feedback:", error);
     }
   };
 
@@ -359,6 +381,91 @@ export default function MatchDetailPage() {
                     {match.ai_analysis.compliance.summary}
                   </p>
                 )}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* AI Feedback — trains adaptive thresholds */}
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Brain className="h-5 w-5 text-primary" />
+              AI Accuracy Feedback
+            </CardTitle>
+          </CardHeader>
+          <CardContent>
+            {feedbackSent ? (
+              <div className={`flex items-center gap-3 p-4 rounded-lg ${
+                feedbackSent === "correct"
+                  ? "bg-emerald-500/10 border border-emerald-500/20"
+                  : "bg-amber-500/10 border border-amber-500/20"
+              }`}>
+                {feedbackSent === "correct" ? (
+                  <ThumbsUp className="h-5 w-5 text-emerald-400" />
+                ) : (
+                  <ThumbsDown className="h-5 w-5 text-amber-400" />
+                )}
+                <div>
+                  <p className={`font-medium ${
+                    feedbackSent === "correct" ? "text-emerald-400" : "text-amber-400"
+                  }`}>
+                    {feedbackSent === "correct" ? "Confirmed as correct match" : "Flagged as incorrect match"}
+                  </p>
+                  <p className="text-sm text-muted-foreground mt-0.5">
+                    Feedback recorded — thresholds will adapt over time
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <p className="text-sm text-muted-foreground">
+                  Was this match correctly identified by the AI? Your feedback
+                  helps calibrate detection thresholds automatically.
+                </p>
+                <div className="flex gap-3">
+                  <Button
+                    variant="outline"
+                    className="flex-1 h-12 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/10 hover:border-emerald-500/50"
+                    onClick={() => handleFeedback(true)}
+                    disabled={feedbackMutation.isPending}
+                  >
+                    {feedbackMutation.isPending ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <ThumbsUp className="mr-2 h-4 w-4" />
+                    )}
+                    Correct Match
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="flex-1 h-12 text-amber-400 border-amber-500/30 hover:bg-amber-500/10 hover:border-amber-500/50"
+                    onClick={() => handleFeedback(false)}
+                    disabled={feedbackMutation.isPending}
+                  >
+                    {feedbackMutation.isPending ? (
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    ) : (
+                      <ThumbsDown className="mr-2 h-4 w-4" />
+                    )}
+                    Incorrect Match
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {/* Ensemble scores breakdown */}
+            {match.ai_analysis?.ensemble_scores && (
+              <div className="mt-4 pt-4 border-t border-border/30">
+                <p className="text-xs text-muted-foreground mb-2 uppercase tracking-wider">Pipeline Scores</p>
+                <div className="grid grid-cols-3 gap-3">
+                  {Object.entries(match.ai_analysis.ensemble_scores as Record<string, number>).map(([key, val]) => (
+                    <div key={key} className="text-center p-2 bg-secondary/50 rounded">
+                      <p className="text-xs text-muted-foreground capitalize">{key}</p>
+                      <p className="text-sm font-mono font-medium mt-0.5">{val}</p>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </CardContent>

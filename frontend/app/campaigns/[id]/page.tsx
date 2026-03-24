@@ -18,7 +18,12 @@ import {
   Eye,
   ExternalLink,
   Loader2,
-  Sparkles
+  Sparkles,
+  Download,
+  CalendarClock,
+  Plus,
+  Power,
+  PowerOff
 } from "lucide-react";
 import Link from "next/link";
 import { Header } from "@/components/layout/header";
@@ -36,7 +41,13 @@ import {
   getCampaignScans,
   getCampaignMatches,
   getCampaignScanStats,
-  getCampaignScan
+  getCampaignScan,
+  downloadComplianceReport,
+  getSchedules,
+  createSchedule,
+  updateSchedule,
+  deleteSchedule,
+  ScanSchedule,
 } from "@/lib/api";
 import { formatDate } from "@/lib/utils";
 
@@ -77,9 +88,12 @@ interface Match {
   confidence_score: number;
   match_type: string;
   compliance_status: string;
+  previous_compliance_status?: string;
   source_url?: string;
   channel?: string;
   created_at: string;
+  last_seen_at?: string;
+  scan_count?: number;
 }
 
 interface ScanStats {
@@ -95,10 +109,10 @@ interface ScanStats {
 }
 
 const SCAN_SOURCES = [
-  { value: "google_ads", label: "Google Ads", icon: "🔍" },
-  { value: "facebook", label: "Facebook", icon: "📘" },
-  { value: "instagram", label: "Instagram", icon: "📷" },
-  { value: "website", label: "Websites", icon: "🌐" },
+  { value: "google_ads", label: "Google Ads", icon: "🔍", desc: "Paid display ads" },
+  { value: "facebook", label: "Facebook Ads", icon: "📘", desc: "Meta Ad Library" },
+  { value: "instagram", label: "Instagram", icon: "📷", desc: "Organic posts" },
+  { value: "website", label: "Websites", icon: "🌐", desc: "Dealer sites" },
 ];
 
 export default function CampaignDetailPage() {
@@ -123,7 +137,64 @@ export default function CampaignDetailPage() {
   const [activeTab, setActiveTab] = useState(initialTab);
   const [pollingScanId, setPollingScanId] = useState<string | null>(null);
   const [deletingAssetId, setDeletingAssetId] = useState<string | null>(null);
+  const [downloadingReport, setDownloadingReport] = useState<string | null>(null);
   const pollingInterval = useRef<NodeJS.Timeout | null>(null);
+
+  // Schedule state
+  const [schedules, setSchedules] = useState<ScanSchedule[]>([]);
+  const [scheduleLoading, setScheduleLoading] = useState(false);
+  const [newSchedSource, setNewSchedSource] = useState("website");
+  const [newSchedFreq, setNewSchedFreq] = useState("weekly");
+  const [newSchedTime, setNewSchedTime] = useState("09:00");
+  const [newSchedDay, setNewSchedDay] = useState<number>(0);
+  const [creatingSched, setCreatingSched] = useState(false);
+
+  const DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+  const loadSchedules = async () => {
+    setScheduleLoading(true);
+    try {
+      const data = await getSchedules(campaignId);
+      setSchedules(data);
+    } catch { /* table may not exist yet */ }
+    finally { setScheduleLoading(false); }
+  };
+
+  const handleCreateSchedule = async () => {
+    setCreatingSched(true);
+    try {
+      const dayVal = (newSchedFreq === "weekly" || newSchedFreq === "biweekly") ? newSchedDay : undefined;
+      await createSchedule(campaignId, newSchedSource, newSchedFreq, newSchedTime, dayVal);
+      await loadSchedules();
+    } catch (err: any) {
+      alert(err?.response?.data?.detail || "Failed to create schedule");
+    } finally { setCreatingSched(false); }
+  };
+
+  const handleToggleSchedule = async (s: ScanSchedule) => {
+    try {
+      await updateSchedule(s.id, { is_active: !s.is_active });
+      await loadSchedules();
+    } catch { /* ignore */ }
+  };
+
+  const handleDeleteSchedule = async (id: string) => {
+    try {
+      await deleteSchedule(id);
+      setSchedules((prev) => prev.filter((s) => s.id !== id));
+    } catch { /* ignore */ }
+  };
+
+  const handleDownloadReport = async (format: "pdf" | "csv") => {
+    setDownloadingReport(format);
+    try {
+      await downloadComplianceReport(format, { campaign_id: campaignId });
+    } catch (error) {
+      console.error("Download failed:", error);
+    } finally {
+      setDownloadingReport(null);
+    }
+  };
 
   useEffect(() => {
     loadCampaign();
@@ -141,6 +212,8 @@ export default function CampaignDetailPage() {
       loadScans();
     } else if (activeTab === "results") {
       loadMatches();
+    } else if (activeTab === "schedules") {
+      loadSchedules();
     }
   }, [activeTab, campaignId]);
 
@@ -463,7 +536,7 @@ export default function CampaignDetailPage() {
 
         {/* Tabs */}
         <Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-4">
-          <TabsList className="grid w-full grid-cols-3">
+          <TabsList className="grid w-full grid-cols-4">
             <TabsTrigger value="assets" className="flex items-center gap-2">
               <ImageIcon className="h-4 w-4" />
               Assets ({assets.length})
@@ -475,6 +548,10 @@ export default function CampaignDetailPage() {
             <TabsTrigger value="results" className="flex items-center gap-2">
               <Eye className="h-4 w-4" />
               Results ({scanStats?.total_matches || 0})
+            </TabsTrigger>
+            <TabsTrigger value="schedules" className="flex items-center gap-2">
+              <CalendarClock className="h-4 w-4" />
+              Schedules
             </TabsTrigger>
           </TabsList>
 
@@ -615,6 +692,7 @@ export default function CampaignDetailPage() {
                       >
                         <span className="text-2xl">{source.icon}</span>
                         <span className="font-medium">{source.label}</span>
+                        <span className="text-2xs text-muted-foreground">{source.desc}</span>
                         {scanning && selectedSource === source.value && (
                           <RefreshCw className="h-4 w-4 animate-spin" />
                         )}
@@ -717,13 +795,39 @@ export default function CampaignDetailPage() {
           <TabsContent value="results" className="space-y-4">
             <Card>
               <CardHeader>
-                <CardTitle className="flex items-center gap-2">
-                  <Eye className="h-5 w-5" />
-                  Scan Results
-                </CardTitle>
-                <CardDescription>
-                  Matches found between your campaign assets and distributor ads
-                </CardDescription>
+                <div className="flex items-start justify-between">
+                  <div>
+                    <CardTitle className="flex items-center gap-2">
+                      <Eye className="h-5 w-5" />
+                      Scan Results
+                    </CardTitle>
+                    <CardDescription className="mt-1">
+                      Matches found between your campaign assets and distributor ads
+                    </CardDescription>
+                  </div>
+                  {matches.length > 0 && (
+                    <div className="flex gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleDownloadReport("pdf")}
+                        disabled={downloadingReport !== null}
+                      >
+                        <Download className="mr-1.5 h-3.5 w-3.5" />
+                        {downloadingReport === "pdf" ? "..." : "PDF"}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleDownloadReport("csv")}
+                        disabled={downloadingReport !== null}
+                      >
+                        <Download className="mr-1.5 h-3.5 w-3.5" />
+                        {downloadingReport === "csv" ? "..." : "CSV"}
+                      </Button>
+                    </div>
+                  )}
+                </div>
               </CardHeader>
               <CardContent>
                 {matches.length === 0 ? (
@@ -777,6 +881,16 @@ export default function CampaignDetailPage() {
                                 {match.channel.replace("_", " ")}
                               </Badge>
                             )}
+                            {(match.scan_count ?? 0) > 1 && (
+                              <span className="text-muted-foreground" title={`Last confirmed: ${match.last_seen_at ? new Date(match.last_seen_at).toLocaleDateString() : "unknown"}`}>
+                                Seen {match.scan_count}x
+                              </span>
+                            )}
+                            {match.previous_compliance_status && match.previous_compliance_status !== match.compliance_status && (
+                              <Badge className="bg-amber-500/20 text-amber-400">
+                                was {match.previous_compliance_status}
+                              </Badge>
+                            )}
                           </div>
                           {match.source_url && (
                             <a
@@ -791,6 +905,151 @@ export default function CampaignDetailPage() {
                         </div>
                       </div>
                     ))}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </TabsContent>
+
+          {/* Schedules Tab */}
+          <TabsContent value="schedules" className="space-y-4">
+            {/* Create new schedule */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-lg">Add Automated Scan</CardTitle>
+                <CardDescription>Configure a recurring scan for this campaign</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="flex flex-wrap items-end gap-4">
+                  <div className="space-y-1.5">
+                    <label className="text-sm font-medium text-muted-foreground">Channel</label>
+                    <select
+                      value={newSchedSource}
+                      onChange={(e) => setNewSchedSource(e.target.value)}
+                      className="flex h-9 w-[160px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    >
+                      {SCAN_SOURCES.map((s) => (
+                        <option key={s.value} value={s.value}>{s.label}</option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-sm font-medium text-muted-foreground">Frequency</label>
+                    <select
+                      value={newSchedFreq}
+                      onChange={(e) => setNewSchedFreq(e.target.value)}
+                      className="flex h-9 w-[160px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    >
+                      <option value="daily">Daily</option>
+                      <option value="weekly">Weekly</option>
+                      <option value="biweekly">Every 2 Weeks</option>
+                      <option value="monthly">Monthly</option>
+                    </select>
+                  </div>
+
+                  {(newSchedFreq === "weekly" || newSchedFreq === "biweekly") && (
+                    <div className="space-y-1.5">
+                      <label className="text-sm font-medium text-muted-foreground">Day</label>
+                      <select
+                        value={newSchedDay}
+                        onChange={(e) => setNewSchedDay(Number(e.target.value))}
+                        className="flex h-9 w-[140px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      >
+                        {DAYS_OF_WEEK.map((d, i) => (
+                          <option key={i} value={i}>{d}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  <div className="space-y-1.5">
+                    <label className="text-sm font-medium text-muted-foreground">Time (UTC)</label>
+                    <input
+                      type="time"
+                      value={newSchedTime}
+                      onChange={(e) => setNewSchedTime(e.target.value)}
+                      className="flex h-9 w-[120px] rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    />
+                  </div>
+
+                  <Button onClick={handleCreateSchedule} disabled={creatingSched} size="sm">
+                    {creatingSched ? <Loader2 className="h-4 w-4 animate-spin mr-1" /> : <Plus className="h-4 w-4 mr-1" />}
+                    Add Schedule
+                  </Button>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Active schedules */}
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-lg">Active Schedules</CardTitle>
+              </CardHeader>
+              <CardContent>
+                {scheduleLoading ? (
+                  <div className="flex justify-center py-8">
+                    <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                  </div>
+                ) : schedules.length === 0 ? (
+                  <div className="text-center py-8 text-muted-foreground">
+                    <CalendarClock className="h-10 w-10 mx-auto mb-3 opacity-50" />
+                    <p className="font-medium">No schedules yet</p>
+                    <p className="text-sm mt-1">Add an automated scan above to get started</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {schedules.map((s) => {
+                      const sourceLabel = SCAN_SOURCES.find((x) => x.value === s.source)?.label || s.source;
+                      const freqLabel = s.frequency === "biweekly" ? "Every 2 Weeks" : s.frequency.charAt(0).toUpperCase() + s.frequency.slice(1);
+                      const timeLabel = s.run_at_time || "09:00";
+                      const dayLabel = (s.frequency === "weekly" || s.frequency === "biweekly") && s.run_on_day != null
+                        ? DAYS_OF_WEEK[s.run_on_day] + "s"
+                        : null;
+                      const schedDesc = dayLabel ? `${freqLabel} · ${dayLabel} at ${timeLabel} UTC` : `${freqLabel} at ${timeLabel} UTC`;
+                      return (
+                        <div
+                          key={s.id}
+                          className={`flex items-center justify-between rounded-lg border p-4 ${s.is_active ? "bg-card" : "bg-muted/40 opacity-70"}`}
+                        >
+                          <div className="flex items-center gap-4">
+                            <div className={`h-2.5 w-2.5 rounded-full ${s.is_active ? "bg-green-500" : "bg-gray-400"}`} />
+                            <div>
+                              <p className="font-medium text-sm">{sourceLabel}</p>
+                              <p className="text-xs text-muted-foreground">{schedDesc}</p>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-6 text-xs text-muted-foreground">
+                            {s.last_run_at && (
+                              <span>Last run: {formatDate(s.last_run_at)}</span>
+                            )}
+                            {s.next_run_at && s.is_active && (
+                              <span>Next: {formatDate(s.next_run_at)}</span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => handleToggleSchedule(s)}
+                              title={s.is_active ? "Pause" : "Resume"}
+                            >
+                              {s.is_active ? <PowerOff className="h-4 w-4 text-amber-500" /> : <Power className="h-4 w-4 text-green-500" />}
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => handleDeleteSchedule(s.id)}
+                              title="Delete"
+                            >
+                              <TrashIcon className="h-4 w-4 text-destructive" />
+                            </Button>
+                          </div>
+                        </div>
+                      );
+                    })}
                   </div>
                 )}
               </CardContent>

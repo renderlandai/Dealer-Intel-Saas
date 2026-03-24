@@ -23,7 +23,7 @@ interface Campaign {
 }
 
 export default function CampaignsPage() {
-  const { data: campaigns = [], isLoading: loading } = useCampaigns();
+  const { data: campaigns = [], isLoading: loading, isError, error, refetch } = useCampaigns();
   const createCampaignMutation = useCreateCampaign();
   const [showCreate, setShowCreate] = useState(false);
   const [newCampaign, setNewCampaign] = useState({ name: "", description: "" });
@@ -123,6 +123,21 @@ export default function CampaignsPage() {
               </div>
             ))}
           </div>
+        ) : isError ? (
+          <Card className="opacity-0 animate-fade-up border-destructive/30">
+            <CardContent className="flex flex-col items-center justify-center py-16">
+              <div className="h-14 w-14 flex items-center justify-center bg-destructive/10 border border-destructive/20 mb-4">
+                <Folder className="h-7 w-7 text-destructive" />
+              </div>
+              <h3 className="text-base font-medium">Failed to load campaigns</h3>
+              <p className="text-sm text-muted-foreground mt-1 max-w-md text-center">
+                Could not connect to the server. Make sure the backend is running on port 8000.
+              </p>
+              <Button className="mt-6" onClick={() => refetch()} size="sm" variant="outline">
+                Try Again
+              </Button>
+            </CardContent>
+          </Card>
         ) : campaigns.length === 0 ? (
           <Card className="opacity-0 animate-fade-up">
             <CardContent className="flex flex-col items-center justify-center py-16">

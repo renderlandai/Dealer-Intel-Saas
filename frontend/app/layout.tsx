@@ -1,9 +1,7 @@
 import type { Metadata } from "next";
 import "./globals.css";
-import { Sidebar } from "@/components/layout/sidebar";
-import { SidebarProvider } from "@/components/layout/sidebar-context";
-import { MainContent } from "@/components/layout/main-content";
 import { QueryProvider } from "@/lib/query-provider";
+import { AuthGate } from "@/components/layout/auth-gate";
 
 export const metadata: Metadata = {
   title: "Dealer Intel — Campaign Asset Intelligence",
@@ -17,14 +15,15 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className="dark">
+      <head>
+        <link
+          href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css"
+          rel="stylesheet"
+        />
+      </head>
       <body className="antialiased">
         <QueryProvider>
-          <SidebarProvider>
-            <div className="flex min-h-screen">
-              <Sidebar />
-              <MainContent>{children}</MainContent>
-            </div>
-          </SidebarProvider>
+          <AuthGate>{children}</AuthGate>
         </QueryProvider>
       </body>
     </html>

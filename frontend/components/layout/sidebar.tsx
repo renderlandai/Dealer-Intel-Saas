@@ -13,9 +13,11 @@ import {
   Zap,
   ChevronLeft,
   ChevronRight,
+  LogOut,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSidebar } from "./sidebar-context";
+import { useAuth } from "@/lib/auth-context";
 
 const navigation = [
   { name: "Dashboard", href: "/", icon: LayoutDashboard },
@@ -33,6 +35,7 @@ const secondaryNav = [
 export function Sidebar() {
   const pathname = usePathname();
   const { isCollapsed, toggleSidebar } = useSidebar();
+  const { user, signOut } = useAuth();
 
   return (
     <aside 
@@ -163,19 +166,35 @@ export function Sidebar() {
         {/* Footer */}
         <div className="border-t border-border p-4">
           {!isCollapsed ? (
-            <div className="p-4 bg-secondary/50 border border-border">
-              <div className="flex items-center gap-2 mb-2">
-                <div className="status-dot active" />
-                <span className="text-xs font-medium">System Online</span>
+            <div className="p-3 bg-secondary/50 border border-border space-y-3">
+              <div className="flex items-center gap-2">
+                <div className="flex h-7 w-7 items-center justify-center rounded-full bg-primary text-[11px] font-semibold text-primary-foreground flex-shrink-0">
+                  {(user?.email?.[0] || "U").toUpperCase()}
+                </div>
+                <div className="overflow-hidden">
+                  <p className="text-xs font-medium truncate">{user?.email || "User"}</p>
+                  <div className="flex items-center gap-1">
+                    <div className="status-dot active" />
+                    <span className="text-2xs text-muted-foreground">Online</span>
+                  </div>
+                </div>
               </div>
-              <p className="text-2xs text-muted-foreground leading-relaxed">
-                Last scan completed 12m ago. All systems operational.
-              </p>
+              <button
+                onClick={signOut}
+                className="flex w-full items-center gap-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                Sign out
+              </button>
             </div>
           ) : (
-            <div className="flex justify-center">
-              <div className="status-dot active" title="System Online" />
-            </div>
+            <button
+              onClick={signOut}
+              className="flex justify-center w-full"
+              title="Sign out"
+            >
+              <LogOut className="h-4 w-4 text-muted-foreground hover:text-foreground transition-colors" />
+            </button>
           )}
         </div>
 

@@ -1,4 +1,5 @@
 import axios from "axios";
+import { supabase } from "./supabase";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -7,15 +8,21 @@ export const api = axios.create({
   headers: {
     "Content-Type": "application/json",
   },
-  timeout: 15000, // 15 second timeout
+  timeout: 15000,
 });
 
-// Demo organization ID
-export const DEMO_ORG_ID = "00000000-0000-0000-0000-000000000001";
+// Attach Supabase JWT to every request
+api.interceptors.request.use(async (config) => {
+  const { data: { session } } = await supabase.auth.getSession();
+  if (session?.access_token) {
+    config.headers.Authorization = `Bearer ${session.access_token}`;
+  }
+  return config;
+});
 
 // Dashboard
 export const getDashboardStats = async () => {
-  const { data } = await api.get(`/dashboard/stats?organization_id=${DEMO_ORG_ID}`);
+  const { data } = await api.get("/dashboard/stats");
   return data;
 };
 
@@ -41,7 +48,7 @@ export const getCoverageByDistributor = async (limit = 10) => {
 
 // Campaigns
 export const getCampaigns = async () => {
-  const { data } = await api.get(`/campaigns?organization_id=${DEMO_ORG_ID}`);
+  const { data } = await api.get("/campaigns");
   return data;
 };
 
@@ -51,10 +58,7 @@ export const getCampaign = async (id: string) => {
 };
 
 export const createCampaign = async (campaign: any) => {
-  const { data } = await api.post("/campaigns", {
-    ...campaign,
-    organization_id: DEMO_ORG_ID,
-  });
+  const { data } = await api.post("/campaigns", campaign);
   return data;
 };
 
@@ -75,7 +79,7 @@ export const uploadAsset = async (campaignId: string, file: File, name?: string)
   
   const { data } = await api.post(`/campaigns/${campaignId}/assets/upload`, formData, {
     headers: { "Content-Type": "multipart/form-data" },
-    timeout: 60000, // 60 second timeout for file uploads
+    timeout: 60000,
   });
   return data;
 };
@@ -87,7 +91,7 @@ export const deleteAsset = async (assetId: string) => {
 
 // Distributors
 export const getDistributors = async () => {
-  const { data } = await api.get(`/distributors?organization_id=${DEMO_ORG_ID}`);
+  const { data } = await api.get("/distributors");
   return data;
 };
 
@@ -97,10 +101,7 @@ export const getDistributor = async (id: string) => {
 };
 
 export const createDistributor = async (distributor: any) => {
-  const { data } = await api.post("/distributors", {
-    ...distributor,
-    organization_id: DEMO_ORG_ID,
-  });
+  const { data } = await api.post("/distributors", distributor);
   return data;
 };
 
@@ -121,7 +122,7 @@ export const updateDistributor = async (id: string, updates: any) => {
 
 export const lookupGoogleAdsId = async (distributorId: string) => {
   const { data } = await api.post(`/distributors/${distributorId}/lookup-google-ads-id`, {}, {
-    timeout: 180000, // 3 minute timeout for this long-running operation
+    timeout: 180000,
   });
   return data;
 };
@@ -172,10 +173,34 @@ export const deleteAllMatches = async () => {
   return data;
 };
 
+export const submitMatchFeedback = async (
+  matchId: string,
+  feedback: {
+    was_correct: boolean;
+    actual_verdict: "true_positive" | "false_positive" | "true_negative" | "false_negative";
+    review_notes?: string;
+  }
+) => {
+  const { data } = await api.post(`/matches/${matchId}/feedback`, {
+    match_id: matchId,
+    ...feedback,
+  });
+  return data;
+};
+
+export const getFeedbackStats = async () => {
+  const { data } = await api.get("/matches/feedback/stats");
+  return data;
+};
+
+export const getThresholdRecommendations = async () => {
+  const { data } = await api.get("/matches/feedback/thresholds");
+  return data;
+};
+
 // Scanning
 export const startScan = async (source: string, distributorIds?: string[]) => {
   const { data } = await api.post("/scans/start", {
-    organization_id: DEMO_ORG_ID,
     source,
     distributor_ids: distributorIds,
   });
@@ -183,7 +208,7 @@ export const startScan = async (source: string, distributorIds?: string[]) => {
 };
 
 export const getScanJobs = async () => {
-  const { data } = await api.get(`/scans?organization_id=${DEMO_ORG_ID}`);
+  const { data } = await api.get("/scans");
   return data;
 };
 
@@ -251,3 +276,141 @@ export const getCampaignScanStats = async (campaignId: string) => {
   return data;
 };
 
+// Organizations
+export const getOrgSettings = async (orgId?: string) => {
+  const id = orgId || "me";
+  const { data: meData } = await api.get("/auth/me");
+  const resolvedId = orgId || meData.organization_id;
+  const { data } = await api.get(`/organizations/${resolvedId}/settings`);
+  return data;
+};
+
+export const updateOrgSettings = async (
+  updates: {
+    name?: string;
+    report_brand_color?: string;
+    notify_email?: string;
+    notify_on_violation?: boolean;
+  },
+  orgId?: string
+) => {
+  const resolvedId = orgId || (await api.get("/auth/me")).data.organization_id;
+  const { data } = await api.patch(`/organizations/${resolvedId}/settings`, updates);
+  return data;
+};
+
+export const sendTestEmail = async (orgId?: string) => {
+  const resolvedId = orgId || (await api.get("/auth/me")).data.organization_id;
+  const { data } = await api.post(`/organizations/${resolvedId}/test-email`);
+  return data;
+};
+
+export const getOrgLogo = async (orgId?: string) => {
+  const resolvedId = orgId || (await api.get("/auth/me")).data.organization_id;
+  const { data } = await api.get(`/organizations/${resolvedId}/logo`);
+  return data;
+};
+
+export const uploadOrgLogo = async (file: File, orgId?: string) => {
+  const resolvedId = orgId || (await api.get("/auth/me")).data.organization_id;
+  const formData = new FormData();
+  formData.append("file", file);
+  const { data } = await api.post(`/organizations/${resolvedId}/logo`, formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+    timeout: 30000,
+  });
+  return data;
+};
+
+export const deleteOrgLogo = async (orgId?: string) => {
+  const resolvedId = orgId || (await api.get("/auth/me")).data.organization_id;
+  const { data } = await api.delete(`/organizations/${resolvedId}/logo`);
+  return data;
+};
+
+// Reports
+export const downloadComplianceReport = async (
+  format: "pdf" | "csv" = "pdf",
+  options?: {
+    days?: number;
+    campaign_id?: string;
+    distributor_id?: string;
+  }
+) => {
+  const params = new URLSearchParams();
+  params.append("format", format);
+  if (options?.days) params.append("days", String(options.days));
+  if (options?.campaign_id) params.append("campaign_id", options.campaign_id);
+  if (options?.distributor_id) params.append("distributor_id", options.distributor_id);
+
+  const response = await api.get(`/reports/compliance?${params.toString()}`, {
+    responseType: "blob",
+    timeout: 60000,
+  });
+
+  const disposition = response.headers["content-disposition"] || "";
+  const filenameMatch = disposition.match(/filename="?([^"]+)"?/);
+  const filename = filenameMatch
+    ? filenameMatch[1]
+    : `compliance_report.${format}`;
+
+  const url = window.URL.createObjectURL(new Blob([response.data]));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.URL.revokeObjectURL(url);
+};
+
+// ── Scan Schedules ─────────────────────────────────────────────
+export interface ScanSchedule {
+  id: string;
+  organization_id: string;
+  campaign_id: string;
+  source: string;
+  frequency: string;
+  run_at_time: string | null;
+  run_on_day: number | null;
+  is_active: boolean;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+export const getSchedules = async (campaignId?: string): Promise<ScanSchedule[]> => {
+  const params = campaignId ? `?campaign_id=${campaignId}` : "";
+  const { data } = await api.get(`/schedules${params}`);
+  return data;
+};
+
+export const createSchedule = async (
+  campaignId: string,
+  source: string,
+  frequency: string,
+  runAtTime: string = "09:00",
+  runOnDay?: number
+): Promise<ScanSchedule> => {
+  const { data } = await api.post("/schedules", {
+    campaign_id: campaignId,
+    source,
+    frequency,
+    run_at_time: runAtTime,
+    run_on_day: runOnDay ?? null,
+  });
+  return data;
+};
+
+export const updateSchedule = async (
+  scheduleId: string,
+  updates: { frequency?: string; is_active?: boolean; run_at_time?: string; run_on_day?: number }
+): Promise<ScanSchedule> => {
+  const { data } = await api.patch(`/schedules/${scheduleId}`, updates);
+  return data;
+};
+
+export const deleteSchedule = async (scheduleId: string): Promise<void> => {
+  await api.delete(`/schedules/${scheduleId}`);
+};

@@ -1,17 +1,19 @@
 """
 Anthropic Claude AI service for image analysis.
 
-All image analysis powered by Claude Opus 4.5:
-- Image filtering for relevance
-- Visual similarity comparison
-- Asset detection in screenshots
-- Multi-stage verification
-- Compliance analysis
-- Perceptual hashing for fast pre-filtering
-- Domain-specific prompts for dealer/distributor monitoring
-- Confidence calibration based on source type and channel
-- Optimized batch processing with parallel execution
+Pipeline (scale-optimised):
+  Stage 0: Extraction filters — min dimensions, max per page (free)
+  Stage 1: Perceptual hash pre-filter — skip images with no hash
+           resemblance to any campaign asset (free, <1ms)
+  Stage 2: CLIP embedding gate — skip images with low semantic
+           similarity to all campaign assets (local GPU/CPU, ~20ms)
+  Stage 3: Claude Haiku relevance filter (cheap, ~0.1s)
+  Stage 4: Claude Opus ensemble matching + compliance (expensive)
+
+Expensive Claude Opus calls only run on images that survived all
+prior stages, reducing API calls by ~95% at scale.
 """
+import logging
 from typing import List, Dict, Any, Optional, Tuple
 import httpx
 import base64
@@ -30,49 +32,121 @@ from .adaptive_threshold_service import (
     should_verify_match,
     get_calibration_factor_from_feedback
 )
+from . import embedding_service
+
+log = logging.getLogger("dealer_intel.ai_service")
 
 settings = get_settings()
 
 # Configure Anthropic client
 anthropic_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-CLAUDE_MODEL = "claude-opus-4-20250514"  # Claude Opus 4.5 model
+CLAUDE_MODEL = "claude-opus-4-20250514"
+ENSEMBLE_MODEL = "claude-opus-4-20250514"
+FILTER_MODEL = settings.filter_model
 
 
-# =============================================================================
-# IMAGE DOWNLOAD AND OPTIMIZATION
-# =============================================================================
+class _ImageCache:
+    """In-memory LRU image cache that avoids re-downloading the same URL
+    within a scan.  Bounded by entry count and total byte size."""
+
+    def __init__(self, max_entries: int = 200, max_bytes: int = 200 * 1024 * 1024):
+        self._store: dict[str, bytes] = {}
+        self._order: list[str] = []
+        self._max_entries = max_entries
+        self._max_bytes = max_bytes
+        self._total_bytes = 0
+        self.hits = 0
+        self.misses = 0
+
+    def get(self, url: str):
+        data = self._store.get(url)
+        if data is not None:
+            self.hits += 1
+            self._order.remove(url)
+            self._order.append(url)
+            return data
+        self.misses += 1
+        return None
+
+    def put(self, url: str, data: bytes):
+        if url in self._store:
+            return
+        while (
+            len(self._order) >= self._max_entries
+            or self._total_bytes + len(data) > self._max_bytes
+        ) and self._order:
+            evict_url = self._order.pop(0)
+            evicted = self._store.pop(evict_url, None)
+            if evicted:
+                self._total_bytes -= len(evicted)
+        self._store[url] = data
+        self._order.append(url)
+        self._total_bytes += len(data)
+
+    def clear(self):
+        self._store.clear()
+        self._order.clear()
+        self._total_bytes = 0
+        self.hits = 0
+        self.misses = 0
+
+    def stats(self) -> dict:
+        total = self.hits + self.misses
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": round(self.hits / max(total, 1) * 100, 1),
+            "cached_entries": len(self._store),
+            "cached_mb": round(self._total_bytes / (1024 * 1024), 2),
+        }
+
+
+_image_cache = _ImageCache()
+
 
 async def download_image(url: str) -> bytes:
-    """Download image from URL with timeout and error handling.
-    
-    Also handles base64 data URLs (data:image/...;base64,...).
+    """Download image from URL with caching, timeout, and error handling.
+
+    Results are cached in-memory so the same URL is only fetched once per
+    server lifetime (or until the LRU evicts it).
     """
-    # Handle base64 data URLs
     if url.startswith("data:"):
         try:
-            # Extract base64 data from data URL
-            # Format: data:image/png;base64,<base64data>
             header, encoded = url.split(",", 1)
             return base64.b64decode(encoded)
         except Exception as e:
-            print(f"[AI] Error decoding base64 data URL: {e}")
+            log.error("Error decoding base64 data URL: %s", e)
             raise
-    
-    # Regular HTTP(S) URL
+
+    cached = _image_cache.get(url)
+    if cached is not None:
+        return cached
+
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             response = await client.get(url, follow_redirects=True)
             response.raise_for_status()
+            _image_cache.put(url, response.content)
             return response.content
         except httpx.HTTPStatusError as e:
-            print(f"[AI] HTTP error downloading image: {e.response.status_code} - {url[:100]}")
+            log.error("HTTP error downloading image: %d - %s", e.response.status_code, url[:100])
             raise
         except httpx.TimeoutException:
-            print(f"[AI] Timeout downloading image: {url[:100]}")
+            log.error("Timeout downloading image: %s", url[:100])
             raise
         except Exception as e:
-            print(f"[AI] Error downloading image: {e} - {url[:100]}")
+            log.error("Error downloading image: %s - %s", e, url[:100])
             raise
+
+
+def get_image_cache_stats() -> dict:
+    """Return current image cache statistics."""
+    return _image_cache.stats()
+
+
+def clear_image_cache():
+    """Clear the image cache (call between scans if needed)."""
+    _image_cache.clear()
 
 
 def encode_image_base64(image_bytes: bytes) -> str:
@@ -158,18 +232,14 @@ def optimize_image_for_api(
         new_size = len(optimized_bytes)
         if original_size > new_size:
             reduction = 100 - (new_size * 100 // original_size)
-            print(f"[AI] Optimized {analysis_type} image: {original_size/1024:.1f}KB -> {new_size/1024:.1f}KB ({reduction}% reduction)")
+            log.debug("Optimized %s image: %.1fKB -> %.1fKB (%d%% reduction)", analysis_type, original_size / 1024, new_size / 1024, reduction)
         
         return optimized_bytes
         
     except Exception as e:
-        print(f"[AI] Image optimization failed: {e}, using original")
+        log.warning("Image optimization failed: %s, using original", e)
         return image_bytes
 
-
-# =============================================================================
-# PERCEPTUAL HASHING
-# =============================================================================
 
 async def compute_image_hashes(image_bytes: bytes) -> Dict[str, Any]:
     """
@@ -191,7 +261,7 @@ async def compute_image_hashes(image_bytes: bytes) -> Dict[str, Any]:
             "average_hash": imagehash.average_hash(img)
         }
     except Exception as e:
-        print(f"[AI] Hash computation failed: {e}")
+        log.error("Hash computation failed: %s", e)
         return None
 
 
@@ -241,7 +311,7 @@ async def compare_with_hash(
         }
         
     except Exception as e:
-        print(f"[AI Hash] Error: {e}")
+        log.error("Hash comparison error: %s", e)
         return {
             "similarity_score": 0,
             "is_exact": False,
@@ -250,14 +320,11 @@ async def compare_with_hash(
         }
 
 
-# =============================================================================
-# ANTHROPIC API CALLS WITH RETRY
-# =============================================================================
-
 async def call_anthropic_with_retry(
     prompt: str,
     images: List[bytes],
-    max_retries: int = None
+    max_retries: int = None,
+    model: str = None,
 ) -> str:
     """
     Call Anthropic Claude API with retry logic and image support.
@@ -266,6 +333,7 @@ async def call_anthropic_with_retry(
         prompt: Text prompt for the model
         images: List of image bytes to include
         max_retries: Number of retry attempts
+        model: Override model (defaults to CLAUDE_MODEL / Opus)
     
     Returns:
         Response text from Claude
@@ -273,6 +341,7 @@ async def call_anthropic_with_retry(
     if max_retries is None:
         max_retries = settings.max_retries
     
+    use_model = model or CLAUDE_MODEL
     last_error = None
     
     # Build message content with images
@@ -295,8 +364,9 @@ async def call_anthropic_with_retry(
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: anthropic_client.messages.create(
-                    model=CLAUDE_MODEL,
+                    model=use_model,
                     max_tokens=2048,
+                    temperature=0,
                     messages=[{"role": "user", "content": content}]
                 )
             )
@@ -313,16 +383,16 @@ async def call_anthropic_with_retry(
             ])
             
             if not is_retryable:
-                print(f"[AI] Non-retryable error: {e}")
+                log.error("Non-retryable error: %s", e)
                 raise
             
             if attempt < max_retries - 1:
                 backoff = settings.initial_backoff * (2 ** attempt)
-                print(f"[AI] Attempt {attempt + 1} failed: {e}")
-                print(f"[AI] Retrying in {backoff:.1f}s...")
+                log.warning("Attempt %d failed: %s", attempt + 1, e)
+                log.warning("Retrying in %.1fs...", backoff)
                 await asyncio.sleep(backoff)
             else:
-                print(f"[AI] All {max_retries} attempts failed")
+                log.error("All %d attempts failed", max_retries)
     
     raise last_error
 
@@ -357,10 +427,6 @@ def extract_json_from_response(response_text: str) -> dict:
     except json.JSONDecodeError:
         raise ValueError(f"Could not extract JSON from response: {text[:200]}...")
 
-
-# =============================================================================
-# DOMAIN-SPECIFIC PROMPTS
-# =============================================================================
 
 def get_filter_prompt() -> str:
     """Get domain-specific filtering prompt for dealer/distributor monitoring."""
@@ -398,135 +464,199 @@ Return your analysis as JSON with these fields:
 
 
 def get_comparison_prompt() -> str:
-    """Get prompt for visual similarity comparison - STRICT matching."""
-    return """Compare these two images with STRICT accuracy. The first is the APPROVED original, the second is the DISCOVERED version.
+    """Get prompt for campaign-aware visual comparison."""
+    return """You are a CAMPAIGN COMPLIANCE AUDITOR for a dealer/distributor marketing monitoring platform.
 
-CRITICAL: Be CONSERVATIVE and ACCURATE. Only report a match if there is clear visual evidence.
+IMAGE 1 (FIRST IMAGE): The APPROVED campaign creative — the official marketing asset.
+IMAGE 2 (SECOND IMAGE): An image discovered on a dealer's website or ad platform.
 
-NEGATIVE CONSTRAINTS (Immediate 0 Score - NO EXCEPTIONS):
-- DIFFERENT BRAND: (e.g. iPhone vs Pixel, Ford vs Chevy, Nike vs Adidas) -> Score 0
-- DIFFERENT MODEL: (e.g. iPhone 14 vs iPhone 15, Camry vs Corolla) -> Score 0
-- DIFFERENT CREATIVE: Same product but different photo/angle/shoot -> Score 0
-- COMPETITOR ASSETS: If the image shows a competitor's product -> Score 0
-- DIFFERENT PRODUCT: Similar category but not the EXACT same item -> Score 0
+YOUR TASK: Determine if Image 2 is running the SAME marketing campaign as Image 1.
 
-STRICT MATCHING CRITERIA:
-- The images must share the SAME specific source photo/graphic
-- Similar colors, layouts, or "vibes" alone are NOT matches
-- Generic similarities (both show phones, both show cars) are NOT matches
-- You must identify the EXACT SAME creative/photograph, not just similar products
+WHAT "SAME CAMPAIGN" MEANS:
+A match means the dealer is displaying this specific campaign — the same promotional message,
+the same visual design, the same offer. The image does NOT need to be a pixel-perfect copy.
+Websites render creatives through HTML/CSS, so the same campaign will often appear with slight
+differences in font rendering, spacing, resolution, or aspect ratio. These rendering differences
+do NOT disqualify a match.
 
-SCORING GUIDELINES (be conservative):
-- 90-100: EXACT match - identical or near-identical image
-- 75-89: STRONG match - clearly the SAME creative with minor cropping
-- 55-74: PARTIAL match - SAME creative but with text overlays or major cropping
-- 0-39: NO MATCH - Different product, different brand, or different creative
+TEMPLATE CREATIVES — EXPECTED DEALER CUSTOMIZATION:
+The approved asset is often a TEMPLATE that contains placeholder fields dealers are expected
+to fill in with their own information. The following substitutions are NORMAL, EXPECTED, and
+should NOT be treated as unauthorized modifications:
+- "Dealer Name", "Your Dealer", "Dealer Logo" or similar placeholders replaced with the
+  dealer's actual name, branding, or logo
+- Placeholder phone numbers, addresses, or URLs replaced with dealer-specific contact info
+- Generic CTA buttons customized with dealer-specific destinations
+These template customizations mean the dealer is CORRECTLY using the creative as intended.
+They should NOT lower the similarity score or be flagged as modifications.
 
-IMPORTANT: Do NOT score above 40 if the products are different, even if the layout is identical.
+EVALUATION FRAMEWORK — analyze in order:
+1. PRODUCT IDENTITY: Is the same specific product featured? (same model, same photo/render)
+2. CAMPAIGN MESSAGE: Is the same promotional offer/headline/CTA present?
+3. VISUAL DESIGN: Does the layout, color scheme, and composition match the campaign?
+4. BRAND ELEMENTS: Are the same logos, brand colors, and trade dress present?
+
+SCORING RUBRIC:
+- 90-100: Same campaign — identical or near-identical rendering of the creative
+          (includes template creatives with expected dealer-name customization)
+- 75-89:  Same campaign — clearly the same creative with minor rendering differences
+          (different resolution, slight cropping, font rendering differences)
+- 60-74:  Same campaign — recognizably the same creative but with modifications
+          (text overlays, watermarks, resizing, color shifts)
+- 40-59:  Ambiguous — shares significant elements but may be a different version
+- 0-39:   Different campaign — different product, different offer, or different design
+
+AUTOMATIC SCORE 0 (different campaign entirely):
+- Different brand (e.g. iPhone creative vs Samsung creative)
+- Different product model (e.g. Galaxy S25 vs Galaxy S26)
+- Same product but completely different creative design/photo
+- Competitor's campaign material
 
 Modifications to identify:
 - cropping, resizing, color_changes, text_added, text_removed, overlay_added, quality_degraded, watermark_added
+- Do NOT list dealer-name placeholder substitution as a modification
 
 Return JSON with:
-- similarity_score: 0-100 (score conservatively)
-- is_match: true only if similarity_score >= 55
+- similarity_score: 0-100
+- is_match: true if similarity_score >= 55
 - match_type: "exact"/"strong"/"partial"/"weak"/"none"
-- modifications: array of detected modifications
+- modifications: array of detected modifications (exclude expected template customizations)
 - modification_severity: "none"/"minor"/"moderate"/"major"
-- analysis: brief description of what is similar and what is different"""
+- analysis: explain what campaign elements match and what differs"""
 
 
 def get_detection_prompt() -> str:
-    """Get prompt for detecting asset within a screenshot - STRICT matching."""
-    return """TASK: Detect if a SPECIFIC marketing asset appears within a webpage screenshot.
+    """Get prompt for detecting a campaign creative within a screenshot or page section."""
+    return """You are a CAMPAIGN COMPLIANCE AUDITOR scanning a webpage for a specific marketing campaign.
 
-IMAGE 1 (FIRST IMAGE): The SPECIFIC MARKETING ASSET (Target) we are searching for.
-IMAGE 2 (SECOND IMAGE): A FULL WEBPAGE SCREENSHOT to examine.
+IMAGE 1 (FIRST IMAGE): The APPROVED CAMPAIGN CREATIVE — the official marketing asset we are looking for.
+IMAGE 2 (SECOND IMAGE): A screenshot from a dealer's website (may be a full page, a page section, or an extracted element).
 
-CRITICAL: We are looking for the EXACT creative. Be STRICT.
+YOUR TASK: Determine if Image 2 contains the SAME marketing campaign shown in Image 1.
 
-NEGATIVE CONSTRAINTS (Immediate asset_found: false):
-- IGNORE competitor ads (e.g. if Target is iPhone, ignore Pixel/Samsung ads)
-- IGNORE similar products (e.g. if Target is Red Car, ignore Blue Car or different model)
-- IGNORE different views (e.g. if Target is front-view, ignore side-view of same product)
-- IGNORE different creatives of the same product (different photo shoot = no match)
+WHAT "SAME CAMPAIGN" MEANS:
+The dealer's website may render the same campaign creative through HTML/CSS rather than embedding
+the original image file. This means the same campaign can appear with different font rendering,
+slightly different spacing, different resolution, or different aspect ratio. These rendering
+differences are EXPECTED and do NOT disqualify a match.
 
-STRICT MATCHING RULES:
-1. The EXACT same image/creative must be visible - not a similar one
-2. If you see a similar product but it is NOT the specific target asset, report asset_found: false
-3. Be careful of "Lists" or "Grids" of products - locate only the SPECIFIC target creative
-4. Different brand = automatic asset_found: false, confidence: 0
-5. Different model = automatic asset_found: false, confidence: 0
+A match requires:
+- The same product being promoted (same model, same visual)
+- The same campaign message or offer
+- Recognizably the same visual design/layout
 
-The asset may appear smaller in the screenshot. Search these areas:
-- Hero/banner sections
-- Sidebars
-- Main content area  
-- Carousels and sliders
-- Footer areas
+A match does NOT require:
+- Pixel-identical rendering
+- Exact same resolution or dimensions
+- Identical font rendering or text spacing
 
-CONFIDENCE SCORING (be conservative):
-- 80-100: Confirmed SAME specific creative visible
-- 60-79: Very likely the EXACT same asset
-- 0-39: Different product, competitor product, or just similar layout
+TEMPLATE CREATIVES:
+The approved asset may be a template with placeholders like "Dealer Name" that dealers
+replace with their own name/branding. This is expected and correct usage — it should
+NOT reduce the confidence score or be treated as a modification.
 
-WHEN IN DOUBT, report asset_found: FALSE. It is better to miss a match than to flag a competitor's ad or wrong product.
+SCAN ALL AREAS of Image 2:
+- Hero/banner sections at the top
+- Promotional blocks in the main content
+- Sidebar advertisements
+- Carousels and sliders (may show only one slide)
+- Footer promotional areas
+- Floating or overlay promotions
+
+CONFIDENCE SCORING:
+- 85-100: Same campaign clearly visible — same product, same design, same message
+- 70-84:  Same campaign very likely — recognizable design with rendering differences
+- 55-69:  Probable match — significant shared elements but notable differences
+- 0-39:   Not a match — different product, different campaign, or different brand
+
+AUTOMATIC asset_found: false:
+- Different brand entirely (e.g. searching for Samsung, found Apple)
+- Different product model (e.g. searching for Galaxy S26, found Galaxy S25)
+- Same product but a completely different campaign design
+- No promotional content visible in the screenshot
 
 Return JSON with:
-- asset_found: true ONLY if confidence >= 60
-- confidence: 0-100 (score conservatively)
+- asset_found: true if confidence >= 55
+- confidence: 0-100
 - location: where found (header/sidebar/main_content/footer/banner/hero/carousel/popup/unknown)
 - appearance: how it appears (exact/resized/cropped/modified/none)
 - modifications: array of modifications detected
-- reasoning: explain why it is the EXACT asset and not a look-alike or competitor"""
+- reasoning: explain which campaign elements match — product, message, design, brand elements"""
 
 
 def get_compliance_prompt(rules_text: str, zombie_check: str) -> str:
-    """Get prompt for compliance analysis - STRICT checking."""
-    return f"""COMPLIANCE ANALYSIS - Be thorough and critical.
+    """Get prompt for compliance analysis - evaluates the creative itself."""
+    return f"""COMPLIANCE ANALYSIS — evaluate whether the CREATIVE ITSELF has been modified.
 
-CRITICAL: First verify if the discovered image actually contains the original asset.
-If the images are NOT the same creative, report asset_visible: false and is_compliant: false.
+IMAGE 1 (FIRST IMAGE): The ORIGINAL APPROVED ASSET — the official marketing creative.
+IMAGE 2 (SECOND IMAGE): The DISCOVERED IMAGE — a crop from a distributor's webpage that
+contains the creative. This image was automatically extracted and may include small amounts
+of surrounding webpage context (navigation bars, dealer logos, page headers/footers, menu
+items, or site chrome). This surrounding context is NORMAL and expected — it is NOT part of
+the creative and must be IGNORED during compliance evaluation.
 
-IMAGE 1 (FIRST IMAGE): The ORIGINAL APPROVED ASSET - official marketing creative.
-IMAGE 2 (SECOND IMAGE): The DISCOVERED IMAGE - what was found on a distributor's site.
-
-STEP 1 - VERIFY MATCH FIRST:
-Before checking compliance, confirm the discovered image actually shows the original asset.
-- If these are DIFFERENT images/creatives, set asset_visible: false
-- Only proceed with compliance analysis if the SAME asset is clearly visible
+STEP 1 — VERIFY MATCH:
+Confirm the discovered image contains the original campaign creative.
+- Focus on the CORE CREATIVE CONTENT: the product imagery, promotional text, offer details,
+  call-to-action buttons, and brand elements that appear in the original asset.
+- IGNORE any surrounding webpage elements (dealer navigation, site headers, menu bars,
+  breadcrumbs, dealer logos outside the creative boundary). These are standard website
+  context from the ad placement, not modifications.
+- If the core creative is NOT present at all, set asset_visible: false.
 
 BRAND RULES:
 {rules_text}
 
 {zombie_check}
 
-STEP 2 - IF ASSET IS VISIBLE, CHECK FOR VIOLATIONS:
+STEP 2 — IF ASSET IS VISIBLE, CHECK THE CREATIVE FOR VIOLATIONS:
 
-1. ASSET INTEGRITY:
-   - Has it been cropped, stretched, or distorted?
-   - Has it been overlaid with unauthorized content?
-   - Are colors significantly altered?
+IMPORTANT: Only flag issues that are modifications TO THE CREATIVE ITSELF.
+Do NOT flag surrounding website navigation, dealer site branding, or page
+chrome as modifications — those are part of the webpage, not the ad.
 
-2. UNAUTHORIZED MODIFICATIONS:
-   - Has text been added or removed?
-   - Have logos or brand elements been obscured?
-   - Has quality been significantly degraded?
+CRITICAL — TEMPLATE CUSTOMIZATION IS COMPLIANT:
+The approved asset is often a TEMPLATE with placeholder fields like "Dealer Name",
+"Your Dealer", or "Dealer Logo". Dealers are EXPECTED and REQUIRED to replace these
+placeholders with their own name, branding, and contact information. This is the
+intended use of the template. Therefore:
+- Replacing "Dealer Name" / "Your Dealer" with the dealer's actual name = COMPLIANT
+- Replacing placeholder logos with the dealer's own logo = COMPLIANT
+- Replacing placeholder phone numbers, addresses, or URLs = COMPLIANT
+- Adjusting CTA buttons with dealer-specific text or links = COMPLIANT
+These are NOT violations. Do NOT list them as modifications or compliance issues.
+
+1. ASSET INTEGRITY (evaluate the creative content only):
+   - Has the creative been cropped so that key content is missing?
+   - Has it been stretched, distorted, or significantly resized?
+   - Have elements been overlaid ON TOP of the creative?
+   - Are the creative's colors significantly altered?
+
+2. UNAUTHORIZED MODIFICATIONS (not template customization, not surrounding page elements):
+   - Has the core campaign imagery been changed or replaced?
+   - Have brand logos (manufacturer/OEM logos, not dealer placeholders) been removed or obscured?
+   - Has the promotional offer, pricing, or terms been altered from the original?
+   - Has the creative's quality been significantly degraded?
+   - Have unauthorized elements been overlaid on the creative?
 
 3. BRAND COMPLIANCE:
-   - Are all required brand elements visible?
-   - Have any forbidden elements been added?
+   - Are all required brand elements from the original creative still visible?
+   - Have forbidden elements been added ON the creative itself?
 
 COMPLIANCE RULES:
-- is_compliant: true ONLY if asset is visible AND no significant modifications AND all brand rules followed
-- is_compliant: false if ANY issues found OR asset not clearly visible
-- When uncertain about compliance, default to is_compliant: false (requires review)
+- is_compliant: true if the creative is visible AND its core content has not been materially modified
+  (template placeholder substitution with dealer info is NOT a material modification)
+- is_compliant: false if the creative's core imagery, brand elements, or offer terms have been
+  altered, or the creative is not present
+- Surrounding webpage UI (dealer nav, headers, site logos) is NOT a violation
+- Dealer-name/logo placeholder substitution is NOT a violation — it is expected template usage
+- When the creative is clearly present with only expected template customizations, it IS compliant
 
 Return JSON with:
-- is_compliant: true only if clearly compliant with no issues
-- asset_visible: true only if the SAME asset is clearly identifiable
-- issues: array of {{type, description, severity}} - list ALL issues found
-- modifications_detected: array of modifications
+- is_compliant: true if the creative is present and unmodified
+- asset_visible: true if the campaign creative is clearly identifiable
+- issues: array of {{type, description, severity}} — only issues with the CREATIVE ITSELF
+- modifications_detected: array of actual creative modifications (not webpage context)
 - brand_elements: {{logo_visible, tagline_visible, colors_accurate, asset_prominent}}
 - zombie_ad: true/false
 - zombie_reason: explanation if zombie
@@ -534,65 +664,160 @@ Return JSON with:
 
 
 def get_verification_prompt() -> str:
-    """Get prompt for multi-stage verification using boolean gates - AGENTIC approach."""
-    return """VERIFICATION AGENT - You are a strict QA compliance agent performing verification.
+    """Get prompt for multi-stage campaign verification using boolean gates."""
+    return """You are a CAMPAIGN VERIFICATION AGENT performing a structured audit.
 
-IMAGE 1: The APPROVED original asset
-IMAGE 2: The DISCOVERED image
+IMAGE 1: The APPROVED campaign creative
+IMAGE 2: The image discovered on a dealer's website or ad platform
 
-PROTOCOL - Execute these steps in order:
+PROTOCOL — Execute these steps in order:
 
 STEP 1 - IDENTIFY:
-List every distinct visual element in both images. Use OCR to read all text.
+Examine both images. List the product, brand, promotional text, offer details,
+and visual design elements in each. Use OCR to read all visible text.
 
-STEP 2 - VERIFY EACH GATE (Pass/Fail only - no partial credit):
+STEP 2 - VERIFY EACH GATE:
 
-□ GATE_LOGO: Is the EXACT same brand logo present in both images?
-  - Not similar logos - must be IDENTICAL
-  - Pass only if you can confirm it's the same logo
+□ GATE_BRAND: Is the same brand represented in both?
+  - Same manufacturer/company logo or branding
+  - FAIL if different brands entirely
 
-□ GATE_PRODUCT: Is the EXACT same product/vehicle/image shown?
-  - Not similar product type - must be the SAME specific image
-  - Compare: same angle, same photo, same vehicle/equipment
-  - This is the CRITICAL gate. If the car/product is different, FAIL.
+□ GATE_PRODUCT: Is the same specific product featured?
+  - Same model, same visual representation (same photo or render)
+  - PASS even if rendered at different resolution or slightly different angle
+  - FAIL if different product model or different product entirely
 
-□ GATE_TEXT: Does the promotional text match?
-  - Use OCR to extract text from both images
-  - Compare exact strings - do they say the same thing?
+□ GATE_MESSAGE: Is the same campaign message/headline present?
+  - Same core promotional text or headline
+  - PASS if the message is the same even with minor wording/formatting differences
+  - FAIL if completely different messaging or no promotional text match
 
-□ GATE_OFFER: Is the SAME offer/pricing displayed?
-  - Compare specific numbers, percentages, dates
-  - Must be identical offer terms
+□ GATE_OFFER: Is the same offer/deal being promoted?
+  - Same pricing, discount, financing terms, or call-to-action
+  - PASS if same offer even if formatting differs
+  - FAIL if different offer terms or no offer in one image
 
-□ GATE_LAYOUT: Is the composition/arrangement the same?
-  - Similar element positioning
-  - Similar visual hierarchy
+□ GATE_DESIGN: Is the visual design recognizably the same campaign?
+  - Same color scheme, layout structure, visual hierarchy
+  - PASS even with rendering differences (font smoothing, spacing, resolution)
+  - FAIL if completely different visual design
 
 STEP 3 - VERDICT:
-- is_match: true ONLY if at least 3 of 5 gates PASS
-- CRITICAL: If GATE_PRODUCT fails, is_match MUST be false regardless of other gates.
-- CRITICAL: If the brand is different, is_match MUST be false.
-- When uncertain, default to false.
+- is_match: true if GATE_BRAND passes AND GATE_PRODUCT passes AND at least 1 of the remaining 3 gates passes
+- A campaign match requires the right brand AND the right product AND at least some shared campaign elements
+- When truly uncertain (50/50), lean toward true — it is worse to miss a real match than to flag a false one
 
 Return JSON with:
-- gate_logo: true/false
+- gate_brand: true/false
 - gate_product: true/false
-- gate_text: true/false
+- gate_message: true/false
 - gate_offer: true/false
-- gate_layout: true/false
+- gate_design: true/false
 - gates_passed: count of true gates (0-5)
-- is_match: true only if gates_passed >= 3 AND gate_product is true
+- is_match: true if gate_brand AND gate_product AND gates_passed >= 3
 - verdict: one-line explanation of your decision"""
 
 
-# =============================================================================
-# CORE ANALYSIS FUNCTIONS
-# =============================================================================
+def get_localization_prompt() -> str:
+    """Prompt that asks Claude to find a campaign creative in a full-page screenshot
+    and return its pixel bounding box so we can crop it out cleanly."""
+    return """You are a CAMPAIGN LOCALIZATION AGENT. Your job is to find where a specific
+marketing campaign creative appears on a webpage screenshot.
+
+IMAGE 1 (FIRST IMAGE): The APPROVED CAMPAIGN CREATIVE — the official marketing asset.
+IMAGE 2 (SECOND IMAGE): A FULL-PAGE SCREENSHOT of a dealer's website.
+
+YOUR TASK: Find every location where the campaign creative (or a close rendering of it)
+appears in the full-page screenshot, and return the PIXEL BOUNDING BOX for each occurrence.
+
+WHAT COUNTS AS THE SAME CAMPAIGN:
+- Same product being promoted (same model, same visual)
+- Same or very similar promotional message/headline
+- Recognizably the same visual design
+- The website may render it via HTML/CSS, so slight differences in font rendering,
+  spacing, or resolution are expected and still count
+
+BOUNDING BOX RULES:
+- Coordinates are in pixels relative to the top-left corner of the full-page screenshot
+- The box should tightly wrap ONLY the campaign creative — do NOT include adjacent ads,
+  navigation bars, footers, or unrelated content
+- Add ~10px padding around the creative for clean cropping
+- If the creative spans the full width of the page, that's fine — just don't include
+  content above or below that isn't part of the creative
+
+Return JSON with:
+- found: true/false — whether the campaign creative appears anywhere on the page
+- locations: array of objects, each with:
+  - x: left edge in pixels
+  - y: top edge in pixels
+  - width: width in pixels
+  - height: height in pixels
+  - confidence: 0-100 how confident this is the same campaign
+  - reasoning: brief explanation of why this is a match
+- page_dimensions: {width, height} of the full screenshot (for validation)"""
+
+
+async def localize_assets_in_screenshot(
+    screenshot_bytes: bytes,
+    asset_bytes_list: List[Tuple[bytes, str, str]],
+) -> List[Dict[str, Any]]:
+    """
+    For each campaign asset, ask Claude to find it in the full-page screenshot
+    and return bounding boxes.
+
+    Args:
+        screenshot_bytes: Full-page screenshot PNG bytes
+        asset_bytes_list: List of (image_bytes, asset_id, asset_name)
+
+    Returns:
+        List of {asset_id, asset_name, x, y, width, height, confidence}
+    """
+    prompt = get_localization_prompt()
+    screenshot_optimized = optimize_image_for_api(screenshot_bytes, "screenshot")
+
+    all_locations: List[Dict[str, Any]] = []
+
+    for asset_bytes, asset_id, asset_name in asset_bytes_list:
+        try:
+            asset_optimized = optimize_image_for_api(asset_bytes, "asset")
+            response_text = await call_anthropic_with_retry(
+                prompt, [asset_optimized, screenshot_optimized]
+            )
+            result = extract_json_from_response(response_text)
+
+            if not result.get("found", False):
+                log.info("Asset '%s' not found on page", asset_name)
+                continue
+
+            locations = result.get("locations", [])
+            log.info("Asset '%s' found at %d location(s)", asset_name, len(locations))
+
+            for loc in locations:
+                conf = loc.get("confidence", 0)
+                if conf < 50:
+                    continue
+                all_locations.append({
+                    "asset_id": asset_id,
+                    "asset_name": asset_name,
+                    "x": int(loc.get("x", 0)),
+                    "y": int(loc.get("y", 0)),
+                    "width": int(loc.get("width", 0)),
+                    "height": int(loc.get("height", 0)),
+                    "confidence": conf,
+                    "reasoning": loc.get("reasoning", ""),
+                })
+
+        except Exception as e:
+            log.error("Error localizing asset '%s': %s", asset_name, e)
+            continue
+
+    return all_locations
+
 
 async def filter_image(image_url: str) -> ImageFilterResult:
     """
-    Use Claude Opus 4.5 to quickly filter irrelevant images.
-    Enhanced with domain-specific prompts.
+    Use Claude Haiku to quickly filter irrelevant images.
+    Haiku is ~30x cheaper than Opus and fast enough for a yes/no relevance check.
     """
     try:
         image_bytes = await download_image(image_url)
@@ -600,7 +825,7 @@ async def filter_image(image_url: str) -> ImageFilterResult:
         
         prompt = get_filter_prompt()
         
-        response_text = await call_anthropic_with_retry(prompt, [image_bytes])
+        response_text = await call_anthropic_with_retry(prompt, [image_bytes], model=FILTER_MODEL)
         result = extract_json_from_response(response_text)
         
         # Apply relevance threshold
@@ -618,7 +843,7 @@ async def filter_image(image_url: str) -> ImageFilterResult:
         )
         
     except Exception as e:
-        print(f"[AI Filter] Error: {e}")
+        log.error("Filter error: %s", e)
         # On error, mark as relevant to avoid missing content
         return ImageFilterResult(
             is_relevant=True,
@@ -644,11 +869,11 @@ async def compare_images(
         
         prompt = get_comparison_prompt()
         
-        response_text = await call_anthropic_with_retry(prompt, [source_bytes, target_bytes])
+        response_text = await call_anthropic_with_retry(prompt, [source_bytes, target_bytes], model=ENSEMBLE_MODEL)
         return extract_json_from_response(response_text)
         
     except Exception as e:
-        print(f"[AI Compare] Error: {e}")
+        log.error("Comparison error: %s", e)
         return {
             "similarity_score": 0,
             "is_match": False,
@@ -664,44 +889,28 @@ async def detect_asset_in_screenshot(
 ) -> Dict[str, Any]:
     """
     Detect if a marketing asset appears within a webpage screenshot.
-    Uses Claude Opus 4.5 for accurate detection.
+
+    Uses a tiling strategy when enabled: splits the screenshot into
+    overlapping viewport-height tiles and checks each one individually.
+    This preserves detail and prevents the asset from being shrunk to
+    an unrecognisable size in a single downscaled image.
+
+    Falls back to single-image detection when tiling is disabled.
     """
     try:
-        print(f"[AI] Detecting asset in screenshot...")
-        
+        log.info("Detecting asset in screenshot")
+
         asset_bytes = await download_image(asset_image_url)
         screenshot_bytes = await download_image(screenshot_url)
-        
         asset_bytes = optimize_image_for_api(asset_bytes, "asset")
-        screenshot_bytes = optimize_image_for_api(screenshot_bytes, "screenshot")
-        
-        prompt = get_detection_prompt()
-        
-        response_text = await call_anthropic_with_retry(prompt, [asset_bytes, screenshot_bytes])
-        result = extract_json_from_response(response_text)
-        
-        asset_found = result.get("asset_found", False)
-        confidence = result.get("confidence", 0)
-        
-        print(f"[AI] Asset detection: found={asset_found}, confidence={confidence}")
-        
-        # STRICT: Only consider it found if BOTH asset_found is true AND confidence is high enough
-        actually_found = asset_found and confidence >= 60
-        
-        return {
-            "asset_found": actually_found,
-            "similarity_score": confidence,
-            "is_match": actually_found and confidence >= settings.screenshot_match_threshold,
-            "match_type": _get_match_type_from_appearance(result.get("appearance", "none"), confidence),
-            "modifications": result.get("modifications", []),
-            "location": result.get("location", "unknown"),
-            "analysis": result.get("reasoning", "")
-        }
-        
+
+        if settings.enable_tiling_fallback:
+            return await _detect_asset_tiled(asset_bytes, screenshot_bytes)
+        else:
+            return await _detect_asset_single(asset_bytes, screenshot_bytes)
+
     except Exception as e:
-        print(f"[AI] Error detecting asset: {e}")
-        import traceback
-        traceback.print_exc()
+        log.error("Error detecting asset: %s", e, exc_info=True)
         return {
             "asset_found": False,
             "similarity_score": 0,
@@ -710,6 +919,113 @@ async def detect_asset_in_screenshot(
             "modifications": [],
             "error": str(e)
         }
+
+
+async def _detect_asset_single(
+    asset_bytes: bytes,
+    screenshot_bytes: bytes
+) -> Dict[str, Any]:
+    """Original single-image detection (legacy path)."""
+    screenshot_bytes = optimize_image_for_api(screenshot_bytes, "screenshot")
+    prompt = get_detection_prompt()
+
+    response_text = await call_anthropic_with_retry(prompt, [asset_bytes, screenshot_bytes], model=ENSEMBLE_MODEL)
+    result = extract_json_from_response(response_text)
+
+    asset_found = result.get("asset_found", False)
+    confidence = result.get("confidence", 0)
+    actually_found = asset_found and confidence >= 55
+
+    log.debug("Single-image detection: found=%s, confidence=%d", asset_found, confidence)
+
+    return {
+        "asset_found": actually_found,
+        "similarity_score": confidence,
+        "is_match": actually_found and confidence >= settings.screenshot_match_threshold,
+        "match_type": _get_match_type_from_appearance(result.get("appearance", "none"), confidence),
+        "modifications": result.get("modifications", []),
+        "location": result.get("location", "unknown"),
+        "analysis": result.get("reasoning", "")
+    }
+
+
+async def _detect_asset_tiled(
+    asset_bytes: bytes,
+    screenshot_bytes: bytes
+) -> Dict[str, Any]:
+    """
+    Split the screenshot into overlapping tiles and check each one for the asset.
+
+    Each tile is viewport-height so the asset (if present) occupies a meaningful
+    portion of the image, making Claude's detection far more reliable.
+    """
+    try:
+        img = Image.open(io.BytesIO(screenshot_bytes))
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        width, height = img.size
+        tile_h = settings.tile_height
+        overlap = settings.tile_overlap
+
+        tiles: List[bytes] = []
+        y = 0
+        while y < height:
+            bottom = min(y + tile_h, height)
+            tile = img.crop((0, y, width, bottom))
+            buf = io.BytesIO()
+            tile.save(buf, format='JPEG', quality=90)
+            tiles.append(buf.getvalue())
+            y += tile_h - overlap
+            if bottom == height:
+                break
+
+        log.debug("Tiling: %d tiles from %dx%d screenshot", len(tiles), width, height)
+
+        best: Dict[str, Any] = {
+            "asset_found": False,
+            "similarity_score": 0,
+            "confidence": 0,
+        }
+
+        prompt = get_detection_prompt()
+
+        for idx, tile_bytes in enumerate(tiles):
+            tile_optimized = optimize_image_for_api(tile_bytes, "screenshot")
+            response_text = await call_anthropic_with_retry(prompt, [asset_bytes, tile_optimized], model=ENSEMBLE_MODEL)
+            result = extract_json_from_response(response_text)
+
+            found = result.get("asset_found", False)
+            conf = result.get("confidence", 0)
+            log.debug("Tile %d/%d: found=%s, confidence=%d", idx + 1, len(tiles), found, conf)
+
+            if conf > best["confidence"]:
+                best = result
+                best["tile_index"] = idx
+
+            if found and conf >= 55:
+                log.debug("Asset found in tile %d — stopping search", idx + 1)
+                break
+
+        asset_found = best.get("asset_found", False)
+        confidence = best.get("confidence", 0)
+        actually_found = asset_found and confidence >= 55
+
+        return {
+            "asset_found": actually_found,
+            "similarity_score": confidence,
+            "is_match": actually_found and confidence >= settings.screenshot_match_threshold,
+            "match_type": _get_match_type_from_appearance(best.get("appearance", "none"), confidence),
+            "modifications": best.get("modifications", []),
+            "location": best.get("location", "unknown"),
+            "analysis": best.get("reasoning", ""),
+            "tiles_checked": len(tiles),
+            "matched_tile": best.get("tile_index"),
+        }
+
+    except Exception as e:
+        log.warning("Tiling failed, falling back to single-image: %s", e)
+        return await _detect_asset_single(asset_bytes, screenshot_bytes)
 
 
 async def verify_borderline_match(
@@ -722,7 +1038,7 @@ async def verify_borderline_match(
     Uses Claude Opus 4.5 for agentic verification.
     """
     try:
-        print(f"[AI] Verifying borderline match (initial score: {initial_score})...")
+        log.info("Verifying borderline match (initial score: %d)", initial_score)
         
         asset_bytes = await download_image(asset_url)
         discovered_bytes = await download_image(discovered_url)
@@ -732,38 +1048,36 @@ async def verify_borderline_match(
         
         prompt = get_verification_prompt()
         
-        response_text = await call_anthropic_with_retry(prompt, [asset_bytes, discovered_bytes])
+        response_text = await call_anthropic_with_retry(prompt, [asset_bytes, discovered_bytes], model=ENSEMBLE_MODEL)
         result = extract_json_from_response(response_text)
         
-        # Boolean gate verification
         gates_passed = result.get("gates_passed", 0)
+        gate_brand = result.get("gate_brand", False)
         gate_product = result.get("gate_product", False)
-        
-        # STRICT: Product gate is critical - must pass + at least 3 total gates
-        is_match = result.get("is_match", False) and gate_product and gates_passed >= 3
-        
-        # Convert gates to score for compatibility (each gate = 20 points)
+
+        is_match = result.get("is_match", False) and gate_brand and gate_product and gates_passed >= 3
+
         verified_score = gates_passed * 20
-        
-        print(f"[AI] Verification complete: gates_passed={gates_passed}, is_match={is_match}")
-        print(f"[AI] Gates: logo={result.get('gate_logo')}, product={gate_product}, text={result.get('gate_text')}, offer={result.get('gate_offer')}, layout={result.get('gate_layout')}")
-        
+
+        log.debug("Verification complete: gates_passed=%d, is_match=%s", gates_passed, is_match)
+        log.debug("Gates: brand=%s, product=%s, message=%s, offer=%s, design=%s", gate_brand, gate_product, result.get('gate_message'), result.get('gate_offer'), result.get('gate_design'))
+
         return {
             "verified_score": verified_score,
             "is_match": is_match,
             "gates": {
-                "logo": result.get("gate_logo", False),
+                "brand": gate_brand,
                 "product": gate_product,
-                "text": result.get("gate_text", False),
+                "message": result.get("gate_message", False),
                 "offer": result.get("gate_offer", False),
-                "layout": result.get("gate_layout", False)
+                "design": result.get("gate_design", False),
             },
             "gates_passed": gates_passed,
-            "verdict": result.get("verdict", "")
+            "verdict": result.get("verdict", ""),
         }
         
     except Exception as e:
-        print(f"[AI] Verification error: {e}")
+        log.error("Verification error: %s", e)
         # STRICT: On error, default to NO match
         return {
             "verified_score": initial_score,
@@ -783,7 +1097,7 @@ async def analyze_compliance(
     Uses Claude Opus 4.5 for accurate compliance checks.
     """
     try:
-        print(f"[AI Compliance] Analyzing compliance with Claude Opus 4.5...")
+        log.info("Analyzing compliance with Claude Opus 4.5")
         
         discovered_bytes = await download_image(discovered_image_url)
         asset_bytes = await download_image(original_asset_url)
@@ -814,7 +1128,7 @@ ZOMBIE AD CHECK:
         response_text = await call_anthropic_with_retry(prompt, [asset_bytes, discovered_bytes])
         result = extract_json_from_response(response_text)
         
-        print(f"[AI Compliance] Result: is_compliant={result.get('is_compliant')}")
+        log.info("Compliance result: is_compliant=%s", result.get('is_compliant'))
         
         return ComplianceCheckResult(
             is_compliant=result.get("is_compliant", True),
@@ -826,9 +1140,7 @@ ZOMBIE AD CHECK:
         )
         
     except Exception as e:
-        print(f"[AI Compliance] Error: {e}")
-        import traceback
-        traceback.print_exc()
+        log.error("Compliance analysis error: %s", e, exc_info=True)
         # STRICT: Default to NOT compliant on errors - requires manual review
         return ComplianceCheckResult(
             is_compliant=False,
@@ -837,10 +1149,6 @@ ZOMBIE AD CHECK:
             analysis_summary=f"Analysis failed - requires manual review: {str(e)}"
         )
 
-
-# =============================================================================
-# ENSEMBLE MATCHING
-# =============================================================================
 
 async def ensemble_match(
     asset_url: str,
@@ -855,19 +1163,18 @@ async def ensemble_match(
     - Asset detection (for screenshots)
     - Perceptual hashing (fast pre-filter)
     """
-    print(f"[AI Ensemble] Starting ensemble match...")
+    log.info("Starting ensemble match")
     
     # Run methods in parallel
     if is_screenshot:
-        results = await asyncio.gather(
-            detect_asset_in_screenshot(asset_url, discovered_url),
-            compare_with_hash(asset_url, discovered_url),
-            return_exceptions=True
-        )
-        detection_result = results[0] if not isinstance(results[0], Exception) else {"similarity_score": 0, "asset_found": False}
-        hash_result = results[1] if not isinstance(results[1], Exception) else {"similarity_score": 0}
-        visual_result = {"similarity_score": 0}  # Skip for screenshots
-        
+        # For screenshots, only run detection — perceptual hashing the whole
+        # page against a small asset is meaningless and drags down scores.
+        detection_result = await detect_asset_in_screenshot(asset_url, discovered_url)
+        if isinstance(detection_result, Exception):
+            detection_result = {"similarity_score": 0, "asset_found": False}
+        hash_result = {"similarity_score": 0}
+        visual_result = {"similarity_score": 0}
+
     else:
         results = await asyncio.gather(
             compare_images(asset_url, discovered_url),
@@ -886,11 +1193,8 @@ async def ensemble_match(
     
     # Weighted ensemble
     if is_screenshot:
-        # For screenshots, detection is primary, hash is secondary
-        final_score = (
-            detection_score * (settings.ensemble_visual_weight + settings.ensemble_detection_weight) +
-            hash_score * settings.ensemble_hash_weight
-        )
+        # For screenshots, detection carries 100% weight — hash is skipped
+        final_score = detection_score * 1.0
     else:
         # For regular images, visual comparison is primary
         final_score = (
@@ -925,8 +1229,8 @@ async def ensemble_match(
     threshold = settings.screenshot_match_threshold if is_screenshot else settings.regular_image_match_threshold
     is_match = final_score >= threshold and (asset_found or final_score >= settings.partial_match_threshold)
     
-    print(f"[AI Ensemble] Scores - Visual: {visual_score}, Detection: {detection_score}, Hash: {hash_score}")
-    print(f"[AI Ensemble] Final: {final_score:.1f}, Match: {is_match}, Type: {match_type}")
+    log.debug("Ensemble scores - Visual: %d, Detection: %d, Hash: %d", visual_score, detection_score, hash_score)
+    log.debug("Ensemble final: %.1f, Match: %s, Type: %s", final_score, is_match, match_type)
     
     return {
         "similarity_score": round(final_score),
@@ -955,7 +1259,7 @@ async def calibrate_confidence(
     try:
         factor = await get_calibration_factor_from_feedback(source_type, channel)
     except Exception as e:
-        print(f"[AI] Error getting adaptive calibration: {e}")
+        log.warning("Error getting adaptive calibration: %s", e)
         factor = get_calibration_factor(source_type, channel)
         
     calibrated = int(raw_score * factor)
@@ -988,10 +1292,6 @@ def _get_match_type_from_score(score: int) -> str:
     return "none"
 
 
-# =============================================================================
-# BATCH PROCESSING
-# =============================================================================
-
 async def batch_filter_images(image_urls: List[str]) -> List[ImageFilterResult]:
     """Filter multiple images in optimized batches."""
     results = []
@@ -1023,9 +1323,94 @@ async def batch_filter_images(image_urls: List[str]) -> List[ImageFilterResult]:
     return results
 
 
-# =============================================================================
-# MAIN PROCESSING PIPELINE
-# =============================================================================
+async def _passes_hash_prefilter(
+    image_bytes: bytes,
+    asset_hashes_cache: List[Dict[str, Any]],
+) -> bool:
+    """
+    Stage 1 pre-filter: check if the image has ANY perceptual hash
+    resemblance to at least one campaign asset.
+
+    Returns True if the image should continue to the next stage.
+    This is free and instant (~0.5ms per comparison).
+    """
+    img_hashes = await compute_image_hashes(image_bytes)
+    if img_hashes is None:
+        return True  # can't compute → don't discard
+
+    threshold = settings.hash_prefilter_max_diff
+
+    for asset_h in asset_hashes_cache:
+        diffs = [
+            img_hashes["phash"] - asset_h["phash"],
+            img_hashes["dhash"] - asset_h["dhash"],
+            img_hashes["whash"] - asset_h["whash"],
+            img_hashes["average_hash"] - asset_h["average_hash"],
+        ]
+        avg_diff = sum(diffs) / 4
+        if avg_diff <= threshold:
+            return True
+
+    return False
+
+
+def _passes_clip_prefilter(
+    image_bytes: bytes,
+    asset_embeddings: list,
+) -> bool:
+    """
+    Stage 2 pre-filter: check CLIP semantic similarity between the
+    discovered image and campaign assets.
+
+    Returns True if the image should continue to Claude.
+    Runs locally on CPU (~20ms per image).
+    """
+    if not asset_embeddings:
+        return True  # no embeddings → skip gate
+
+    img_emb = embedding_service.compute_embedding(image_bytes)
+    if img_emb is None:
+        return True  # model unavailable → don't discard
+
+    best_sim = embedding_service.best_asset_similarity(img_emb, asset_embeddings)
+    passes = best_sim >= settings.clip_similarity_threshold
+    log.debug("CLIP best similarity: %.3f (threshold %.2f) → %s",
+              best_sim, settings.clip_similarity_threshold, "PASS" if passes else "SKIP")
+    return passes
+
+
+async def _precompute_asset_hashes(
+    campaign_assets: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Download each campaign asset and compute perceptual hashes once."""
+    results = []
+    for asset in campaign_assets:
+        try:
+            asset_bytes = await download_image(asset["file_url"])
+            hashes = await compute_image_hashes(asset_bytes)
+            if hashes:
+                results.append(hashes)
+        except Exception as e:
+            log.warning("Could not hash asset %s: %s", asset.get("name", asset["id"]), e)
+    return results
+
+
+async def _precompute_asset_embeddings(
+    campaign_assets: List[Dict[str, Any]],
+) -> list:
+    """Download each campaign asset and compute CLIP embeddings once."""
+    bytes_list = []
+    for asset in campaign_assets:
+        try:
+            bytes_list.append(await download_image(asset["file_url"]))
+        except Exception as e:
+            log.warning("Could not download asset %s for embedding: %s",
+                        asset.get("name", asset["id"]), e)
+    if not bytes_list:
+        return []
+    embeddings = embedding_service.compute_embeddings_batch(bytes_list)
+    return [e for e in embeddings if e is not None]
+
 
 async def process_discovered_image(
     discovered_image_id: str,
@@ -1033,19 +1418,22 @@ async def process_discovered_image(
     campaign_assets: List[Dict[str, Any]],
     brand_rules: Dict[str, Any],
     source_type: Optional[str] = None,
-    channel: Optional[str] = None
-) -> Optional[Dict[str, Any]]:
+    channel: Optional[str] = None,
+    asset_hashes_cache: Optional[List[Dict[str, Any]]] = None,
+    asset_embeddings_cache: Optional[list] = None,
+) -> tuple:
     """
     Full processing pipeline for a discovered image.
-    
-    Enhanced with:
-    - Adaptive thresholds based on historical feedback
-    - Ensemble matching
-    - Borderline verification
-    - Confidence calibration
+
+    Returns (result_dict, stage) where stage indicates the last pipeline
+    stage reached.  When no match is found result_dict is None.
+
+    Stages: "download_failed", "hash_rejected", "clip_rejected",
+            "filter_rejected", "below_threshold", "verification_rejected",
+            "matched"
     """
-    print(f"[AI] Processing image: {image_url[:80]}...")
-    print(f"[AI] Source type: {source_type or 'not specified'}")
+    log.info("Processing image: %s", image_url[:80])
+    log.debug("Source type: %s", source_type or "not specified")
     
     # Determine if this is a screenshot
     is_screenshot = (
@@ -1054,6 +1442,28 @@ async def process_discovered_image(
         "screenshotUrl" in image_url or
         "/screenshots/" in image_url
     )
+
+    # --- Stage 1 & 2: local pre-filters (skip for screenshots) ---
+    if not is_screenshot:
+        try:
+            image_bytes_for_prefilter = await download_image(image_url)
+        except Exception as e:
+            log.warning("Could not download image for pre-filter: %s", e)
+            return None, "download_failed"
+
+        # Stage 1: Hash pre-filter
+        if asset_hashes_cache:
+            passes_hash = await _passes_hash_prefilter(image_bytes_for_prefilter, asset_hashes_cache)
+            if not passes_hash:
+                log.debug("REJECTED by hash pre-filter (no asset resemblance)")
+                return None, "hash_rejected"
+
+        # Stage 2: CLIP embedding pre-filter
+        if asset_embeddings_cache:
+            passes_clip = _passes_clip_prefilter(image_bytes_for_prefilter, asset_embeddings_cache)
+            if not passes_clip:
+                log.debug("REJECTED by CLIP pre-filter (low semantic similarity)")
+                return None, "clip_rejected"
     
     # Get adaptive threshold for this source/channel
     adaptive_threshold, threshold_meta = await get_adaptive_threshold(
@@ -1061,36 +1471,35 @@ async def process_discovered_image(
         channel or "website"
     )
     
-    print(f"[AI] Using adaptive threshold: {adaptive_threshold} (Confidence: {threshold_meta['confidence']})")
+    log.debug("Using adaptive threshold: %d (Confidence: %s)", adaptive_threshold, threshold_meta['confidence'])
     
-    print(f"[AI] Image type: {'SCREENSHOT' if is_screenshot else 'regular image'}")
+    log.debug("Image type: %s", "SCREENSHOT" if is_screenshot else "regular image")
     
-    # Step 1: Filter (skip for screenshots)
+    # Stage 3: Claude Haiku relevance filter (skip for screenshots)
     if is_screenshot:
-        print(f"[AI] Step 1: SKIPPING filter for screenshot")
+        log.debug("Stage 3: skipping filter for screenshot")
         filter_result = ImageFilterResult(
             is_relevant=True,
             confidence=1.0,
             reason="Screenshot - checking for contained assets"
         )
     else:
-        print(f"[AI] Step 1: Filtering for relevance...")
+        log.debug("Stage 3: Haiku relevance filter")
         filter_result = await filter_image(image_url)
-        print(f"[AI] - Filter: is_relevant={filter_result.is_relevant}, confidence={filter_result.confidence}")
+        log.debug("Filter: is_relevant=%s, confidence=%.2f", filter_result.is_relevant, filter_result.confidence)
         
         if not filter_result.is_relevant:
-            print(f"[AI] Image filtered out as not relevant")
-            return None
+            log.debug("Image filtered out as not relevant")
+            return None, "filter_rejected"
     
-    # Step 2: Ensemble matching against each asset
-    print(f"[AI] Step 2: Ensemble matching against {len(campaign_assets)} assets...")
+    # Stage 4: Ensemble matching against each asset (Claude Opus)
+    log.debug("Stage 4: ensemble matching against %d assets", len(campaign_assets))
     best_match = None
     best_score = 0
     
     for asset in campaign_assets:
-        print(f"[AI] - Comparing with asset: {asset.get('name', asset['id'])}")
+        log.debug("Comparing with asset: %s", asset.get('name', asset['id']))
         
-        # Use ensemble matching
         comparison = await ensemble_match(
             asset["file_url"],
             image_url,
@@ -1100,9 +1509,8 @@ async def process_discovered_image(
         score = comparison.get("similarity_score", 0)
         is_found = comparison.get("asset_found", False) or comparison.get("is_match", False)
         
-        print(f"[AI]   Ensemble score: {score}, Found/Match: {is_found}")
+        log.debug("Ensemble score: %d, Found/Match: %s", score, is_found)
         
-        # Track best match
         if is_found or score > best_score:
             if is_found:
                 best_score = max(score, best_score)
@@ -1113,19 +1521,18 @@ async def process_discovered_image(
     
     threshold = adaptive_threshold
     
-    # Check if we have a match
     if not best_match:
-        print(f"[AI] No match found")
-        return None
+        log.info("No match found")
+        return None, "below_threshold"
     
     asset_found = best_match["comparison"].get("asset_found", False)
     is_match = best_match["comparison"].get("is_match", False)
     
     if not asset_found and not is_match and best_score < threshold:
-        print(f"[AI] Best score {best_score} below threshold {threshold}")
-        return None
+        log.debug("Best score %d below threshold %d", best_score, threshold)
+        return None, "below_threshold"
     
-    # Step 3: Verify borderline matches
+    # Verify borderline matches
     needs_verification = await should_verify_match(
         best_score,
         source_type or ("page_screenshot" if is_screenshot else "website_banner"),
@@ -1133,7 +1540,7 @@ async def process_discovered_image(
     )
     
     if needs_verification:
-        print(f"[AI] Step 3: Verifying borderline match (score: {best_score})...")
+        log.debug("Verifying borderline match (score: %d)", best_score)
         verification = await verify_borderline_match(
             best_match["asset"]["file_url"],
             image_url,
@@ -1141,19 +1548,18 @@ async def process_discovered_image(
         )
         
         if not verification.get("is_match", False):
-            print(f"[AI] Verification rejected match")
-            return None
+            log.debug("Verification rejected match")
+            return None, "verification_rejected"
         
-        # Use verified score
         best_score = verification.get("verified_score", best_score)
-        print(f"[AI] Verification passed with score: {best_score}")
+        log.debug("Verification passed with score: %d", best_score)
     
     # Apply confidence calibration
     calibrated_score = await calibrate_confidence(best_score, source_type or "unknown", channel or "unknown")
-    print(f"[AI] Calibrated score: {best_score} -> {calibrated_score}")
+    log.debug("Calibrated score: %d -> %d", best_score, calibrated_score)
     
-    # Step 4: Compliance analysis
-    print(f"[AI] Step 4: Compliance analysis...")
+    # Compliance analysis
+    log.debug("Compliance analysis")
     compliance = await analyze_compliance(
         image_url,
         best_match["asset"]["file_url"],
@@ -1161,10 +1567,9 @@ async def process_discovered_image(
         best_match["asset"].get("campaign_end_date")
     )
     
-    # Determine match type
     match_type = _get_match_type_from_score(calibrated_score)
     
-    print(f"[AI] Final: {match_type} match, score {calibrated_score}, compliant={compliance.is_compliant}")
+    log.info("Final: %s match, score %d, compliant=%s", match_type, calibrated_score, compliance.is_compliant)
     
     return {
         "discovered_image_id": discovered_image_id,
@@ -1190,7 +1595,7 @@ async def process_discovered_image(
             "ensemble_scores": best_match["comparison"].get("method_scores", {}),
             "calibration_applied": best_score != calibrated_score
         }
-    }
+    }, "matched"
 
 
 async def process_images_batch(
@@ -1200,14 +1605,22 @@ async def process_images_batch(
 ) -> List[Optional[Dict[str, Any]]]:
     """
     Process multiple images in optimized parallel batches.
+
+    Pre-computes asset hashes and CLIP embeddings once, then reuses
+    them for every discovered image to avoid redundant downloads.
     """
+    # Pre-compute caches once for all images
+    log.info("Pre-computing asset hashes and embeddings for %d assets", len(campaign_assets))
+    asset_hashes = await _precompute_asset_hashes(campaign_assets)
+    asset_embeddings = await _precompute_asset_embeddings(campaign_assets)
+    log.info("Cached %d hash sets, %d CLIP embeddings", len(asset_hashes), len(asset_embeddings))
+
     results = []
     batch_size = settings.batch_size
     
     for i in range(0, len(images), batch_size):
         batch = images[i:i + batch_size]
         
-        # Process batch in parallel
         batch_results = await asyncio.gather(
             *[
                 process_discovered_image(
@@ -1216,7 +1629,9 @@ async def process_images_batch(
                     campaign_assets,
                     brand_rules,
                     source_type=img.get("source_type"),
-                    channel=img.get("channel")
+                    channel=img.get("channel"),
+                    asset_hashes_cache=asset_hashes,
+                    asset_embeddings_cache=asset_embeddings,
                 )
                 for img in batch
             ],
@@ -1225,12 +1640,11 @@ async def process_images_batch(
         
         for j, result in enumerate(batch_results):
             if isinstance(result, Exception):
-                print(f"[AI Batch] Error processing image: {result}")
-                results.append(None)
+                log.error("Error processing image in batch: %s", result)
+                results.append((None, "error"))
             else:
                 results.append(result)
         
-        # Rate limiting between batches
         if i + batch_size < len(images):
             await asyncio.sleep(settings.batch_delay)
     

@@ -12,6 +12,9 @@ import {
   Eye,
   Trash2,
   Layers,
+  ThumbsUp,
+  ThumbsDown,
+  Download,
 } from "lucide-react";
 import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
@@ -27,7 +30,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { useMatches, useMatchStats, useApproveMatch, useFlagMatch, useDeleteMatch, useDeleteAllMatches } from "@/lib/hooks";
+import { useMatches, useMatchStats, useApproveMatch, useFlagMatch, useDeleteMatch, useDeleteAllMatches, useSubmitFeedback } from "@/lib/hooks";
+import { downloadComplianceReport } from "@/lib/api";
 import {
   timeAgo,
   getMatchTypeBadge,
@@ -70,7 +74,21 @@ function MatchesContent() {
   const flagMutation = useFlagMatch();
   const deleteMatchMutation = useDeleteMatch();
   const deleteAllMatchesMutation = useDeleteAllMatches();
+  const feedbackMutation = useSubmitFeedback();
   const [searchFilter, setSearchFilter] = useState("");
+  const [feedbackGiven, setFeedbackGiven] = useState<Record<string, "correct" | "incorrect">>({});
+  const [downloading, setDownloading] = useState<string | null>(null);
+
+  const handleDownload = async (format: "pdf" | "csv") => {
+    setDownloading(format);
+    try {
+      await downloadComplianceReport(format);
+    } catch (error) {
+      console.error("Download failed:", error);
+    } finally {
+      setDownloading(null);
+    }
+  };
   
   const handleStatusFilter = (status: string) => {
     if (status) {
@@ -113,6 +131,21 @@ function MatchesContent() {
       } catch (error) {
         console.error("Failed to delete all matches:", error);
       }
+    }
+  };
+
+  const handleFeedback = async (id: string, wasCorrect: boolean) => {
+    try {
+      await feedbackMutation.mutateAsync({
+        matchId: id,
+        feedback: {
+          was_correct: wasCorrect,
+          actual_verdict: wasCorrect ? "true_positive" : "false_positive",
+        },
+      });
+      setFeedbackGiven((prev) => ({ ...prev, [id]: wasCorrect ? "correct" : "incorrect" }));
+    } catch (error) {
+      console.error("Failed to submit feedback:", error);
     }
   };
 
@@ -196,18 +229,38 @@ function MatchesContent() {
               className="pl-9 h-9"
             />
           </div>
-          {matches.length > 0 && (
-            <Button 
+          <div className="flex items-center gap-2">
+            <Button
               variant="outline"
               size="sm"
-              onClick={handleDeleteAllMatches}
-              disabled={deleteAllMatchesMutation.isPending}
-              className="text-destructive hover:text-destructive hover:border-destructive/50"
+              onClick={() => handleDownload("pdf")}
+              disabled={downloading !== null}
             >
-              <Trash2 className="mr-2 h-3.5 w-3.5" />
-              Delete All
+              <Download className="mr-2 h-3.5 w-3.5" />
+              {downloading === "pdf" ? "Generating..." : "PDF"}
             </Button>
-          )}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => handleDownload("csv")}
+              disabled={downloading !== null}
+            >
+              <Download className="mr-2 h-3.5 w-3.5" />
+              {downloading === "csv" ? "Generating..." : "CSV"}
+            </Button>
+            {matches.length > 0 && (
+              <Button 
+                variant="outline"
+                size="sm"
+                onClick={handleDeleteAllMatches}
+                disabled={deleteAllMatchesMutation.isPending}
+                className="text-destructive hover:text-destructive hover:border-destructive/50"
+              >
+                <Trash2 className="mr-2 h-3.5 w-3.5" />
+                Delete All
+              </Button>
+            )}
+          </div>
         </div>
 
         {/* Matches Table */}
@@ -238,6 +291,7 @@ function MatchesContent() {
                     <TableHead>Confidence</TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead>Discovered</TableHead>
+                    <TableHead>Feedback</TableHead>
                     <TableHead className="text-right">Actions</TableHead>
                   </TableRow>
                 </TableHeader>
@@ -327,6 +381,44 @@ function MatchesContent() {
                           <span className="text-xs text-muted-foreground font-mono">
                             {timeAgo(match.created_at)}
                           </span>
+                        </TableCell>
+                        <TableCell>
+                          {feedbackGiven[match.id] ? (
+                            <Badge className={
+                              feedbackGiven[match.id] === "correct"
+                                ? "bg-emerald-500/20 text-emerald-400 border-emerald-500/30"
+                                : "bg-amber-500/20 text-amber-400 border-amber-500/30"
+                            }>
+                              {feedbackGiven[match.id] === "correct" ? (
+                                <><ThumbsUp className="h-3 w-3 mr-1" /> Correct</>
+                              ) : (
+                                <><ThumbsDown className="h-3 w-3 mr-1" /> Wrong</>
+                              )}
+                            </Badge>
+                          ) : (
+                            <div className="flex gap-0.5">
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7 text-emerald-400 hover:text-emerald-300 hover:bg-emerald-500/10"
+                                onClick={() => handleFeedback(match.id, true)}
+                                disabled={feedbackMutation.isPending}
+                                title="Correct match"
+                              >
+                                <ThumbsUp className="h-3.5 w-3.5" />
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                className="h-7 w-7 text-amber-400 hover:text-amber-300 hover:bg-amber-500/10"
+                                onClick={() => handleFeedback(match.id, false)}
+                                disabled={feedbackMutation.isPending}
+                                title="Incorrect match"
+                              >
+                                <ThumbsDown className="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          )}
                         </TableCell>
                         <TableCell>
                           <div className="flex items-center justify-end gap-1">

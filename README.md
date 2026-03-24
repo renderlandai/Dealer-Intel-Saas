@@ -21,7 +21,7 @@ AI-powered campaign asset monitoring for distributor networks. Automatically det
 - Node.js 18+
 - Supabase account
 - Anthropic API key (Claude)
-- Apify account with API token
+- ScreenshotOne account (access key)
 
 ## Quick Setup
 
@@ -49,7 +49,8 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_ANON_KEY=your-anon-key
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 ANTHROPIC_API_KEY=your-anthropic-api-key
-APIFY_API_TOKEN=your-apify-token
+SCREENSHOTONE_ACCESS_KEY=your-screenshotone-access-key
+SCREENSHOTONE_SECRET_KEY=your-screenshotone-secret-key
 ```
 
 Create `frontend/.env.local`:
@@ -105,11 +106,11 @@ dealer-intel/
 │   │   │   ├── distributors.py  # Distributor CRUD
 │   │   │   ├── matches.py       # Match management
 │   │   │   ├── dashboard.py     # Dashboard stats & analytics
-│   │   │   ├── scanning.py      # Apify scan jobs
+│   │   │   ├── scanning.py      # Scan jobs & analysis
 │   │   │   └── feedback.py      # AI accuracy feedback & calibration
 │   │   └── services/
-│   │       ├── ai_service.py              # Claude Opus 4.5 analysis pipeline
-│   │       ├── apify_service.py           # Apify integration
+│   │       ├── ai_service.py              # Claude image analysis pipeline
+│   │       ├── screenshot_service.py      # ScreenshotOne integration
 │   │       └── adaptive_threshold_service.py  # Dynamic threshold tuning
 │   └── requirements.txt
 ├── frontend/
@@ -216,10 +217,10 @@ dealer-intel/
 
 ## AI Pipeline
 
-1. **Apify Scrapers** collect images from:
-   - Google Ads Transparency Center
-   - Facebook/Instagram Ad Library
-   - Dealer websites
+1. **ScreenshotOne** captures full-page screenshots from:
+   - Google Ads Transparency Center (per advertiser)
+   - Facebook/Meta Ad Library (per page)
+   - Dealer websites (full-page with lazy-load support)
 
 2. **Perceptual Hashing** provides fast pre-filtering:
    - pHash, dHash, wHash, average hash algorithms
@@ -255,10 +256,10 @@ Key thresholds can be configured via environment variables:
 | Component | Monthly Cost |
 |-----------|-------------|
 | Supabase (Free tier) | $0 |
-| Apify (Starter) | $49+ |
+| ScreenshotOne (Starter) | $25+ |
 | Anthropic (Claude) | $20-100 |
 | Vercel (Free tier) | $0 |
-| **Total** | **~$70-150/month** |
+| **Total** | **~$45-125/month** |
 
 ## Deployment
 
@@ -288,18 +289,13 @@ vercel
 
 ## Next Steps
 
-1. **Add Apify Scrapers**: Go to [Apify Console](https://console.apify.com) and add:
-   - `lexis-solutions/google-ads-scraper`
-   - `curios/facebook-ads-scraper`
-   - `apify/website-content-crawler`
+1. **Configure ScreenshotOne**: Sign up at [screenshotone.com](https://screenshotone.com) and add your access key to `.env`
 
-2. **Configure Webhooks**: Set up Apify webhooks to notify your backend when scans complete
+2. **Add Authentication**: Implement Supabase Auth for user management
 
-3. **Add Authentication**: Implement Supabase Auth for user management
+3. **Set Up Scheduled Scans**: Use Supabase Edge Functions or a cron service for automated monitoring
 
-4. **Set Up Scheduled Scans**: Use Supabase Edge Functions or a cron service for automated monitoring
-
-5. **Review AI Feedback**: Use the `/api/v1/feedback` endpoints to monitor and improve AI accuracy
+4. **Review AI Feedback**: Use the `/api/v1/feedback` endpoints to monitor and improve AI accuracy
 
 ## Security Notes
 

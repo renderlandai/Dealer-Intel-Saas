@@ -25,6 +25,8 @@ import {
   deleteAllMatches,
   deleteScan,
   deleteAllScans,
+  submitMatchFeedback,
+  getFeedbackStats,
 } from "./api";
 
 // Query keys for cache management
@@ -283,6 +285,34 @@ export function useDeleteAllMatches() {
       queryClient.invalidateQueries({ queryKey: ["matches"] });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });
     },
+  });
+}
+
+export function useSubmitFeedback() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      matchId,
+      feedback,
+    }: {
+      matchId: string;
+      feedback: {
+        was_correct: boolean;
+        actual_verdict: "true_positive" | "false_positive" | "true_negative" | "false_negative";
+        review_notes?: string;
+      };
+    }) => submitMatchFeedback(matchId, feedback),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["matches"] });
+      queryClient.invalidateQueries({ queryKey: ["feedbackStats"] });
+    },
+  });
+}
+
+export function useFeedbackStats() {
+  return useQuery({
+    queryKey: ["feedbackStats"],
+    queryFn: getFeedbackStats,
   });
 }
 
