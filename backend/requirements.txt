@@ -44,5 +44,9 @@ reportlab>=4.0.0
 # Scheduling
 apscheduler>=3.10.0
 
+# Task Queue
+celery[redis]>=5.4.0
+redis[hiredis]>=5.0.0
+
 # Error Tracking
 sentry-sdk[fastapi]>=2.0.0

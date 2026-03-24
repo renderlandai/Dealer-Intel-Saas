@@ -1,6 +1,6 @@
 """Scanning and analysis routes."""
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
+from fastapi import APIRouter, HTTPException, Depends
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 
@@ -113,19 +113,18 @@ router = APIRouter(prefix="/scans", tags=["scanning"])
 @router.post("/start", response_model=ScanJob)
 async def start_scan(
     scan_request: ScanJobCreate,
-    background_tasks: BackgroundTasks,
     user: AuthUser = Depends(get_current_user),
 ):
     """
     Start a new scan job.
     
-    This will:
-    1. Create a scan job record
-    2. Capture screenshots via ScreenshotOne
-    3. Auto-analyze discovered images against campaign assets
-    4. Return the job ID for status tracking
+    Dispatches the scan to a Celery worker for durable background execution.
     """
-    # Create scan job record
+    from ..tasks import (
+        run_google_ads_scan_task, run_facebook_scan_task,
+        run_instagram_scan_task, run_website_scan_task,
+    )
+
     job_data = {
         "organization_id": str(user.org_id),
         "campaign_id": str(scan_request.campaign_id) if scan_request.campaign_id else None,
@@ -135,9 +134,8 @@ async def start_scan(
     
     result = supabase.table("scan_jobs").insert(job_data).execute()
     scan_job = result.data[0]
-    scan_job_id = UUID(scan_job["id"])
+    scan_job_id = scan_job["id"]
     
-    # Get distributors to scan
     if scan_request.distributor_ids:
         distributors = supabase.table("distributors")\
             .select("*")\
@@ -151,30 +149,18 @@ async def start_scan(
             .execute()
     
     distributor_list = distributors.data
+    campaign_id_str = str(scan_request.campaign_id) if scan_request.campaign_id else None
     
-    # Build distributor mappings
     if scan_request.source == ScanSource.GOOGLE_ADS:
-        # Map advertiser names to distributor IDs
         names = [d.get("google_ads_advertiser_id") or d["name"] for d in distributor_list]
         mapping = {
-            (d.get("google_ads_advertiser_id") or d["name"]).lower(): UUID(d["id"])
+            (d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"]
             for d in distributor_list
         }
-        
         log.info("Starting Google Ads scan for %d advertisers", len(names))
-        log.info("Campaign ID for auto-analysis: %s", scan_request.campaign_id)
-        
-        # Start scrape in background
-        background_tasks.add_task(
-            run_google_ads_scan,
-            names,
-            scan_job_id,
-            mapping,
-            scan_request.campaign_id  # Pass campaign_id for auto-analysis!
-        )
+        run_google_ads_scan_task.delay(names, scan_job_id, mapping, campaign_id_str)
         
     elif scan_request.source == ScanSource.INSTAGRAM:
-        # Instagram organic posts via apify/instagram-scraper
         urls = [d["instagram_url"] for d in distributor_list if d.get("instagram_url")]
         mapping = {}
         for d in distributor_list:
@@ -182,58 +168,25 @@ async def start_scan(
             if ig_url:
                 username = apify_instagram_service._extract_username(ig_url)
                 if username:
-                    mapping[username.lower()] = UUID(d["id"])
-                mapping[d["name"].lower()] = UUID(d["id"])
-
+                    mapping[username.lower()] = d["id"]
+                mapping[d["name"].lower()] = d["id"]
         log.info("Starting Instagram organic scan for %d profiles", len(urls))
-        log.info("Campaign ID for auto-analysis: %s", scan_request.campaign_id)
-
-        background_tasks.add_task(
-            run_instagram_scan,
-            urls,
-            scan_job_id,
-            mapping,
-            scan_request.campaign_id,
-        )
+        run_instagram_scan_task.delay(urls, scan_job_id, mapping, campaign_id_str)
 
     elif scan_request.source == ScanSource.FACEBOOK:
-        # Facebook ads via Meta Ad Library
         urls = [d["facebook_url"] for d in distributor_list if d.get("facebook_url")]
-        mapping = {
-            d["name"].lower(): UUID(d["id"])
-            for d in distributor_list
-        }
-        
+        mapping = {d["name"].lower(): d["id"] for d in distributor_list}
         log.info("Starting Facebook scan for %d pages", len(urls))
-        log.info("Campaign ID for auto-analysis: %s", scan_request.campaign_id)
-        
-        background_tasks.add_task(
-            run_facebook_scan,
-            urls,
-            scan_job_id,
-            mapping,
-            scan_request.campaign_id,
-            "facebook",
-        )
+        run_facebook_scan_task.delay(urls, scan_job_id, mapping, campaign_id_str, "facebook")
         
     elif scan_request.source == ScanSource.WEBSITE:
-        # Get website URLs
         urls = [d["website_url"] for d in distributor_list if d.get("website_url")]
         mapping = {
-            d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: UUID(d["id"])
+            d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: d["id"]
             for d in distributor_list if d.get("website_url")
         }
-        
         log.info("Starting website scan for %d URLs: %s", len(urls), urls)
-        log.info("Campaign ID for auto-analysis: %s", scan_request.campaign_id)
-        
-        background_tasks.add_task(
-            run_website_scan,
-            urls,
-            scan_job_id,
-            mapping,
-            scan_request.campaign_id  # Pass campaign_id for auto-analysis!
-        )
+        run_website_scan_task.delay(urls, scan_job_id, mapping, campaign_id_str)
     
     return scan_job
 
@@ -930,19 +883,14 @@ async def delete_all_scans():
 @router.post("/{job_id}/analyze")
 async def analyze_discovered_images(
     job_id: UUID,
-    background_tasks: BackgroundTasks,
     campaign_id: Optional[UUID] = None
 ):
     """
     Analyze discovered images from a completed scan.
-    
-    This will:
-    1. Filter images for relevance
-    2. Match against campaign assets via ensemble matching
-    3. Run compliance checks with Claude
-    4. Create match records
+    Dispatched to Celery worker for durable execution.
     """
-    # Get scan job
+    from ..tasks import analyze_scan_task
+
     job = supabase.table("scan_jobs")\
         .select("*")\
         .eq("id", str(job_id))\
@@ -955,61 +903,24 @@ async def analyze_discovered_images(
     if job.data["status"] != "completed":
         raise HTTPException(status_code=400, detail="Scan job not completed yet")
     
-    # Get unprocessed discovered images
     images = supabase.table("discovered_images")\
-        .select("*")\
+        .select("id", count="exact")\
         .eq("scan_job_id", str(job_id))\
         .eq("is_processed", False)\
         .execute()
     
-    if not images.data:
+    image_count = images.count or 0
+    if image_count == 0:
         return {"message": "No unprocessed images found", "count": 0}
     
-    # Get campaign assets
-    if campaign_id:
-        assets = supabase.table("assets")\
-            .select("*")\
-            .eq("campaign_id", str(campaign_id))\
-            .execute()
-    else:
-        # Get all assets for the organization
-        assets = supabase.table("assets")\
-            .select("*, campaigns!inner(organization_id)")\
-            .eq("campaigns.organization_id", job.data["organization_id"])\
-            .execute()
-    
-    # Get brand rules
-    rules = supabase.table("compliance_rules")\
-        .select("*")\
-        .eq("organization_id", job.data["organization_id"])\
-        .eq("is_active", True)\
-        .execute()
-    
-    brand_rules = {}
-    for rule in rules.data:
-        if rule["rule_type"] == "required_element":
-            brand_rules.setdefault("required_elements", []).append(
-                rule["rule_config"].get("element")
-            )
-        elif rule["rule_type"] == "forbidden_element":
-            brand_rules.setdefault("forbidden_elements", []).append(
-                rule["rule_config"].get("element")
-            )
-    
-    # Run analysis in background
-    background_tasks.add_task(
-        run_image_analysis,
-        images.data,
-        assets.data,
-        brand_rules,
-        job.data["organization_id"],
-        str(job_id)  # Pass scan_job_id for matches_count update
+    analyze_scan_task.delay(
+        str(job_id),
+        str(campaign_id) if campaign_id else None,
     )
     
     return {
-        "message": "Analysis started",
-        "image_count": len(images.data),
-        "asset_count": len(assets.data)
+        "message": "Analysis queued",
+        "image_count": image_count,
     }
 
 
@@ -1092,21 +1003,16 @@ async def run_image_analysis(
 @router.post("/quick-scan")
 async def quick_scan(
     source: ScanSource,
-    background_tasks: BackgroundTasks,
     user: AuthUser = Depends(get_current_user),
 ):
     """
     Quick scan - starts a scan and immediately begins analysis.
-    
-    Convenience endpoint that combines start_scan and analyze.
     """
-    # Create scan job
     job = await start_scan(
         ScanJobCreate(
             organization_id=user.org_id,
             source=source
         ),
-        background_tasks,
         user
     )
     
@@ -1120,15 +1026,14 @@ async def quick_scan(
 @router.post("/reprocess-unprocessed")
 async def reprocess_unprocessed_images(
     campaign_id: UUID,
-    background_tasks: BackgroundTasks,
     limit: int = 100
 ):
     """
     Reprocess images that were never analyzed.
-    
-    This handles cases where the auto-analysis failed or was interrupted.
+    Dispatched to Celery worker for durable execution.
     """
-    # Get campaign info
+    from ..tasks import reprocess_images_task
+
     campaign = supabase.table("campaigns")\
         .select("organization_id")\
         .eq("id", str(campaign_id))\
@@ -1138,58 +1043,29 @@ async def reprocess_unprocessed_images(
     if not campaign.data:
         raise HTTPException(status_code=404, detail="Campaign not found")
     
-    organization_id = campaign.data["organization_id"]
-    
-    # Get unprocessed images (across all scans)
     unprocessed = supabase.table("discovered_images")\
-        .select("*")\
+        .select("id", count="exact")\
         .eq("is_processed", False)\
         .limit(limit)\
         .execute()
     
-    if not unprocessed.data:
+    if not (unprocessed.count or 0):
         return {"message": "No unprocessed images found", "count": 0}
     
-    # Get campaign assets
     assets = supabase.table("assets")\
-        .select("*")\
+        .select("id", count="exact")\
         .eq("campaign_id", str(campaign_id))\
         .execute()
     
-    if not assets.data:
+    if not (assets.count or 0):
         return {"message": "No campaign assets to match against", "count": 0}
     
-    # Get brand rules
-    rules = supabase.table("compliance_rules")\
-        .select("*")\
-        .eq("organization_id", organization_id)\
-        .eq("is_active", True)\
-        .execute()
-    
-    brand_rules = {}
-    for rule in rules.data:
-        if rule["rule_type"] == "required_element":
-            brand_rules.setdefault("required_elements", []).append(
-                rule["rule_config"].get("element")
-            )
-        elif rule["rule_type"] == "forbidden_element":
-            brand_rules.setdefault("forbidden_elements", []).append(
-                rule["rule_config"].get("element")
-            )
-    
-    # Run analysis in background
-    background_tasks.add_task(
-        run_image_analysis,
-        unprocessed.data,
-        assets.data,
-        brand_rules,
-        organization_id
-    )
+    reprocess_images_task.delay(str(campaign_id), limit)
     
     return {
-        "message": "Reprocessing started",
-        "image_count": len(unprocessed.data),
-        "asset_count": len(assets.data)
+        "message": "Reprocessing queued",
+        "image_count": unprocessed.count,
+        "asset_count": assets.count,
     }
 
 

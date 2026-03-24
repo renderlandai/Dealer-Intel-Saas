@@ -1,7 +1,6 @@
 """Scheduled scan service — uses APScheduler CronTrigger for time-precise scheduling."""
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
@@ -141,49 +140,50 @@ async def _trigger_scan(schedule_id: str) -> None:
         scan_job = result.data[0]
         scan_job_id = UUID(scan_job["id"])
 
-        from ..routers.scanning import (
-            run_google_ads_scan,
-            run_facebook_scan,
-            run_instagram_scan,
-            run_website_scan,
+        from ..tasks import (
+            run_google_ads_scan_task,
+            run_facebook_scan_task,
+            run_instagram_scan_task,
+            run_website_scan_task,
         )
         from ..services import apify_instagram_service
 
-        cid = UUID(campaign_id)
+        cid_str = campaign_id
+        job_id_str = str(scan_job_id)
 
         if source == "google_ads":
             names = [d.get("google_ads_advertiser_id") or d["name"] for d in dist_list]
             mapping = {
-                (d.get("google_ads_advertiser_id") or d["name"]).lower(): UUID(d["id"])
+                (d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"]
                 for d in dist_list
             }
-            asyncio.create_task(run_google_ads_scan(names, scan_job_id, mapping, cid))
+            run_google_ads_scan_task.delay(names, job_id_str, mapping, cid_str)
 
         elif source == "instagram":
             urls = [d["instagram_url"] for d in dist_list if d.get("instagram_url")]
-            mapping: Dict[str, UUID] = {}
+            mapping: Dict[str, str] = {}
             for d in dist_list:
                 ig_url = d.get("instagram_url")
                 if ig_url:
                     username = apify_instagram_service._extract_username(ig_url)
                     if username:
-                        mapping[username.lower()] = UUID(d["id"])
-                    mapping[d["name"].lower()] = UUID(d["id"])
-            asyncio.create_task(run_instagram_scan(urls, scan_job_id, mapping, cid))
+                        mapping[username.lower()] = d["id"]
+                    mapping[d["name"].lower()] = d["id"]
+            run_instagram_scan_task.delay(urls, job_id_str, mapping, cid_str)
 
         elif source == "facebook":
             urls = [d["facebook_url"] for d in dist_list if d.get("facebook_url")]
-            mapping = {d["name"].lower(): UUID(d["id"]) for d in dist_list}
-            asyncio.create_task(run_facebook_scan(urls, scan_job_id, mapping, cid))
+            mapping = {d["name"].lower(): d["id"] for d in dist_list}
+            run_facebook_scan_task.delay(urls, job_id_str, mapping, cid_str, "facebook")
 
         elif source == "website":
             urls = [d["website_url"] for d in dist_list if d.get("website_url")]
             mapping = {
-                d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: UUID(d["id"])
+                d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: d["id"]
                 for d in dist_list
                 if d.get("website_url")
             }
-            asyncio.create_task(run_website_scan(urls, scan_job_id, mapping, cid))
+            run_website_scan_task.delay(urls, job_id_str, mapping, cid_str)
 
         supabase.table("scan_jobs").update({
             "status": "running",

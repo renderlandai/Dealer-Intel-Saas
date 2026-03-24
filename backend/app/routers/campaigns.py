@@ -1,7 +1,7 @@
 """Campaign and Asset routes."""
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, BackgroundTasks, Depends
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from typing import List, Optional
 from uuid import UUID
 
@@ -256,20 +256,19 @@ async def delete_asset(asset_id: UUID):
 async def start_campaign_scan(
     campaign_id: UUID,
     source: ScanSource,
-    background_tasks: BackgroundTasks,
     distributor_ids: Optional[List[UUID]] = None,
     user: AuthUser = Depends(get_current_user),
 ):
     """
     Start a scan specifically for this campaign.
-    
-    This will:
-    1. Verify the campaign exists
-    2. Create a scan job linked to this campaign
-    3. Trigger the appropriate scraper
-    4. Results will be matched against this campaign's assets
+    Dispatched to Celery worker for durable background execution.
     """
-    # Verify campaign exists
+    from ..tasks import (
+        run_google_ads_scan_task, run_facebook_scan_task,
+        run_instagram_scan_task, run_website_scan_task,
+    )
+    from ..services import apify_instagram_service
+
     campaign = supabase.table("campaigns")\
         .select("*, organizations!campaigns_organization_id_fkey(id)")\
         .eq("id", str(campaign_id))\
@@ -281,7 +280,6 @@ async def start_campaign_scan(
     
     organization_id = campaign.data["organization_id"]
     
-    # Create scan job linked to this campaign
     job_data = {
         "organization_id": str(organization_id),
         "campaign_id": str(campaign_id),
@@ -291,9 +289,8 @@ async def start_campaign_scan(
     
     result = supabase.table("scan_jobs").insert(job_data).execute()
     scan_job = result.data[0]
-    scan_job_id = UUID(scan_job["id"])
+    scan_job_id = scan_job["id"]
     
-    # Get distributors to scan
     if distributor_ids:
         distributors = supabase.table("distributors")\
             .select("*")\
@@ -309,27 +306,23 @@ async def start_campaign_scan(
     distributor_list = distributors.data
     
     if not distributor_list:
-        # Update job status to failed if no distributors
         supabase.table("scan_jobs").update({
             "status": "failed",
             "error_message": "No active distributors found to scan"
-        }).eq("id", str(scan_job_id)).execute()
+        }).eq("id", scan_job_id).execute()
         scan_job["status"] = "failed"
         scan_job["error_message"] = "No active distributors found to scan"
         return scan_job
     
-    # Import scan functions from scanning router
-    from .scanning import run_google_ads_scan, run_facebook_scan, run_instagram_scan, run_website_scan
-    from ..services import apify_instagram_service
+    campaign_id_str = str(campaign_id)
     
-    # Build distributor mappings and trigger scans (passing campaign_id for auto-analysis)
     if source == ScanSource.GOOGLE_ADS:
         names = [d.get("google_ads_advertiser_id") or d["name"] for d in distributor_list]
         mapping = {
-            (d.get("google_ads_advertiser_id") or d["name"]).lower(): UUID(d["id"])
+            (d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"]
             for d in distributor_list
         }
-        background_tasks.add_task(run_google_ads_scan, names, scan_job_id, mapping, campaign_id)
+        run_google_ads_scan_task.delay(names, scan_job_id, mapping, campaign_id_str)
 
     elif source == ScanSource.INSTAGRAM:
         urls = [d["instagram_url"] for d in distributor_list if d.get("instagram_url")]
@@ -339,29 +332,22 @@ async def start_campaign_scan(
             if ig_url:
                 username = apify_instagram_service._extract_username(ig_url)
                 if username:
-                    mapping[username.lower()] = UUID(d["id"])
-                mapping[d["name"].lower()] = UUID(d["id"])
-        background_tasks.add_task(run_instagram_scan, urls, scan_job_id, mapping, campaign_id)
+                    mapping[username.lower()] = d["id"]
+                mapping[d["name"].lower()] = d["id"]
+        run_instagram_scan_task.delay(urls, scan_job_id, mapping, campaign_id_str)
 
     elif source == ScanSource.FACEBOOK:
         urls = [d["facebook_url"] for d in distributor_list if d.get("facebook_url")]
-        mapping = {d["name"].lower(): UUID(d["id"]) for d in distributor_list}
-        background_tasks.add_task(run_facebook_scan, urls, scan_job_id, mapping, campaign_id)
+        mapping = {d["name"].lower(): d["id"] for d in distributor_list}
+        run_facebook_scan_task.delay(urls, scan_job_id, mapping, campaign_id_str, "facebook")
         
     elif source == ScanSource.WEBSITE:
         urls = [d["website_url"] for d in distributor_list if d.get("website_url")]
         mapping = {
-            d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: UUID(d["id"])
+            d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: d["id"]
             for d in distributor_list if d.get("website_url")
         }
-        background_tasks.add_task(run_website_scan, urls, scan_job_id, mapping, campaign_id)
-    
-    # Update job status to running
-    supabase.table("scan_jobs").update({
-        "status": "running",
-        "started_at": datetime.now(timezone.utc).isoformat()
-    }).eq("id", str(scan_job_id)).execute()
-    scan_job["status"] = "running"
+        run_website_scan_task.delay(urls, scan_job_id, mapping, campaign_id_str)
     
     return scan_job
 
@@ -405,15 +391,14 @@ async def get_campaign_scan(campaign_id: UUID, scan_id: UUID, user: AuthUser = D
 async def analyze_campaign_scan(
     campaign_id: UUID,
     scan_id: UUID,
-    background_tasks: BackgroundTasks,
     user: AuthUser = Depends(get_current_user),
 ):
     """
     Analyze discovered images from a campaign scan.
-    
-    This will match discovered images against this campaign's assets only.
+    Dispatched to Celery worker for durable execution.
     """
-    # Verify scan job exists and belongs to campaign
+    from ..tasks import analyze_scan_task
+
     job = supabase.table("scan_jobs")\
         .select("*")\
         .eq("id", str(scan_id))\
@@ -427,52 +412,22 @@ async def analyze_campaign_scan(
     if job.data["status"] != "completed":
         raise HTTPException(status_code=400, detail="Scan job not completed yet")
     
-    # Get unprocessed discovered images from this scan
     images = supabase.table("discovered_images")\
-        .select("*")\
+        .select("id", count="exact")\
         .eq("scan_job_id", str(scan_id))\
         .eq("is_processed", False)\
         .execute()
     
-    if not images.data:
+    image_count = images.count or 0
+    if image_count == 0:
         return {"message": "No unprocessed images found", "count": 0}
     
-    # Get campaign assets only
-    assets = supabase.table("assets")\
-        .select("*")\
-        .eq("campaign_id", str(campaign_id))\
-        .execute()
-    
-    if not assets.data:
-        return {"message": "No assets in this campaign to match against", "count": 0}
-    
-    # Get brand rules
-    rules = supabase.table("compliance_rules")\
-        .select("*")\
-        .eq("organization_id", job.data["organization_id"])\
-        .eq("is_active", True)\
-        .execute()
-    
-    brand_rules = {}
-    for rule in rules.data:
-        if rule["rule_type"] == "required_element":
-            brand_rules.setdefault("required_elements", []).append(
-                rule["rule_config"].get("element")
-            )
-        elif rule["rule_type"] == "forbidden_element":
-            brand_rules.setdefault("forbidden_elements", []).append(
-                rule["rule_config"].get("element")
-            )
-    
-    # Import and run analysis
-    from .scanning import run_image_analysis
-    background_tasks.add_task(run_image_analysis, images.data, assets.data, brand_rules)
+    analyze_scan_task.delay(str(scan_id), str(campaign_id))
     
     return {
-        "message": "Analysis started for campaign",
+        "message": "Analysis queued for campaign",
         "campaign_id": str(campaign_id),
-        "image_count": len(images.data),
-        "asset_count": len(assets.data)
+        "image_count": image_count,
     }
 
 

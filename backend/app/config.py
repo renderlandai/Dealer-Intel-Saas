@@ -30,6 +30,9 @@ class Settings(BaseSettings):
     # Error Tracking
     sentry_dsn: str = ""
     
+    # Redis / Celery
+    redis_url: str = Field(default="redis://localhost:6379/0", description="Redis/Valkey URL for Celery broker")
+    
     # App
     debug: bool = False
     api_prefix: str = "/api/v1"
