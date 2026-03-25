@@ -29,7 +29,7 @@ const securityHeaders = [
       "style-src 'self' 'unsafe-inline' https://api.mapbox.com https://fonts.googleapis.com",
       "img-src 'self' data: blob: https: http:",
       "font-src 'self' data: https://fonts.gstatic.com",
-      "connect-src 'self' http://localhost:8000 https://*.supabase.co https://api.mapbox.com https://*.mapbox.com https://*.sentry.io",
+      "connect-src 'self' https://*.ondigitalocean.app http://localhost:8000 https://*.supabase.co https://api.mapbox.com https://*.mapbox.com https://*.sentry.io",
       "worker-src 'self' blob:",
       "child-src 'self' blob:",
       "frame-ancestors 'none'",
