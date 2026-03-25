@@ -23,44 +23,72 @@ def _deserialize_mapping(mapping: Dict[str, str]) -> Dict[str, UUID]:
     return {k: UUID(v) for k, v in mapping.items()}
 
 
+def _mark_job_failed(scan_job_id: str, error: str) -> None:
+    """Best-effort update of scan job status to failed."""
+    try:
+        from .database import supabase
+        supabase.table("scan_jobs").update({
+            "status": "failed",
+            "error_message": error[:500],
+        }).eq("id", scan_job_id).execute()
+    except Exception as db_err:
+        log.error("Could not mark scan job %s as failed: %s", scan_job_id, db_err)
+
+
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=60)
 def run_website_scan_task(self, urls, scan_job_id, distributor_mapping, campaign_id=None):
     from .routers.scanning import run_website_scan
     log.info("Celery: website scan job=%s urls=%d", scan_job_id, len(urls))
-    _run_async(run_website_scan(
-        urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-        UUID(campaign_id) if campaign_id else None,
-    ))
+    try:
+        _run_async(run_website_scan(
+            urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+            UUID(campaign_id) if campaign_id else None,
+        ))
+    except Exception as e:
+        log.error("Task run_website_scan_task failed for %s: %s", scan_job_id, e, exc_info=True)
+        _mark_job_failed(scan_job_id, str(e))
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=60)
 def run_google_ads_scan_task(self, advertiser_ids, scan_job_id, distributor_mapping, campaign_id=None):
     from .routers.scanning import run_google_ads_scan
     log.info("Celery: Google Ads scan job=%s advertisers=%d", scan_job_id, len(advertiser_ids))
-    _run_async(run_google_ads_scan(
-        advertiser_ids, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-        UUID(campaign_id) if campaign_id else None,
-    ))
+    try:
+        _run_async(run_google_ads_scan(
+            advertiser_ids, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+            UUID(campaign_id) if campaign_id else None,
+        ))
+    except Exception as e:
+        log.error("Task run_google_ads_scan_task failed for %s: %s", scan_job_id, e, exc_info=True)
+        _mark_job_failed(scan_job_id, str(e))
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=60)
 def run_facebook_scan_task(self, page_urls, scan_job_id, distributor_mapping, campaign_id=None, channel="facebook"):
     from .routers.scanning import run_facebook_scan
     log.info("Celery: Facebook scan job=%s pages=%d", scan_job_id, len(page_urls))
-    _run_async(run_facebook_scan(
-        page_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-        UUID(campaign_id) if campaign_id else None, channel,
-    ))
+    try:
+        _run_async(run_facebook_scan(
+            page_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+            UUID(campaign_id) if campaign_id else None, channel,
+        ))
+    except Exception as e:
+        log.error("Task run_facebook_scan_task failed for %s: %s", scan_job_id, e, exc_info=True)
+        _mark_job_failed(scan_job_id, str(e))
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=60)
 def run_instagram_scan_task(self, profile_urls, scan_job_id, distributor_mapping, campaign_id=None):
     from .routers.scanning import run_instagram_scan
     log.info("Celery: Instagram scan job=%s profiles=%d", scan_job_id, len(profile_urls))
-    _run_async(run_instagram_scan(
-        profile_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-        UUID(campaign_id) if campaign_id else None,
-    ))
+    try:
+        _run_async(run_instagram_scan(
+            profile_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+            UUID(campaign_id) if campaign_id else None,
+        ))
+    except Exception as e:
+        log.error("Task run_instagram_scan_task failed for %s: %s", scan_job_id, e, exc_info=True)
+        _mark_job_failed(scan_job_id, str(e))
 
 
 @celery_app.task(bind=True, max_retries=1, default_retry_delay=30)
@@ -139,9 +167,20 @@ def reprocess_images_task(self, campaign_id, limit=100):
         return
 
     org_id = campaign.data["organization_id"]
+
+    org_jobs = supabase.table("scan_jobs")\
+        .select("id")\
+        .eq("organization_id", org_id)\
+        .execute()
+    org_job_ids = [j["id"] for j in (org_jobs.data or [])]
+    if not org_job_ids:
+        log.info("No scan jobs found for org %s — nothing to reprocess", org_id)
+        return
+
     unprocessed = (
         supabase.table("discovered_images")
         .select("*")
+        .in_("scan_job_id", org_job_ids)
         .eq("is_processed", False)
         .limit(limit)
         .execute()

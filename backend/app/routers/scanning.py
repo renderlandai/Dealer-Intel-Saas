@@ -150,10 +150,21 @@ async def start_scan(
     scan_job = result.data[0]
     scan_job_id = scan_job["id"]
     
+    if scan_request.campaign_id:
+        campaign_check = supabase.table("campaigns")\
+            .select("id")\
+            .eq("id", str(scan_request.campaign_id))\
+            .eq("organization_id", str(user.org_id))\
+            .maybe_single()\
+            .execute()
+        if not campaign_check.data:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
     if scan_request.distributor_ids:
         distributors = supabase.table("distributors")\
             .select("*")\
             .in_("id", [str(d) for d in scan_request.distributor_ids])\
+            .eq("organization_id", str(user.org_id))\
             .execute()
     else:
         distributors = supabase.table("distributors")\
@@ -908,10 +919,13 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
         
     except Exception as e:
         log.error("Critical error in auto-analysis for scan %s: %s", scan_job_id, e, exc_info=True)
-        # Update scan job with error
-        supabase.table("scan_jobs").update({
-            "error_message": f"Analysis failed: {str(e)}"
-        }).eq("id", str(scan_job_id)).execute()
+        try:
+            supabase.table("scan_jobs").update({
+                "status": "failed",
+                "error_message": f"Analysis failed: {str(e)}"
+            }).eq("id", str(scan_job_id)).execute()
+        except Exception as db_err:
+            log.error("Failed to update scan job status after analysis error: %s", db_err)
 
 
 @router.get("", response_model=List[ScanJob])
@@ -1364,8 +1378,18 @@ async def reprocess_unprocessed_images(
     if not campaign.data:
         raise HTTPException(status_code=404, detail="Campaign not found")
     
+    org_scan_jobs = supabase.table("scan_jobs")\
+        .select("id")\
+        .eq("organization_id", str(user.org_id))\
+        .execute()
+    org_job_ids = [j["id"] for j in (org_scan_jobs.data or [])]
+
+    if not org_job_ids:
+        return {"message": "No scan jobs found for your organization", "count": 0}
+
     unprocessed = supabase.table("discovered_images")\
         .select("id", count="exact")\
+        .in_("scan_job_id", org_job_ids)\
         .eq("is_processed", False)\
         .limit(limit)\
         .execute()

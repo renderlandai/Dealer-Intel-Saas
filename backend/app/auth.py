@@ -93,7 +93,10 @@ async def get_current_user(
     if not sub:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing subject")
 
-    user_id = UUID(sub)
+    try:
+        user_id = UUID(sub)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token subject")
     email = payload.get("email", "")
 
     if user_id in _profile_cache:

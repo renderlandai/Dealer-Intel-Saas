@@ -2,6 +2,9 @@
 import os
 import ssl
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from celery import Celery
 
 # REDIS_URL is the canonical env var for both Celery and app config.

@@ -265,8 +265,9 @@ async def get_billing_usage(user: AuthUser = Depends(get_current_user)):
 async def stripe_webhook(request: Request):
     """Handle Stripe webhook events to sync subscription state."""
     s = get_settings()
-    if not s.stripe_secret_key:
-        return JSONResponse(status_code=200, content={"received": True})
+    if not s.stripe_secret_key or not s.stripe_webhook_secret:
+        log.warning("Stripe webhook received but billing is not configured")
+        return JSONResponse(status_code=503, content={"error": "Billing not configured"})
 
     payload = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
@@ -280,7 +281,7 @@ async def stripe_webhook(request: Request):
         raise HTTPException(400, "Invalid signature")
     except Exception as e:
         log.error("Stripe webhook error: %s", e)
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, "Webhook processing error")
 
     event_type = event["type"]
     data = event["data"]["object"]

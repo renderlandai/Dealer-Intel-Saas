@@ -177,6 +177,17 @@ workers:
         scope: RUN_TIME
         type: SECRET
         value: ""
+      - key: STRIPE_SECRET_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: STRIPE_WEBHOOK_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: FRONTEND_URL
+        scope: RUN_TIME
+        value: "https://dealer-intel-saas.vercel.app"
       - key: DEBUG
         scope: RUN_TIME
         value: "false"

@@ -38,16 +38,27 @@ settings = get_settings()
 
 # Shared browser instance to avoid repeated cold starts
 _browser: Optional[Browser] = None
+_pw_instance = None
 _browser_lock = asyncio.Lock()
 
 
 async def _get_browser() -> Browser:
     """Return a shared headless Chromium instance, launching if needed."""
-    global _browser
+    global _browser, _pw_instance
     async with _browser_lock:
         if _browser is None or not _browser.is_connected():
-            pw = await async_playwright().start()
-            _browser = await pw.chromium.launch(
+            if _browser is not None:
+                try:
+                    await _browser.close()
+                except Exception:
+                    pass
+            if _pw_instance is not None:
+                try:
+                    await _pw_instance.stop()
+                except Exception:
+                    pass
+            _pw_instance = await async_playwright().start()
+            _browser = await _pw_instance.chromium.launch(
                 headless=True,
                 args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
             )
@@ -420,7 +431,10 @@ async def _extract_from_viewport(
     except Exception as e:
         log.error("Error on %s (%s): %s", url, viewport_label, e, exc_info=True)
     finally:
-        await page.context.close()
+        try:
+            await page.context.close()
+        except Exception:
+            pass
 
     return extracted_count, evidence_url, seen_srcs
 
@@ -658,7 +672,10 @@ async def _extract_ads_from_viewport(
     except Exception as e:
         log.error("Error on %s (%s): %s", target_url[:60], viewport_label, e, exc_info=True)
     finally:
-        await page.context.close()
+        try:
+            await page.context.close()
+        except Exception:
+            pass
 
     return extracted_count, evidence_url, seen_srcs
 
