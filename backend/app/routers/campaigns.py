@@ -12,6 +12,11 @@ from ..models import (
     Asset, AssetCreate, AssetUpdate,
     ScanJob, ScanSource, ScanJobCreate
 )
+from ..plan_enforcement import (
+    OrgPlan, get_org_plan,
+    check_campaign_limit, check_scan_quota,
+    check_concurrent_scans, check_channel_allowed,
+)
 
 log = logging.getLogger("dealer_intel.campaigns")
 
@@ -69,8 +74,14 @@ async def get_campaign(campaign_id: UUID):
 
 
 @router.post("", response_model=Campaign)
-async def create_campaign(campaign: CampaignCreate, user: AuthUser = Depends(get_current_user)):
+async def create_campaign(
+    campaign: CampaignCreate,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
     """Create a new campaign."""
+    check_campaign_limit(op)
+
     data = campaign.model_dump()
     data["organization_id"] = str(user.org_id)
     
@@ -258,11 +269,15 @@ async def start_campaign_scan(
     source: ScanSource,
     distributor_ids: Optional[List[UUID]] = None,
     user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
 ):
     """
     Start a scan specifically for this campaign.
     Dispatched to Celery worker for durable background execution.
     """
+    check_channel_allowed(op, source.value)
+    check_scan_quota(op)
+    check_concurrent_scans(op)
     from ..tasks import (
         run_google_ads_scan_task, run_facebook_scan_task,
         run_instagram_scan_task, run_website_scan_task,

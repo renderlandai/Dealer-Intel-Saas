@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 from uuid import UUID
@@ -272,12 +273,36 @@ def upsert_job(schedule: dict) -> None:
     _register_job(schedule)
 
 
+async def _run_retention() -> None:
+    """Wrapper for the daily data retention sweep."""
+    from .retention_service import run_retention_sweep
+    await run_retention_sweep()
+
+
 async def start() -> None:
-    """Start the APScheduler background scheduler and load persisted schedules."""
+    """Start the APScheduler background scheduler and load persisted schedules.
+
+    Only runs when SCHEDULER_ENABLED=true to prevent duplicate job firing
+    when multiple API instances are deployed.
+    """
+    if os.getenv("SCHEDULER_ENABLED", "true").lower() != "true":
+        log.info("APScheduler disabled on this instance (SCHEDULER_ENABLED != true)")
+        return
+
     global _scheduler
     _scheduler = AsyncIOScheduler(timezone="UTC")
     _scheduler.start()
     log.info("APScheduler started")
+
+    # Daily data retention sweep at 03:00 UTC
+    _scheduler.add_job(
+        _run_retention,
+        trigger=CronTrigger(hour=3, minute=0, timezone="UTC"),
+        id="data_retention_sweep",
+        replace_existing=True,
+    )
+    log.info("Data retention sweep scheduled for 03:00 UTC daily")
+
     await load_schedules()
 
 

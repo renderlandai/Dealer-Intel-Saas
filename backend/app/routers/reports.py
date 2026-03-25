@@ -9,6 +9,7 @@ from fastapi.responses import Response
 
 from ..auth import AuthUser, get_current_user
 from ..services.report_service import generate_csv, generate_pdf
+from ..plan_enforcement import OrgPlan, get_org_plan, check_pdf_reports
 
 log = logging.getLogger("dealer_intel.reports")
 
@@ -22,6 +23,7 @@ async def download_compliance_report(
     campaign_id: Optional[UUID] = None,
     distributor_id: Optional[UUID] = None,
     user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
 ):
     """
     Generate and download a compliance report.
@@ -32,6 +34,9 @@ async def download_compliance_report(
     - **distributor_id**: scope to a single distributor (optional)
     - **organization_id**: org whose logo to use in PDF header (optional)
     """
+    if format == "pdf":
+        check_pdf_reports(op)
+
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M")
 
     organization_id = user.org_id

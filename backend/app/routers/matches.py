@@ -1,10 +1,11 @@
-"""Match routes."""
+"""Match routes — all queries scoped to the authenticated user's organization."""
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Optional
 from uuid import UUID
 
+from ..auth import AuthUser, get_current_user
 from ..database import supabase
 from ..models import (
     Match, MatchUpdate, ComplianceStatus,
@@ -21,24 +22,56 @@ def _utc_now() -> str:
     """Return current UTC timestamp as ISO-8601 string for Supabase."""
     return datetime.now(timezone.utc).isoformat()
 
+
 log = logging.getLogger("dealer_intel.matches")
 
 router = APIRouter(prefix="/matches", tags=["matches"])
 
 
+def _org_distributor_ids(org_id: str) -> List[str]:
+    """Return all distributor IDs belonging to an organization."""
+    result = supabase.table("distributors") \
+        .select("id") \
+        .eq("organization_id", org_id) \
+        .execute()
+    return [d["id"] for d in (result.data or [])]
+
+
+def _verify_match_ownership(match_id: str, org_distributor_ids: List[str]) -> dict:
+    """Fetch a match and verify it belongs to the org's distributors."""
+    result = supabase.table("matches") \
+        .select("*") \
+        .eq("id", match_id) \
+        .single() \
+        .execute()
+
+    if not result.data:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    if result.data.get("distributor_id") and result.data["distributor_id"] not in org_distributor_ids:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    return result.data
+
+
 @router.get("", response_model=List[Match])
 async def list_matches(
-    organization_id: Optional[UUID] = None,
-    campaign_id: Optional[UUID] = None,
     distributor_id: Optional[UUID] = None,
     compliance_status: Optional[ComplianceStatus] = None,
     match_type: Optional[str] = None,
     min_confidence: Optional[float] = None,
     limit: int = 50,
-    offset: int = 0
+    offset: int = 0,
+    user: AuthUser = Depends(get_current_user),
 ):
-    """List all matches with filters."""
+    """List matches scoped to the user's organization."""
+    dist_ids = _org_distributor_ids(str(user.org_id))
+    if not dist_ids:
+        return []
+
     q = supabase.table("recent_matches").select("*")
+    q = q.in_("distributor_id", dist_ids)
+
     if distributor_id:
         q = q.eq("distributor_id", str(distributor_id))
     if compliance_status:
@@ -47,21 +80,30 @@ async def list_matches(
         q = q.eq("match_type", match_type)
     if min_confidence:
         q = q.gte("confidence_score", min_confidence)
+
     result = q.range(offset, offset + limit - 1).execute()
     return result.data
 
 
 @router.get("/stats")
-async def get_match_stats(organization_id: Optional[UUID] = None):
-    """Get match statistics using efficient SQL aggregation."""
-    try:
-        result = supabase.rpc("get_match_stats").execute()
-        if result.data:
-            return result.data
-    except Exception as e:
-        log.warning("RPC get_match_stats failed, using fallback: %s", e)
+async def get_match_stats(user: AuthUser = Depends(get_current_user)):
+    """Get match statistics scoped to the user's organization."""
+    dist_ids = _org_distributor_ids(str(user.org_id))
+    if not dist_ids:
+        return {
+            "total_matches": 0,
+            "compliant": 0,
+            "violations": 0,
+            "pending_review": 0,
+            "by_type": {"exact": 0, "strong": 0, "partial": 0},
+            "average_confidence": 0.0,
+            "compliance_rate": 0.0,
+        }
 
-    result = supabase.table("matches").select("compliance_status, match_type, confidence_score").execute()
+    result = supabase.table("matches") \
+        .select("compliance_status, match_type, confidence_score") \
+        .in_("distributor_id", dist_ids) \
+        .execute()
 
     total = len(result.data) if result.data else 0
     compliance_counts = {"compliant": 0, "violation": 0, "pending": 0}
@@ -91,17 +133,22 @@ async def get_match_stats(organization_id: Optional[UUID] = None):
         "average_confidence": round(avg_confidence, 2),
         "compliance_rate": round(
             compliance_counts["compliant"] / max(total, 1) * 100, 1
-        )
+        ),
     }
 
 
 @router.get("/{match_id}", response_model=Match)
-async def get_match(match_id: UUID):
-    """Get a specific match with full details."""
-    result = supabase.table("recent_matches")\
-        .select("*")\
-        .eq("id", str(match_id))\
-        .single()\
+async def get_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
+    """Get a specific match scoped to the user's organization."""
+    dist_ids = _org_distributor_ids(str(user.org_id))
+    if not dist_ids:
+        raise HTTPException(status_code=404, detail="Match not found")
+
+    result = supabase.table("recent_matches") \
+        .select("*") \
+        .eq("id", str(match_id)) \
+        .in_("distributor_id", dist_ids) \
+        .single() \
         .execute()
 
     if not result.data:
@@ -111,16 +158,22 @@ async def get_match(match_id: UUID):
 
 
 @router.patch("/{match_id}", response_model=Match)
-async def update_match(match_id: UUID, match: MatchUpdate):
-    """Update match compliance status."""
-    data = match.model_dump(exclude_unset=True)
+async def update_match(
+    match_id: UUID,
+    match: MatchUpdate,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Update match compliance status, scoped to the user's organization."""
+    dist_ids = _org_distributor_ids(str(user.org_id))
+    _verify_match_ownership(str(match_id), dist_ids)
 
+    data = match.model_dump(exclude_unset=True)
     if "compliance_status" in data:
         data["reviewed_at"] = _utc_now()
 
-    result = supabase.table("matches")\
-        .update(data)\
-        .eq("id", str(match_id))\
+    result = supabase.table("matches") \
+        .update(data) \
+        .eq("id", str(match_id)) \
         .execute()
 
     if not result.data:
@@ -130,14 +183,17 @@ async def update_match(match_id: UUID, match: MatchUpdate):
 
 
 @router.post("/{match_id}/approve")
-async def approve_match(match_id: UUID):
-    """Mark a match as compliant."""
-    result = supabase.table("matches")\
+async def approve_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
+    """Mark a match as compliant, scoped to the user's organization."""
+    dist_ids = _org_distributor_ids(str(user.org_id))
+    _verify_match_ownership(str(match_id), dist_ids)
+
+    result = supabase.table("matches") \
         .update({
             "compliance_status": "compliant",
-            "reviewed_at": _utc_now()
-        })\
-        .eq("id", str(match_id))\
+            "reviewed_at": _utc_now(),
+        }) \
+        .eq("id", str(match_id)) \
         .execute()
 
     if not result.data:
@@ -147,26 +203,33 @@ async def approve_match(match_id: UUID):
 
 
 @router.post("/{match_id}/flag")
-async def flag_match(match_id: UUID, reason: Optional[str] = None):
-    """Flag a match as a violation."""
+async def flag_match(
+    match_id: UUID,
+    reason: Optional[str] = None,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Flag a match as a violation, scoped to the user's organization."""
+    dist_ids = _org_distributor_ids(str(user.org_id))
+    _verify_match_ownership(str(match_id), dist_ids)
+
     update_data = {
         "compliance_status": "violation",
-        "reviewed_at": _utc_now()
+        "reviewed_at": _utc_now(),
     }
 
     if reason:
-        current = supabase.table("matches")\
-            .select("compliance_issues")\
-            .eq("id", str(match_id))\
-            .single()\
+        current = supabase.table("matches") \
+            .select("compliance_issues") \
+            .eq("id", str(match_id)) \
+            .single() \
             .execute()
         issues = current.data.get("compliance_issues", []) if current.data else []
         issues.append({"type": "manual_flag", "reason": reason})
         update_data["compliance_issues"] = issues
 
-    result = supabase.table("matches")\
-        .update(update_data)\
-        .eq("id", str(match_id))\
+    result = supabase.table("matches") \
+        .update(update_data) \
+        .eq("id", str(match_id)) \
         .execute()
 
     if not result.data:
@@ -176,26 +239,33 @@ async def flag_match(match_id: UUID, reason: Optional[str] = None):
 
 
 @router.delete("/{match_id}")
-async def delete_match(match_id: UUID):
-    """Delete a specific match."""
-    supabase.table("matches")\
-        .delete()\
-        .eq("id", str(match_id))\
+async def delete_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
+    """Delete a specific match, scoped to the user's organization."""
+    dist_ids = _org_distributor_ids(str(user.org_id))
+    _verify_match_ownership(str(match_id), dist_ids)
+
+    supabase.table("matches") \
+        .delete() \
+        .eq("id", str(match_id)) \
         .execute()
 
     return {"status": "deleted", "match_id": str(match_id)}
 
 
 @router.delete("")
-async def delete_all_matches():
-    """Delete all matches. Only available when ENABLE_DANGEROUS_ENDPOINTS=true."""
+async def delete_all_matches(user: AuthUser = Depends(get_current_user)):
+    """Delete all matches for the user's organization."""
     from ..config import get_settings
     if not get_settings().enable_dangerous_endpoints:
         raise HTTPException(status_code=403, detail="Bulk delete is disabled in this environment")
 
-    result = supabase.table("matches")\
-        .delete()\
-        .neq("id", "00000000-0000-0000-0000-000000000000")\
+    dist_ids = _org_distributor_ids(str(user.org_id))
+    if not dist_ids:
+        return {"status": "deleted", "count": 0}
+
+    result = supabase.table("matches") \
+        .delete() \
+        .in_("distributor_id", dist_ids) \
         .execute()
     deleted_count = len(result.data) if result.data else 0
 
@@ -203,17 +273,20 @@ async def delete_all_matches():
 
 
 @router.post("/link-google-ads-distributors")
-async def link_google_ads_distributors():
-    """
-    Link orphaned Google Ads matches to distributors based on advertiser_id.
-    """
-    distributors_result = supabase.table("distributors")\
-        .select("id, google_ads_advertiser_id")\
-        .not_.is_("google_ads_advertiser_id", "null")\
+async def link_google_ads_distributors(user: AuthUser = Depends(get_current_user)):
+    """Link orphaned Google Ads matches to distributors, scoped to the user's org."""
+    org_id = str(user.org_id)
+
+    distributors_result = supabase.table("distributors") \
+        .select("id, google_ads_advertiser_id") \
+        .eq("organization_id", org_id) \
+        .not_.is_("google_ads_advertiser_id", "null") \
         .execute()
 
     advertiser_to_distributor = {}
+    dist_ids = []
     for d in distributors_result.data:
+        dist_ids.append(d["id"])
         ad_id = d.get("google_ads_advertiser_id")
         if ad_id:
             advertiser_to_distributor[ad_id.lower()] = d["id"]
@@ -222,10 +295,10 @@ async def link_google_ads_distributors():
     if not advertiser_to_distributor:
         return {"status": "no_distributors", "message": "No distributors have Google Ads advertiser IDs configured", "updated": 0}
 
-    matches_result = supabase.table("matches")\
-        .select("id, discovered_image_id")\
-        .eq("channel", "google_ads")\
-        .is_("distributor_id", "null")\
+    matches_result = supabase.table("matches") \
+        .select("id, discovered_image_id") \
+        .eq("channel", "google_ads") \
+        .is_("distributor_id", "null") \
         .execute()
 
     if not matches_result.data:
@@ -233,12 +306,21 @@ async def link_google_ads_distributors():
 
     image_ids = [m["discovered_image_id"] for m in matches_result.data if m.get("discovered_image_id")]
 
-    images_result = supabase.table("discovered_images")\
-        .select("id, metadata, distributor_id")\
-        .in_("id", image_ids)\
+    scan_jobs = supabase.table("scan_jobs") \
+        .select("id") \
+        .eq("organization_id", org_id) \
+        .execute()
+    org_job_ids = {j["id"] for j in (scan_jobs.data or [])}
+
+    images_result = supabase.table("discovered_images") \
+        .select("id, metadata, distributor_id, scan_job_id") \
+        .in_("id", image_ids) \
         .execute()
 
-    image_metadata = {img["id"]: img for img in images_result.data}
+    image_metadata = {
+        img["id"]: img for img in images_result.data
+        if img.get("scan_job_id") in org_job_ids
+    }
 
     updated_count = 0
     for match in matches_result.data:
@@ -272,7 +354,7 @@ async def link_google_ads_distributors():
         "status": "success",
         "message": f"Linked {updated_count} matches to distributors",
         "updated": updated_count,
-        "total_orphans": len(matches_result.data)
+        "total_orphans": len(matches_result.data),
     }
 
 
@@ -282,22 +364,20 @@ async def link_google_ads_distributors():
 
 
 @router.post("/{match_id}/feedback", response_model=MatchFeedback)
-async def submit_match_feedback(match_id: UUID, feedback: MatchFeedbackCreate):
-    """
-    Submit feedback on whether a match was correct.
+async def submit_match_feedback(
+    match_id: UUID,
+    feedback: MatchFeedbackCreate,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Submit feedback on whether a match was correct, scoped to the user's org."""
+    dist_ids = _org_distributor_ids(str(user.org_id))
+    _verify_match_ownership(str(match_id), dist_ids)
 
-    This feeds the adaptive threshold calibration engine, which uses
-    accumulated feedback to adjust match thresholds per source/channel
-    over time.
-    """
-    match_result = supabase.table("matches")\
-        .select("id, confidence_score, match_type, channel, ai_analysis")\
-        .eq("id", str(match_id))\
-        .single()\
+    match_result = supabase.table("matches") \
+        .select("id, confidence_score, match_type, channel, ai_analysis") \
+        .eq("id", str(match_id)) \
+        .single() \
         .execute()
-
-    if not match_result.data:
-        raise HTTPException(status_code=404, detail="Match not found")
 
     match_data = match_result.data
     ai_analysis = match_data.get("ai_analysis") or {}
@@ -337,15 +417,23 @@ async def submit_match_feedback(match_id: UUID, feedback: MatchFeedbackCreate):
 
 
 @router.get("/feedback/stats", response_model=List[FeedbackAccuracyStats])
-async def get_feedback_accuracy_stats():
-    """
-    Get accuracy statistics grouped by source type and channel.
+async def get_feedback_accuracy_stats(user: AuthUser = Depends(get_current_user)):
+    """Get accuracy statistics scoped to the user's organization."""
+    dist_ids = _org_distributor_ids(str(user.org_id))
+    if not dist_ids:
+        return []
 
-    Shows how well the AI is performing for each combination, enabling
-    targeted threshold tuning.
-    """
-    result = supabase.table("match_feedback")\
-        .select("source_type, channel, match_type, was_correct, ai_confidence")\
+    org_matches = supabase.table("matches") \
+        .select("id") \
+        .in_("distributor_id", dist_ids) \
+        .execute()
+    match_ids = [m["id"] for m in (org_matches.data or [])]
+    if not match_ids:
+        return []
+
+    result = supabase.table("match_feedback") \
+        .select("source_type, channel, match_type, was_correct, ai_confidence") \
+        .in_("match_id", match_ids) \
         .execute()
 
     feedback = result.data or []
@@ -398,13 +486,8 @@ async def get_feedback_accuracy_stats():
 
 
 @router.get("/feedback/thresholds")
-async def get_threshold_recommendations():
-    """
-    Get adaptive threshold recommendations based on accumulated feedback.
-
-    Returns current vs recommended thresholds for each source/channel
-    combination, with confidence levels based on sample count.
-    """
+async def get_threshold_recommendations(user: AuthUser = Depends(get_current_user)):
+    """Get adaptive threshold recommendations based on accumulated feedback."""
     thresholds = await get_all_adaptive_thresholds()
     return {
         "thresholds": thresholds,

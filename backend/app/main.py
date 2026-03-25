@@ -1,18 +1,21 @@
 """Dealer Intel SaaS - FastAPI Backend."""
 import logging
+import time
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .config import get_settings
 from .logging_config import setup_logging
 from contextlib import asynccontextmanager
 from fastapi import Depends
 from .auth import AuthUser, get_current_user
-from .routers import campaigns, distributors, matches, dashboard, scanning, feedback, reports, organizations, schedules
+from .routers import campaigns, distributors, matches, dashboard, scanning, feedback, reports, organizations, schedules, billing, team, alerts, compliance_rules
 from .services import scheduler_service
 
 settings = get_settings()
@@ -56,6 +59,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SlowAPIMiddleware)
+
+
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        log.info(
+            "%s %s %d %.0fms",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed_ms,
+        )
+        return response
+
+
+app.add_middleware(RequestLoggingMiddleware)
 
 # Global exception handler — prevent leaking internals in production
 @app.exception_handler(Exception)
@@ -76,6 +98,16 @@ app.include_router(feedback.router, prefix="/api/v1")
 app.include_router(reports.router, prefix="/api/v1")
 app.include_router(organizations.router, prefix="/api/v1")
 app.include_router(schedules.router, prefix="/api/v1")
+app.include_router(billing.router, prefix="/api/v1")
+app.include_router(team.router, prefix="/api/v1")
+app.include_router(alerts.router, prefix="/api/v1")
+app.include_router(compliance_rules.router, prefix="/api/v1")
+
+
+if settings.enable_dangerous_endpoints:
+    log.warning("ENABLE_DANGEROUS_ENDPOINTS is ON — bulk delete and debug routes are active")
+else:
+    log.info("Dangerous endpoints disabled (ENABLE_DANGEROUS_ENDPOINTS=false)")
 
 
 @app.get("/")
@@ -90,18 +122,28 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check — verifies database connectivity."""
-    checks = {"database": "unknown"}
+    """Health check — verifies database and Redis connectivity."""
+    checks = {"database": "unknown", "redis": "unknown"}
     healthy = True
 
     try:
         from .database import supabase
-        result = supabase.table("organizations").select("id", count="exact").limit(1).execute()
+        supabase.table("organizations").select("id", count="exact").limit(1).execute()
         checks["database"] = "connected"
     except Exception as e:
         checks["database"] = f"error: {type(e).__name__}"
         healthy = False
         log.warning("Health check: database unreachable — %s", e)
+
+    try:
+        import redis as redis_lib
+        r = redis_lib.from_url(settings.redis_url, socket_connect_timeout=3)
+        r.ping()
+        checks["redis"] = "connected"
+    except Exception as e:
+        checks["redis"] = f"error: {type(e).__name__}"
+        healthy = False
+        log.warning("Health check: Redis unreachable — %s", e)
 
     status_code = 200 if healthy else 503
     return JSONResponse(
@@ -127,6 +169,10 @@ async def api_root():
             "reports": "/api/v1/reports",
             "organizations": "/api/v1/organizations",
             "schedules": "/api/v1/schedules",
+            "billing": "/api/v1/billing",
+            "team": "/api/v1/team",
+            "alerts": "/api/v1/alerts",
+            "compliance-rules": "/api/v1/compliance-rules",
         }
     }
 

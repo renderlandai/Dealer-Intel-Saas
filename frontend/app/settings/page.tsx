@@ -14,12 +14,20 @@ import {
   Mail,
   Send,
   AlertCircle,
+  CreditCard,
+  ExternalLink,
+  ArrowRight,
+  Clock,
+  Gauge,
 } from "lucide-react";
 import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail } from "@/lib/api";
+import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession } from "@/lib/api";
+import { useBillingUsage } from "@/lib/hooks";
+import { useAuth } from "@/lib/auth-context";
+import { TeamSection } from "@/components/settings/team-section";
 
 const COLOR_PRESETS = [
   { hex: "#334155", name: "Slate" },
@@ -178,6 +186,45 @@ export default function SettingsPage() {
     }
   };
 
+  const { data: billing, isLoading: billingLoading } = useBillingUsage();
+  const [portalLoading, setPortalLoading] = useState(false);
+
+  const handleManageBilling = async () => {
+    setPortalLoading(true);
+    try {
+      const { portal_url } = await createPortalSession();
+      window.location.href = portal_url;
+    } catch {
+      // Will be caught by the 403 interceptor if no billing account
+    } finally {
+      setPortalLoading(false);
+    }
+  };
+
+  const planLabel = billing?.plan === "free"
+    ? "Free Trial"
+    : billing?.plan
+      ? billing.plan.charAt(0).toUpperCase() + billing.plan.slice(1)
+      : "—";
+
+  const statusLabel = billing?.plan_status === "trialing"
+    ? "Trial"
+    : billing?.plan_status === "active"
+    ? "Active"
+    : billing?.plan_status === "past_due"
+    ? "Past Due"
+    : billing?.plan_status === "canceled"
+    ? "Canceled"
+    : "—";
+
+  const statusColor = billing?.plan_status === "active"
+    ? "text-success"
+    : billing?.plan_status === "past_due"
+    ? "text-amber-500"
+    : billing?.plan_status === "canceled"
+    ? "text-destructive"
+    : "text-primary";
+
   return (
     <div className="min-h-screen">
       <Header
@@ -186,6 +233,127 @@ export default function SettingsPage() {
       />
 
       <div className="p-8 max-w-3xl space-y-6">
+        {/* Billing & Plan */}
+        <Card className="opacity-0 animate-fade-up" style={{ animationFillMode: "forwards" }}>
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center bg-secondary border border-border">
+                <CreditCard className="h-5 w-5 text-muted-foreground" />
+              </div>
+              <div className="flex-1">
+                <CardTitle className="text-base">Plan & Billing</CardTitle>
+                <CardDescription className="text-xs">
+                  Your current subscription and usage
+                </CardDescription>
+              </div>
+              {billing && billing.plan !== "free" && billing.stripe_customer_id !== null && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleManageBilling}
+                  disabled={portalLoading}
+                >
+                  <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
+                  {portalLoading ? "Loading..." : "Manage Billing"}
+                </Button>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-5">
+            {billingLoading ? (
+              <div className="space-y-3">
+                <div className="h-16 border border-border bg-secondary/20 animate-pulse" />
+                <div className="h-24 border border-border bg-secondary/20 animate-pulse" />
+              </div>
+            ) : billing ? (
+              <>
+                {/* Plan summary strip */}
+                <div className="flex items-center gap-4 p-4 border border-border bg-secondary/20">
+                  <div className="flex-1">
+                    <p className="text-2xs uppercase tracking-wider text-muted-foreground">Current Plan</p>
+                    <p className="text-lg font-semibold tracking-tight mt-0.5">{planLabel}</p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-2xs uppercase tracking-wider text-muted-foreground">Status</p>
+                    <p className={`text-sm font-medium mt-0.5 ${statusColor}`}>{statusLabel}</p>
+                  </div>
+                  {billing.trial_days_left !== null && billing.plan === "free" && (
+                    <div className="text-right border-l border-border pl-4">
+                      <p className="text-2xs uppercase tracking-wider text-muted-foreground">Trial</p>
+                      <p className="text-sm font-mono mt-0.5 flex items-center gap-1">
+                        <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+                        {billing.trial_days_left} {billing.trial_days_left === 1 ? "day" : "days"} left
+                      </p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Usage meters */}
+                <div className="space-y-3">
+                  <p className="text-2xs uppercase tracking-wider text-muted-foreground flex items-center gap-1.5">
+                    <Gauge className="h-3.5 w-3.5" />
+                    Usage
+                  </p>
+                  {[
+                    { label: "Dealers", current: billing.dealers.current, max: billing.dealers.max },
+                    { label: "Campaigns", current: billing.campaigns.current, max: billing.campaigns.max },
+                    { label: "Scans", current: billing.scans.current, max: billing.scans.max, suffix: billing.scans.period === "this_month" ? " / mo" : billing.scans.period === "total" ? " total" : "" },
+                  ].map((meter) => {
+                    const unlimited = meter.max === null || meter.max === undefined;
+                    const pct = unlimited ? 0 : Math.min(100, (meter.current / meter.max!) * 100);
+                    const atLimit = !unlimited && meter.current >= meter.max!;
+                    const nearLimit = !unlimited && pct >= 80 && !atLimit;
+                    const barColor = atLimit ? "bg-destructive" : nearLimit ? "bg-amber-500" : "bg-primary";
+
+                    return (
+                      <div key={meter.label} className="space-y-1.5">
+                        <div className="flex justify-between text-sm">
+                          <span className="text-muted-foreground">
+                            {meter.label}
+                            {meter.suffix && <span className="text-2xs text-muted-foreground/60 ml-1">{meter.suffix}</span>}
+                          </span>
+                          <span className="font-mono tabular-nums">
+                            {meter.current}
+                            <span className="text-muted-foreground">/{unlimited ? "∞" : meter.max}</span>
+                          </span>
+                        </div>
+                        {!unlimited && (
+                          <div className="h-1.5 w-full bg-secondary rounded-full overflow-hidden">
+                            <div
+                              className={`h-full rounded-full transition-all duration-500 ${barColor}`}
+                              style={{ width: `${pct}%` }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {billing.plan === "free" && (
+                  <div className="flex items-center gap-3 p-3 border border-primary/20 bg-primary/5">
+                    <div className="flex-1">
+                      <p className="text-sm font-medium">Ready to upgrade?</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        Book a demo to unlock more dealers, campaigns, and scan channels.
+                      </p>
+                    </div>
+                    <a
+                      href="mailto:sales@dealerintel.com"
+                      className="h-8 px-4 flex items-center justify-center bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 transition-colors shadow-glow gap-1.5 flex-shrink-0"
+                    >
+                      Book a Demo
+                      <ArrowRight className="h-3 w-3" />
+                    </a>
+                  </div>
+                )}
+              </>
+            ) : (
+              <p className="text-sm text-muted-foreground">Unable to load billing information.</p>
+            )}
+          </CardContent>
+        </Card>
+
         {/* Company Info */}
         <Card className="opacity-0 animate-fade-up" style={{ animationFillMode: "forwards" }}>
           <CardHeader>
@@ -505,6 +673,11 @@ export default function SettingsPage() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Team Management */}
+        <TeamSection
+          maxSeats={billing?.features?.max_user_seats ?? null}
+        />
       </div>
     </div>
   );

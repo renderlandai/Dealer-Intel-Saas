@@ -350,6 +350,168 @@ Completed the entire Priority 2 feature set in a single session. Built PDF/CSV c
 
 ---
 
+## 2026-03-24 (Tuesday) — Production Deployment & Celery Task Queue
+
+### Summary
+Major infrastructure session: deployed the full backend to DigitalOcean App Platform using Docker, resolved multiple build and runtime issues during deployment, deployed the frontend to Vercel with production environment variables, and built a complete Celery + Valkey (Redis) distributed task queue to replace FastAPI's `BackgroundTasks`. The system is now fully production-deployed with durable, crash-recoverable background scan processing.
+
+### Session 1: Docker + DigitalOcean App Platform Deployment
+
+**Problem**: The backend needed to be containerized and deployed to DigitalOcean App Platform. The application has heavy system dependencies (Playwright/Chromium for browser automation, OpenCV for image processing, CLIP for embeddings) that require explicit Docker configuration rather than simple buildpack deployment.
+
+**Dockerfile (`backend/Dockerfile`)**
+- Base image: `python:3.11-slim`
+- System dependencies: `build-essential`, `libglib2.0-0`, `libgl1`, `libsm6`, `libxext6`, `libxrender1`, `curl`
+- CPU-only PyTorch installed first via `--index-url https://download.pytorch.org/whl/cpu` to avoid pulling ~5GB of CUDA libraries (image would exceed DO build limits otherwise)
+- Playwright Chromium browser installed via `playwright install chromium --with-deps`
+- Gunicorn as the production WSGI server with Uvicorn workers
+
+**Gunicorn Configuration (`backend/gunicorn.conf.py`)**
+- 2 Uvicorn async workers (conservative due to Playwright + CLIP memory usage)
+- 5-minute timeout for long-running scan operations
+- `preload_app = True` to load CLIP model once, shared across workers
+- Port configurable via `PORT` env var (defaults to 8000)
+
+**DigitalOcean App Platform Configuration (`.do/app.yaml`)**
+- Service: `api` on `professional-xs` instance (1 vCPU, 1GB RAM)
+- Dockerfile build strategy (not buildpack — critical for Playwright)
+- Health check on `/health` with 90s initial delay, 30s period, 5 failure threshold
+- Auto-deploy on push to `main` branch
+- All secrets injected as encrypted runtime environment variables
+
+**Build Issues Resolved (4 iterations)**:
+1. **Dockerfile not found**: Files weren't committed to git — DO clones from the repo, so uncommitted local files don't exist in the build. Fixed by committing and pushing all Docker files
+2. **`libgl1-mesa-glx` unavailable**: Package was renamed to `libgl1` in Debian Trixie (the base image's distro). Fixed by updating the package name
+3. **Docker image too large**: Default PyTorch pulls ~5GB of NVIDIA CUDA libraries. Fixed by installing CPU-only PyTorch first (`--index-url https://download.pytorch.org/whl/cpu`), reducing the image by ~5GB
+4. **`gunicorn` not found at runtime**: `gunicorn` wasn't in `requirements.txt` — it was only referenced in the Dockerfile CMD. Fixed by adding `gunicorn>=21.2.0` to requirements
+5. **Health check failing — "database unreachable, Invalid URL"**: Environment variables had `PLACEHOLDER` values instead of real credentials. Fixed by updating the app spec with actual Supabase/API credentials via `doctl`
+
+**Deployment Method**: Used `doctl` CLI instead of the DigitalOcean UI because the UI was forcing Buildpack mode and wouldn't allow switching to Dockerfile mode. The CLI provided full control over the app spec YAML.
+
+### Session 2: Vercel Frontend Deployment Fix
+
+The Vercel frontend build was failing with `Error: supabaseUrl is required` during prerendering. Next.js tries to render pages like `/distributors` at build time, which imports the Supabase client, which crashes without the URL environment variable.
+
+**Fix**: Added all four `NEXT_PUBLIC_*` environment variables in Vercel dashboard:
+- `NEXT_PUBLIC_SUPABASE_URL`
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY`
+- `NEXT_PUBLIC_API_URL` (pointing to the new DO backend: `https://dealer-intel-api-c2m2p.ondigitalocean.app`)
+- `NEXT_PUBLIC_MAPBOX_TOKEN`
+
+Redeployed — frontend now live and connected to production backend.
+
+### Session 3: Celery + Valkey Distributed Task Queue
+
+**Problem**: `BackgroundTasks` (FastAPI's built-in) runs scan tasks in the same process as the web server. If the server restarts during a deploy, crashes, or scales — any running scan is silently killed and lost. For a production system processing 160 scan jobs per cycle (40 dealers × 4 channels), this is unacceptable.
+
+**Solution**: Celery with DigitalOcean Managed Valkey (Redis-compatible, open-source fork).
+
+**Infrastructure Added**:
+- DigitalOcean Managed Valkey database (`db-valkey-nyc3-40902`) — $15/month, NYC region, TLS-encrypted
+- Celery worker component added to the DO App Platform spec — runs alongside the API service using the same Docker image but with `celery -A app.celery_app worker` as the command
+
+**New Files**:
+
+`backend/app/celery_app.py` — Celery application configuration:
+- Broker: Valkey via `rediss://` (TLS) connection string
+- No result backend (scan results stored in Supabase, not Redis)
+- JSON serialization for all task messages
+- `task_acks_late = True` — tasks acknowledged only after completion, so if a worker dies mid-scan, the task returns to the queue for another worker to pick up
+- `worker_prefetch_multiplier = 1` — one task at a time per worker (scans are CPU/memory heavy)
+- `task_reject_on_worker_lost = True` — crashed tasks are re-queued, not dropped
+- `worker_max_tasks_per_child = 50` — worker process restarts after 50 tasks to prevent memory leaks from Playwright/CLIP
+- `task_soft_time_limit = 1800` (30 min) / `task_time_limit = 2400` (40 min) — prevents stuck tasks from blocking the queue forever
+- TLS configuration for DigitalOcean managed Valkey (`ssl_cert_reqs: CERT_NONE`)
+
+`backend/app/tasks.py` — Six Celery task definitions:
+1. `run_website_scan_task` — wraps `run_website_scan()` with UUID serialization/deserialization
+2. `run_google_ads_scan_task` — wraps `run_google_ads_scan()`
+3. `run_facebook_scan_task` — wraps `run_facebook_scan()`
+4. `run_instagram_scan_task` — wraps `run_instagram_scan()`
+5. `analyze_scan_task` — wraps `auto_analyze_scan()`, fetches images/assets from DB internally (avoids sending large data through the message broker)
+6. `reprocess_images_task` — wraps image reprocessing with DB-side data fetching
+
+Each task uses `_run_async()` to bridge Celery's synchronous workers with the existing async scan functions by creating a new event loop per task execution. Scan and analysis tasks retry up to 2x with 60-second delay on transient failures.
+
+**Modified Files**:
+
+`backend/app/routers/scanning.py` — Replaced all `BackgroundTasks` usage:
+- `start_scan()` — removed `background_tasks: BackgroundTasks` parameter; all four scan branches now call `run_*_scan_task.delay()` instead of `background_tasks.add_task()`
+- `analyze_discovered_images()` — dispatches `analyze_scan_task.delay()` with just IDs (no large data payloads)
+- `quick_scan()` — updated to call the modified `start_scan()` without `BackgroundTasks`
+- `reprocess_unprocessed_images()` — dispatches `reprocess_images_task.delay()`
+- Distributor mapping values changed from `UUID` objects to plain strings for JSON serialization compatibility
+
+`backend/app/routers/campaigns.py` — Same `BackgroundTasks` removal:
+- `start_campaign_scan()` — uses Celery task dispatch
+- `analyze_campaign_scan()` — uses `analyze_scan_task.delay()`
+- Removed status update to "running" at dispatch time (the scan function itself sets "running" when the Celery worker picks it up)
+
+`backend/app/services/scheduler_service.py` — Scheduled scans now dispatch via Celery:
+- `_trigger_scan()` — replaced `asyncio.create_task(run_*_scan(...))` with `run_*_scan_task.delay(...)` for all four scan sources
+- Removed unused `asyncio` import
+- Mapping values changed from UUID to string for serialization
+
+`backend/app/config.py` — Added `redis_url` setting with default `redis://localhost:6379/0`
+
+`backend/requirements.txt` — Added `celery[redis]>=5.4.0` and `redis[hiredis]>=5.0.0`
+
+`docker-compose.yml` — Updated for local development:
+- Added `redis` service (Redis 7 Alpine)
+- Added `worker` service running `celery -A app.celery_app worker --loglevel=info --concurrency=2`
+- Both `api` and `worker` share the same Dockerfile build and `.env` file
+- `REDIS_URL` overridden to `redis://redis:6379/0` for Docker networking
+
+**DigitalOcean App Spec** — Added worker component:
+- Same Docker image as the API service (needs Playwright, CLIP, OpenCV)
+- `run_command: celery -A app.celery_app worker --loglevel=info --concurrency=2`
+- Same `professional-xs` instance size
+- All environment variables duplicated (Supabase, Anthropic, scraper keys, etc.) since the worker executes the full scan pipeline
+- `REDIS_URL` added to both API service and worker
+
+### How Celery Task Queue Works
+
+1. **User triggers scan** → API endpoint creates a scan job record (status: "pending") in Supabase and calls `run_website_scan_task.delay(urls, job_id, mapping, campaign_id)`
+2. **Message published** → `.delay()` serializes the arguments to JSON and publishes a message to the Valkey broker. The API endpoint returns immediately with the job ID
+3. **Worker picks up task** → The Celery worker process (running in a separate container) receives the message, deserializes the arguments, and calls the original async scan function via `asyncio.run()`
+4. **Scan executes** → The scan function runs the full pipeline: page discovery → image extraction → hash/CLIP pre-filter → Claude analysis → match creation → notifications. It updates the scan job status in Supabase as it progresses (pending → running → completed/failed)
+5. **Crash recovery** → If the worker dies mid-scan (deploy, OOM, crash), the task is NOT acknowledged (late ACK). Valkey keeps the message, and when the worker restarts, it picks the task back up and re-executes from the beginning. The scan function is idempotent — it skips already-processed images
+6. **Scheduled scans** → APScheduler fires at the configured cron time, calls `.delay()` to publish the scan to Valkey, and the worker processes it. The scheduler runs in the API process; the actual scan runs in the worker process
+
+### Production Architecture (Final State)
+
+| Component | Platform | Instance | Purpose |
+|-----------|----------|----------|---------|
+| **Frontend** | Vercel | Managed | Next.js app, Supabase Auth, API calls to backend |
+| **API** | DigitalOcean App Platform | professional-xs (1 vCPU, 1GB) | FastAPI + Gunicorn, handles HTTP, publishes scan tasks |
+| **Worker** | DigitalOcean App Platform | professional-xs (1 vCPU, 1GB) | Celery worker, executes scans, AI pipeline, notifications |
+| **Valkey** | DigitalOcean Managed DB | Basic ($15/mo) | Task message broker (TLS-encrypted) |
+| **Database** | Supabase | Free tier | PostgreSQL + file storage + auth |
+
+### Commits
+- `faa8450` — Add Docker + DigitalOcean App Platform deployment config (Dockerfile, gunicorn.conf.py, .do/app.yaml, docker-compose.yml, .dockerignore)
+- `118708b` — Fix Dockerfile: replace deprecated libgl1-mesa-glx with libgl1
+- `a309e95` — Install CPU-only PyTorch to reduce Docker image size by ~5GB
+- `f778a8f` — Add gunicorn to requirements.txt for production server
+- `047748c` — Add Celery + Valkey task queue for durable scan execution (celery_app.py, tasks.py, scanning/campaigns/scheduler refactored)
+
+### New Third-Party Services Added
+| Service | Purpose | Cost |
+|---------|---------|------|
+| **DigitalOcean App Platform** | Backend API + Celery worker hosting | ~$24/mo (2× professional-xs) |
+| **DigitalOcean Managed Valkey** | Celery task broker (Redis-compatible, TLS) | $15/mo |
+| **Celery** | Distributed task queue for durable scan processing | Open source |
+
+### Verified Working
+- Backend API live at `https://dealer-intel-api-c2m2p.ondigitalocean.app`
+- Health check passing: `{"status":"healthy","checks":{"database":"connected"}}`
+- Auth enforced: protected endpoints return 401 without token
+- Frontend live on Vercel, connected to production API
+- Celery worker deployed and running (9/9 deployment steps passed)
+- Auto-deploy on push to `main` enabled for both API and worker
+
+---
+
 ## Third-Party Services Inventory
 
 All external services and significant libraries used across the application.
@@ -357,7 +519,7 @@ All external services and significant libraries used across the application.
 ### Cloud Services & APIs
 | Service | Purpose | Config |
 |---------|---------|--------|
-| **Supabase** | PostgreSQL database + file storage (logos, assets) | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` |
+| **Supabase** | PostgreSQL database + file storage (logos, assets) + auth | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` |
 | **Anthropic Claude** | AI image analysis — Haiku (filtering), Sonnet (comparison), Opus (verification) | `ANTHROPIC_API_KEY` |
 | **Apify** | Meta Ad Library + Instagram organic post scraping | `APIFY_API_KEY` |
 | **SerpApi** | Google Ads Transparency Center structured data | `SERPAPI_API_KEY` |
@@ -365,12 +527,16 @@ All external services and significant libraries used across the application.
 | **Resend** | Transactional email notifications (scan results, violations) | `RESEND_API_KEY` |
 | **Sentry** | Error tracking and performance monitoring (frontend + backend) | `SENTRY_DSN` |
 | **Mapbox GL** | Interactive dealer compliance map visualization | `NEXT_PUBLIC_MAPBOX_TOKEN` |
+| **DigitalOcean App Platform** | Backend API + Celery worker hosting (Docker) | — |
+| **DigitalOcean Managed Valkey** | Celery task broker (Redis-compatible, TLS) | `REDIS_URL` |
 | **Vercel** | Frontend hosting and deployment | — |
 
 ### Key Libraries
 | Library | Purpose | Language |
 |---------|---------|----------|
 | **FastAPI** | Backend web framework | Python |
+| **Gunicorn** | Production WSGI/ASGI server with Uvicorn workers | Python |
+| **Celery** | Distributed task queue for durable background scan processing | Python |
 | **Next.js 14** | Frontend React framework with App Router | TypeScript |
 | **APScheduler** | Cron-based scan scheduling engine | Python |
 | **ReportLab** | PDF compliance report generation | Python |
@@ -390,72 +556,14 @@ All external services and significant libraries used across the application.
 
 ---
 
-## Current State — Uncommitted Changes Summary
-
-### New Files (18)
-| File | Purpose |
-|------|---------|
-| `backend/app/logging_config.py` | Structured JSON/dev logging |
-| `backend/app/services/apify_instagram_service.py` | Instagram organic post scraper |
-| `backend/app/services/apify_meta_service.py` | Meta Ad Library scraper |
-| `backend/app/services/cv_matching.py` | OpenCV visual matching |
-| `backend/app/services/embedding_service.py` | CLIP embedding pre-filter |
-| `backend/app/services/extraction_service.py` | Playwright image extraction |
-| `backend/app/services/page_discovery.py` | Dealer site page discovery |
-| `backend/app/services/screenshot_service.py` | ScreenshotOne integration |
-| `backend/app/services/serpapi_service.py` | Google Ads via SerpApi |
-| `frontend/app/error.tsx` | Global error boundary |
-| `frontend/app/global-error.tsx` | Root error boundary |
-| `frontend/app/not-found.tsx` | Custom 404 page |
-| `frontend/sentry.client.config.ts` | Client Sentry config |
-| `frontend/sentry.edge.config.ts` | Edge Sentry config |
-| `frontend/sentry.server.config.ts` | Server Sentry config |
-| `frontend/package-lock.json` | NPM lockfile |
-| `frontend/tsconfig.tsbuildinfo` | TS build cache |
-| `run-all-ports.sh` | One-command dev startup |
-
-### Modified Files (23)
-| File | Change Summary |
-|------|---------------|
-| `README.md` | Updated for new architecture |
-| `backend/app/config.py` | +ScreenshotOne, SerpApi, Apify, Sentry, CLIP, Playwright, page discovery settings |
-| `backend/app/database.py` | Connection pooling and error handling |
-| `backend/app/main.py` | +Sentry, rate limiting, structured logging, JSON errors |
-| `backend/app/routers/campaigns.py` | +Instagram scan routing, campaign scan source separation |
-| `backend/app/routers/dashboard.py` | Dashboard endpoint updates |
-| `backend/app/routers/distributors.py` | Distributor endpoint updates |
-| `backend/app/routers/matches.py` | +Feedback endpoints, adaptive threshold recommendations |
-| `backend/app/routers/scanning.py` | +Instagram scan routing, refactored for new extraction/screenshot services |
-| `backend/app/services/ai_service.py` | Tiered models, CLIP integration, hash pre-filter, adaptive threshold calls |
-| `backend/check_scans.py` | Updated scan inspection utility |
-| `backend/requirements.txt` | +opencv, sentence-transformers, playwright, slowapi, sentry-sdk |
-| `frontend/app/campaigns/page.tsx` | +Scan source descriptions, UI fixes |
-| `frontend/app/distributors/page.tsx` | UI fixes |
-| `frontend/app/globals.css` | Additional styles |
-| `frontend/app/layout.tsx` | +Sentry integration |
-| `frontend/app/page.tsx` | Dashboard layout improvements |
-| `frontend/components/dashboard/DealerMap.tsx` | Major map rewrite |
-| `frontend/components/dashboard/recent-matches.tsx` | Minor fix |
-| `frontend/lib/api.ts` | +Feedback & threshold API functions |
-| `frontend/next-env.d.ts` | Type update |
-| `frontend/next.config.js` | +Security headers, Sentry webpack, CSP |
-| `frontend/package.json` | +@sentry/nextjs |
-
-### Deleted Files (1)
-| File | Reason |
-|------|--------|
-| `backend/app/services/apify_service.py` | Replaced by serpapi + apify_meta + screenshot services |
-
----
-
 ## Open Items / Next Steps
 
 ### Priority 1 — Ship-Ready
-- [ ] Commit all uncommitted changes
-- [ ] Add authentication (Supabase Auth + JWT-based RLS)
-- [ ] Implement task queue (Celery + Redis) to replace BackgroundTasks
+- [x] ~~Commit all uncommitted changes~~
+- [x] ~~Add authentication (Supabase Auth + JWT-based RLS)~~
+- [x] ~~Implement task queue (Celery + Valkey) to replace BackgroundTasks~~
 - [ ] Write tests (pytest with mocked AI/Apify calls)
-- [ ] Add Docker + CI/CD configuration
+- [x] ~~Add Docker + CI/CD configuration~~
 
 ### Priority 2 — Feature Completeness
 - [x] Add scheduled/automated scans (daily, weekly per org)
@@ -483,3 +591,105 @@ All external services and significant libraries used across the application.
 - [x] Scheduled/automated scans with APScheduler (daily, weekly, biweekly, monthly)
 - [x] Time-specific scheduling: time picker (UTC) + day-of-week selector
 - [x] Schedule management UI: create, pause/resume, delete
+
+### Completed (2026-03-24 — Deployment & Infrastructure)
+- [x] Docker containerization (Dockerfile with Playwright, OpenCV, CPU-only PyTorch)
+- [x] Gunicorn production server config (Uvicorn workers, 5-min timeout, preload)
+- [x] DigitalOcean App Platform deployment (API service + Celery worker)
+- [x] Vercel frontend deployment with production environment variables
+- [x] Celery + Valkey distributed task queue (durable, crash-recoverable scans)
+- [x] Late ACK + task rejection for automatic crash recovery
+- [x] Auto-deploy on push to `main` for both API and worker
+- [x] TLS-encrypted Valkey connection for task broker security
+
+---
+
+## Roadmap — Prioritized Checklist
+
+Items 1–4 block revenue. Items 5–9 block a good first-customer experience. Items 10–13 prevent problems at ~5–10 customers. Remaining items are growth and differentiation plays.
+
+- [x] **1. Stripe integration + subscription billing** — Stripe Checkout, Subscriptions with metered dealer billing, webhook handler, billing columns on `organizations`
+- [x] **2. Plan enforcement middleware** — `plan_limits` config mapping tier → caps, enforced at every create endpoint
+- [x] **3. Monthly scan quota + concurrent scan limiter** — Per-org per-period scan counting + concurrent scan gating
+- [x] **4. Landing page + pricing page** — Public-facing marketing pages with "Book a Demo" CTAs
+- [ ] **5. Re-enable match deduplication** — Already built, disabled for testing *(deferred to pre-launch testing)*
+- [x] **6. Scan usage UI** — Trial banner, usage meters, billing settings, upgrade modals
+- [x] **7. Onboarding flow** — Dashboard checklist for first-time setup
+- [x] **8. Error handling + user-facing scan status** — Error messages with contextual suggestions + retry mechanism
+- [x] **9. User seats + invite flow** — Org admin invite flow with seat limits by plan
+- [x] **10. Data retention enforcement** — Scheduled daily purge job at 03:00 UTC, retention by plan tier
+- [ ] **11. Tests (pytest)** — Unit tests for `ai_service.py`, integration tests, API router tests *(deferred to pre-launch testing)*
+- [x] **12. Batch scanning mode** — "Scan All Channels" for Pro+Business plans
+- [x] **13. Compliance trend analytics** — Week-over-week compliance chart on dashboard (Pro+Business)
+- [x] **17. Recurring scan cost optimization** — Page hit cache: hot pages scanned first on repeat scans, full discovery skipped when all assets matched from cache
+
+### On Hold
+- [ ] **15. Slack / webhook notifications** — Blocked on Slack access
+- [ ] **16. White-label reports (Enterprise)** — On hold
+
+### Remaining
+- [ ] **20. API access (Enterprise)** — REST API with API key authentication for customer integrations
+
+### Removed
+- ~~14. Volume pricing~~ — Removed
+- ~~18. Instagram Stories/Reels scanning~~ — Removed
+- ~~19. YouTube scanning~~ — Removed
+
+---
+
+## Production Readiness Checklist
+
+**Current score: 4.5 / 10 — Target: 7.5+ after completing Tiers 1–6**
+
+### Tier 1: Security (Critical — fix before any real user)
+
+- [x] **1.1 Add auth to unprotected org endpoints** — `POST /{org_id}/test-email`, `GET /{org_id}/logo`, `DELETE /{org_id}/logo` in `organizations.py` have no `get_current_user` dependency. Add auth + plan gating.
+- [x] **1.2 Add tenant scoping on all org routes** — `get_org_settings`, `update_org_settings`, `upload_org_logo` accept `{org_id}` from URL but never verify it matches `user.org_id`. Add `_assert_own_org(org_id, user)` guard to every endpoint in `organizations.py`.
+- [x] **1.3 Add auth to unprotected scan endpoints** — `GET /scans/{job_id}`, `DELETE /scans/{job_id}`, `POST /scans/{job_id}/analyze`, `POST /scans/reprocess-unprocessed` in `scanning.py` have no auth. Add `get_current_user` + org scoping to each.
+- [x] **1.4 Protect invite-accept endpoint** — `POST /team/invites/{token}/accept` has no auth and no rate limit. Require `get_current_user` and verify invite email matches `user.email`.
+
+### Tier 2: Rate Limiting & Abuse Prevention
+
+- [x] **2.1 Activate the rate limiter** — Add `SlowAPIMiddleware` to `main.py` (currently configured but never wired). Add per-route limits: `POST /scans/start` (10/min), `POST /scans/batch` (2/min), `POST /billing/webhook` (60/min), `POST /team/invites/{token}/accept` (10/min), `POST /{org_id}/test-email` (5/min).
+- [x] **2.2 Wire unused compliance rules limit** — Built `compliance_rules.py` CRUD router (list, get, create, update, delete). `check_compliance_rules_limit(op)` enforced on create. Wired into `main.py`.
+- [x] **2.3 Gate compliance trend by plan** — `GET /dashboard/compliance-trend` is ungated, but `compliance_trends` is a paid feature flag. Add `OrgPlan` dependency and check the flag.
+
+### Tier 3: Infrastructure & Deployment
+
+- [x] **3.1 Fix `app.yaml` — add Celery worker** — Added `workers` section with Celery process, `REDIS_URL` env to both api and worker, `SCHEDULER_ENABLED=true` on api.
+- [x] **3.2 Fix CORS / frontend URL mismatch** — `CORS_ORIGINS` updated to `dealer-intel-saas.vercel.app` to match `FRONTEND_URL`.
+- [x] **3.3 Prevent APScheduler duplication** — Added `SCHEDULER_ENABLED` env var check in `scheduler_service.py`. Defaults to `true` for single-instance; set to `false` on additional replicas.
+- [x] **3.4 Unify Redis URL env var** — `celery_app.py` now falls back to both `REDIS_URL` and `redis_url` env vars. Documented `REDIS_URL` as canonical.
+
+### Tier 4: Auth & Data Integrity
+
+- [x] **4.1 Add TTL to profile cache** — Replaced unbounded `dict` with `cachetools.TTLCache(maxsize=10_000, ttl=300)` in `auth.py`. Added `cachetools>=5.3.0` to `requirements.txt`.
+- [x] **4.2 Fix auto-provisioning race condition** — `user_profiles.user_id` already has a `UNIQUE` constraint. Added try/except around `_auto_provision_user` with a retry lookup so concurrent requests don't crash — second request picks up the already-created profile.
+- [x] **4.3 Fix frontend auth redirect inconsistency** — Extracted `PUBLIC_PATHS` constant in `auth-context.tsx` (exported). `onAuthStateChange` now uses `PUBLIC_PATHS.includes(pathname)` and redirects to `/landing` instead of `/login`. `auth-gate.tsx` imports shared `PUBLIC_PATHS` instead of its own copy.
+
+### Tier 5: Observability & Error Handling
+
+- [x] **5.1 Add Redis health check** — `GET /health` now pings both Supabase and Redis. Returns `503 degraded` if either is unreachable. Uses `redis.from_url()` with a 3-second connect timeout.
+- [x] **5.2 Add request logging middleware** — `RequestLoggingMiddleware` in `main.py` logs `METHOD /path STATUS TIMEms` for every request via `BaseHTTPMiddleware`.
+- [x] **5.3 Verify dangerous endpoints are disabled** — `ENABLE_DANGEROUS_ENDPOINTS=false` confirmed in `app.yaml`. All 3 guarded endpoints (`DELETE /scans`, `GET /scans/debug/{id}`, `DELETE /matches`) return 403. Added startup log line confirming the state.
+
+### Tier 6: Testing & CI
+
+- [x] **6.1 Create auth tests** — `backend/tests/test_auth.py`: 10 tests covering missing token, expired JWT, invalid JWT, wrong secret, valid token profile resolution, auto-provisioning new user, cache hit on second request, TTL config check, single-user cache clear, full cache clear.
+- [x] **6.2 Create tenant isolation tests** — `backend/tests/test_tenant_isolation.py`: 10 tests verifying User A cannot read/update/logo/delete/email Org B's settings, campaign and distributor lists are org-scoped, match list goes through org distributors, scan lookup is org-scoped, alert list is org-scoped.
+- [x] **6.3 Create billing webhook tests** — `backend/tests/test_billing_webhook.py`: 7 tests covering invalid signature → 400, checkout.session.completed activates plan, missing org_id is graceful, payment_failed marks past_due, unknown customer is graceful, subscription.deleted downgrades to free, unhandled event returns 200.
+- [x] **6.4 Add CI pipeline** — `.github/workflows/ci.yml`: runs `pytest` on backend (Python 3.11) and `npm run build` on frontend (Node 20) on every push/PR to main. Added `pytest>=8.0.0`, `pytest-asyncio>=0.23.0`, `httpx>=0.28.0` to `requirements.txt`.
+
+### Tier 7: Data & Performance
+
+- [x] **7.1 Optimize dashboard stats** — Created `get_dashboard_stats` Postgres RPC (migration `017_dashboard_stats_rpc.sql`) that returns all 8 counters in a single round-trip. `dashboard.py` calls the RPC first and falls back to sequential queries if the function isn't deployed yet.
+- [x] **7.2 Add production database indexes** — Migration `018_production_indexes.sql`: 7 composite indexes on `matches(distributor_id, compliance_status)`, `matches(distributor_id, created_at)`, `scan_jobs(organization_id, status)`, `scan_jobs(organization_id, created_at)`, `alerts(organization_id, is_read)`, `discovered_images(scan_job_id, is_processed)`, `assets(campaign_id)`.
+- [x] **7.3 Add migration runner to deploy pipeline** — Added `migrate` job to `.github/workflows/ci.yml` that runs `supabase db push` after backend tests pass, only on pushes to `main`. Requires `SUPABASE_ACCESS_TOKEN` and `SUPABASE_PROJECT_REF` GitHub secrets.
+
+### Execution Timeline
+
+| Week | Items | Effort | Impact |
+|------|-------|--------|--------|
+| **Week 1** | 1.1, 1.2, 1.3, 1.4, 2.1, 3.2, 3.4, 5.3 | ~1.5 days | Closes all auth holes, activates rate limiting, fixes config |
+| **Week 2** | 4.1, 4.2, 4.3, 3.1, 3.3, 5.1, 5.2 | ~1 day | Fixes cache/race/redirect bugs, aligns infra |
+| **Week 3** | 6.1, 6.2, 6.3, 6.4, 2.2, 2.3, 7.1, 7.2, 7.3 | ~2–3 days | Test safety net, CI, feature gating, performance |

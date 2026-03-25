@@ -1,5 +1,6 @@
 import axios from "axios";
 import { supabase } from "./supabase";
+import { upgradeEvents } from "./upgrade-events";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -20,6 +21,26 @@ api.interceptors.request.use(async (config) => {
   return config;
 });
 
+// Surface plan-limit errors as upgrade prompts instead of generic failures
+api.interceptors.response.use(undefined, (error) => {
+  const status = error?.response?.status;
+  const detail = error?.response?.data?.detail;
+
+  if (status === 403 && typeof detail === "string" && detail.toLowerCase().includes("plan")) {
+    upgradeEvents.emit({
+      title: "Plan limit reached",
+      message: detail,
+    });
+  } else if (status === 429) {
+    upgradeEvents.emit({
+      title: "Usage limit reached",
+      message: detail || "You've reached your plan's scan quota for this period.",
+    });
+  }
+
+  return Promise.reject(error);
+});
+
 // Dashboard
 export const getDashboardStats = async () => {
   const { data } = await api.get("/dashboard/stats");
@@ -33,6 +54,31 @@ export const getRecentMatches = async (limit = 10) => {
 
 export const getRecentAlerts = async (limit = 10) => {
   const { data } = await api.get(`/dashboard/recent-alerts?limit=${limit}`);
+  return data;
+};
+
+export const getAlerts = async (unreadOnly = false, limit = 50, offset = 0) => {
+  const { data } = await api.get(`/alerts?unread_only=${unreadOnly}&limit=${limit}&offset=${offset}`);
+  return data;
+};
+
+export const getUnreadAlertCount = async () => {
+  const { data } = await api.get("/alerts/count");
+  return data;
+};
+
+export const markAlertRead = async (alertId: string) => {
+  const { data } = await api.patch(`/alerts/${alertId}/read`);
+  return data;
+};
+
+export const markAllAlertsRead = async () => {
+  const { data } = await api.post("/alerts/mark-all-read");
+  return data;
+};
+
+export const deleteAlert = async (alertId: string) => {
+  const { data } = await api.delete(`/alerts/${alertId}`);
   return data;
 };
 
@@ -227,6 +273,21 @@ export const deleteAllScans = async () => {
   return data;
 };
 
+export const retryScan = async (jobId: string) => {
+  const { data } = await api.post(`/scans/${jobId}/retry`);
+  return data;
+};
+
+export const startBatchScan = async () => {
+  const { data } = await api.post("/scans/batch");
+  return data;
+};
+
+export const getComplianceTrend = async (days: number = 30) => {
+  const { data } = await api.get(`/dashboard/compliance-trend?days=${days}`);
+  return data;
+};
+
 export const analyzeScanResults = async (jobId: string, campaignId?: string) => {
   const params = campaignId ? `?campaign_id=${campaignId}` : "";
   const { data } = await api.post(`/scans/${jobId}/analyze${params}`);
@@ -325,6 +386,48 @@ export const uploadOrgLogo = async (file: File, orgId?: string) => {
 export const deleteOrgLogo = async (orgId?: string) => {
   const resolvedId = orgId || (await api.get("/auth/me")).data.organization_id;
   const { data } = await api.delete(`/organizations/${resolvedId}/logo`);
+  return data;
+};
+
+// Billing
+export const getBillingUsage = async () => {
+  const { data } = await api.get("/billing/usage");
+  return data;
+};
+
+export const createCheckoutSession = async (plan: string) => {
+  const { data } = await api.post("/billing/checkout-session", { plan });
+  return data;
+};
+
+export const createPortalSession = async () => {
+  const { data } = await api.post("/billing/portal-session");
+  return data;
+};
+
+// Team
+export const getTeamMembers = async () => {
+  const { data } = await api.get("/team/members");
+  return data;
+};
+
+export const getTeamInvites = async () => {
+  const { data } = await api.get("/team/invites");
+  return data;
+};
+
+export const inviteTeamMember = async (email: string, role: string = "member") => {
+  const { data } = await api.post("/team/invites", { email, role });
+  return data;
+};
+
+export const cancelInvite = async (inviteId: string) => {
+  const { data } = await api.delete(`/team/invites/${inviteId}`);
+  return data;
+};
+
+export const removeTeamMember = async (userId: string) => {
+  const { data } = await api.delete(`/team/members/${userId}`);
   return data;
 };
 

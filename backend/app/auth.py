@@ -7,6 +7,7 @@ from uuid import UUID
 
 import httpx
 import jwt
+from cachetools import TTLCache
 from jwt import PyJWKClient
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -40,7 +41,7 @@ class AuthUser:
         self.email = email
 
 
-_profile_cache: dict = {}
+_profile_cache: TTLCache = TTLCache(maxsize=10_000, ttl=300)
 
 
 async def get_current_user(
@@ -112,8 +113,22 @@ async def get_current_user(
         profile = None
 
     if not profile:
-        org_id = await _auto_provision_user(user_id, email)
-        role = "owner"
+        try:
+            org_id = await _auto_provision_user(user_id, email)
+            role = "owner"
+        except Exception as prov_err:
+            log.warning("Auto-provision failed (likely race): %s — retrying lookup", prov_err)
+            retry = (
+                supabase.table("user_profiles")
+                .select("organization_id, role")
+                .eq("user_id", str(user_id))
+                .maybe_single()
+                .execute()
+            )
+            if not retry.data:
+                raise HTTPException(status_code=500, detail="Failed to provision user profile")
+            org_id = UUID(retry.data["organization_id"])
+            role = retry.data.get("role", "member")
     else:
         org_id = UUID(profile["organization_id"])
         role = profile.get("role", "member")
@@ -124,12 +139,18 @@ async def get_current_user(
 
 
 async def _auto_provision_user(user_id: UUID, email: str) -> UUID:
-    """First-time login: create an organization and user_profiles row."""
+    """First-time login: create an organization with a 14-day free trial."""
+    from datetime import datetime, timedelta, timezone
+
     org_name = email.split("@")[0].title() if email else "My Organization"
+    trial_end = (datetime.now(timezone.utc) + timedelta(days=14)).isoformat()
 
     org = supabase.table("organizations").insert({
         "name": org_name,
         "slug": org_name.lower().replace(" ", "-"),
+        "plan": "free",
+        "plan_status": "trialing",
+        "trial_expires_at": trial_end,
     }).execute()
     org_id = UUID(org.data[0]["id"])
 

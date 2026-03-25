@@ -3,6 +3,11 @@ import {
   getDashboardStats,
   getRecentMatches,
   getRecentAlerts,
+  getAlerts,
+  getUnreadAlertCount,
+  markAlertRead,
+  markAllAlertsRead,
+  deleteAlert,
   getCoverageByChannel,
   getCampaigns,
   getCampaign,
@@ -25,12 +30,19 @@ import {
   deleteAllMatches,
   deleteScan,
   deleteAllScans,
+  retryScan,
+  startBatchScan,
+  getComplianceTrend,
   submitMatchFeedback,
   getFeedbackStats,
+  getBillingUsage,
 } from "./api";
 
 // Query keys for cache management
 export const queryKeys = {
+  billing: {
+    usage: ["billing", "usage"] as const,
+  },
   dashboard: {
     stats: ["dashboard", "stats"] as const,
     recentMatches: (limit: number) => ["dashboard", "recentMatches", limit] as const,
@@ -57,6 +69,15 @@ export const queryKeys = {
   },
 };
 
+// Billing hooks
+export function useBillingUsage() {
+  return useQuery({
+    queryKey: queryKeys.billing.usage,
+    queryFn: getBillingUsage,
+    staleTime: 60_000,
+  });
+}
+
 // Dashboard hooks
 export function useDashboardStats() {
   return useQuery({
@@ -76,6 +97,55 @@ export function useRecentAlerts(limit = 10) {
   return useQuery({
     queryKey: queryKeys.dashboard.recentAlerts(limit),
     queryFn: () => getRecentAlerts(limit),
+  });
+}
+
+// Alert hooks
+export function useAlerts(unreadOnly = false) {
+  return useQuery({
+    queryKey: ["alerts", { unreadOnly }] as const,
+    queryFn: () => getAlerts(unreadOnly),
+  });
+}
+
+export function useUnreadAlertCount() {
+  return useQuery({
+    queryKey: ["alerts", "unread-count"] as const,
+    queryFn: getUnreadAlertCount,
+    refetchInterval: 60_000,
+  });
+}
+
+export function useMarkAlertRead() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: markAlertRead,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });
+    },
+  });
+}
+
+export function useMarkAllAlertsRead() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: markAllAlertsRead,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });
+    },
+  });
+}
+
+export function useDeleteAlert() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: deleteAlert,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });
+    },
   });
 }
 
@@ -263,6 +333,36 @@ export function useDeleteAllScans() {
       queryClient.invalidateQueries({ queryKey: ["matches"] });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });
     },
+  });
+}
+
+export function useRetryScan() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: retryScan,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.scans.all });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });
+    },
+  });
+}
+
+export function useBatchScan() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: startBatchScan,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.scans.all });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });
+    },
+  });
+}
+
+export function useComplianceTrend(days: number = 30) {
+  return useQuery({
+    queryKey: ["compliance-trend", days] as const,
+    queryFn: () => getComplianceTrend(days),
+    staleTime: 5 * 60_000,
   });
 }
 

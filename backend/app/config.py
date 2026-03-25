@@ -2,7 +2,7 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field
 from functools import lru_cache
-from typing import Dict
+from typing import Any, Dict, List, Optional
 
 
 class Settings(BaseSettings):
@@ -26,6 +26,17 @@ class Settings(BaseSettings):
     
     # Apify (Meta Ad Library — Facebook & Instagram)
     apify_api_key: str = ""
+    
+    # Stripe (billing)
+    stripe_secret_key: str = ""
+    stripe_webhook_secret: str = ""
+    stripe_price_starter: str = ""
+    stripe_price_professional: str = ""
+    stripe_price_business: str = ""
+    stripe_price_extra_dealer_starter: str = ""
+    stripe_price_extra_dealer_professional: str = ""
+    stripe_price_extra_dealer_business: str = ""
+    frontend_url: str = "http://localhost:3000"
     
     # Error Tracking
     sentry_dsn: str = ""
@@ -184,8 +195,164 @@ def get_calibration_factor(source_type: str, channel: str, settings: Settings = 
     return source_factor * channel_factor
 
 
+# ===========================================
+# Plan Limits — enforced by billing middleware
+# ===========================================
+
+PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
+    "free": {
+        "max_dealers": 2,
+        "max_campaigns": 1,
+        "max_scans_total": 5,
+        "max_scans_per_month": None,
+        "max_concurrent_scans": 1,
+        "max_pages_per_site": 8,
+        "max_compliance_rules": 0,
+        "max_user_seats": 1,
+        "max_pdf_reports": 1,
+        "allowed_channels": ["website"],
+        "allowed_frequencies": [],
+        "max_schedules_per_campaign": 0,
+        "pdf_reports": True,
+        "report_branding": False,
+        "email_notifications": False,
+        "slack_notifications": False,
+        "compliance_trends": False,
+        "adaptive_calibration_active": False,
+        "api_access": False,
+        "data_retention_days": 21,
+        "trial_duration_days": 14,
+        "included_dealers": 2,
+        "extra_dealer_price": 0,
+    },
+    "starter": {
+        "max_dealers": 10,
+        "max_campaigns": 3,
+        "max_scans_total": None,
+        "max_scans_per_month": 15,
+        "max_concurrent_scans": 1,
+        "max_pages_per_site": 8,
+        "max_compliance_rules": 0,
+        "max_user_seats": 1,
+        "max_pdf_reports": None,
+        "allowed_channels": ["website"],
+        "allowed_frequencies": ["biweekly", "monthly"],
+        "max_schedules_per_campaign": 1,
+        "pdf_reports": False,
+        "report_branding": False,
+        "email_notifications": False,
+        "slack_notifications": False,
+        "compliance_trends": False,
+        "adaptive_calibration_active": False,
+        "api_access": False,
+        "data_retention_days": 90,
+        "trial_duration_days": None,
+        "included_dealers": 10,
+        "extra_dealer_price": 99,
+    },
+    "professional": {
+        "max_dealers": 40,
+        "max_campaigns": 10,
+        "max_scans_total": None,
+        "max_scans_per_month": 40,
+        "max_concurrent_scans": 2,
+        "max_pages_per_site": 15,
+        "max_compliance_rules": 10,
+        "max_user_seats": 3,
+        "max_pdf_reports": None,
+        "allowed_channels": ["website", "google_ads", "facebook", "instagram"],
+        "allowed_frequencies": ["weekly", "biweekly", "monthly"],
+        "max_schedules_per_campaign": 1,
+        "pdf_reports": True,
+        "report_branding": True,
+        "email_notifications": True,
+        "slack_notifications": False,
+        "compliance_trends": False,
+        "adaptive_calibration_active": True,
+        "api_access": False,
+        "data_retention_days": 180,
+        "trial_duration_days": None,
+        "included_dealers": 40,
+        "extra_dealer_price": 90,
+    },
+    "business": {
+        "max_dealers": 100,
+        "max_campaigns": None,
+        "max_scans_total": None,
+        "max_scans_per_month": 150,
+        "max_concurrent_scans": 5,
+        "max_pages_per_site": 20,
+        "max_compliance_rules": None,
+        "max_user_seats": 10,
+        "max_pdf_reports": None,
+        "allowed_channels": ["website", "google_ads", "facebook", "instagram"],
+        "allowed_frequencies": ["daily", "weekly", "biweekly", "monthly"],
+        "max_schedules_per_campaign": None,
+        "pdf_reports": True,
+        "report_branding": True,
+        "email_notifications": True,
+        "slack_notifications": False,
+        "compliance_trends": True,
+        "adaptive_calibration_active": True,
+        "api_access": False,
+        "data_retention_days": 365,
+        "trial_duration_days": None,
+        "included_dealers": 100,
+        "extra_dealer_price": 70,
+    },
+    "enterprise": {
+        "max_dealers": None,
+        "max_campaigns": None,
+        "max_scans_total": None,
+        "max_scans_per_month": None,
+        "max_concurrent_scans": 10,
+        "max_pages_per_site": 50,
+        "max_compliance_rules": None,
+        "max_user_seats": None,
+        "max_pdf_reports": None,
+        "allowed_channels": ["website", "google_ads", "facebook", "instagram"],
+        "allowed_frequencies": ["daily", "weekly", "biweekly", "monthly"],
+        "max_schedules_per_campaign": None,
+        "pdf_reports": True,
+        "report_branding": True,
+        "email_notifications": True,
+        "slack_notifications": True,
+        "compliance_trends": True,
+        "adaptive_calibration_active": True,
+        "api_access": True,
+        "data_retention_days": 730,
+        "trial_duration_days": None,
+        "included_dealers": None,
+        "extra_dealer_price": 49,
+    },
+}
 
 
+def get_plan_limits(plan: str) -> Dict[str, Any]:
+    """Return the limits dict for a plan, defaulting to 'free'."""
+    return PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
+
+
+def get_stripe_price_id(plan: str, settings: Optional["Settings"] = None) -> Optional[str]:
+    """Map a plan name to its Stripe Price ID."""
+    if settings is None:
+        settings = get_settings()
+    return {
+        "starter": settings.stripe_price_starter,
+        "professional": settings.stripe_price_professional,
+        "business": settings.stripe_price_business,
+    }.get(plan)
+
+
+def get_extra_dealer_price_id(plan: str, settings: Optional["Settings"] = None) -> Optional[str]:
+    """Map a plan name to its extra-dealer Stripe Price ID."""
+    if settings is None:
+        settings = get_settings()
+    return {
+        "starter": settings.stripe_price_extra_dealer_starter,
+        "professional": settings.stripe_price_extra_dealer_professional,
+        "business": settings.stripe_price_extra_dealer_business,
+    }.get(plan)
 
 
 

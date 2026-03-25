@@ -16,12 +16,13 @@ import {
   ChevronDown,
   ChevronUp,
   BarChart3,
+  Layers,
 } from "lucide-react";
 import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { useScanJobs, useCampaigns, useDeleteScan, useDeleteAllScans } from "@/lib/hooks";
+import { useScanJobs, useCampaigns, useDeleteScan, useDeleteAllScans, useRetryScan, useBatchScan, useBillingUsage } from "@/lib/hooks";
 import { useQueryClient } from "@tanstack/react-query";
 import { formatDateTime } from "@/lib/utils";
 
@@ -42,6 +43,8 @@ interface PipelineStats {
   pages_scanned?: number;
   pages_skipped?: number;
   early_stopped?: boolean;
+  cache_hit?: boolean;
+  cached_pages_used?: number;
   // Legacy fields for backward compat with older scans
   matched?: number;
   duplicates_skipped?: number;
@@ -106,13 +109,24 @@ function PipelineFunnel({ stats }: { stats: PipelineStats }) {
       ))}
       {stats.pages_discovered != null && (
         <div className={`mt-2 pt-2 border-t border-border/30 text-xs flex gap-4 ${stats.early_stopped ? "text-emerald-400" : "text-muted-foreground"}`}>
-          {stats.early_stopped ? (
+          {stats.cache_hit ? (
+            <>
+              <span>Cache Hit: all assets matched from {stats.cached_pages_used} cached page(s)</span>
+              <span>Page discovery skipped</span>
+            </>
+          ) : stats.early_stopped ? (
             <>
               <span>Early Stop: all assets matched after {stats.pages_scanned}/{stats.pages_discovered} pages</span>
               <span>{stats.pages_skipped} pages skipped</span>
+              {(stats.cached_pages_used ?? 0) > 0 && (
+                <span>{stats.cached_pages_used} from cache</span>
+              )}
             </>
           ) : (
-            <span>Pages: {stats.pages_scanned}/{stats.pages_discovered} scanned</span>
+            <span>
+              Pages: {stats.pages_scanned}/{stats.pages_discovered} scanned
+              {(stats.cached_pages_used ?? 0) > 0 && ` (${stats.cached_pages_used} from cache)`}
+            </span>
           )}
         </div>
       )}
@@ -133,8 +147,12 @@ export default function ScansPage() {
   const queryClient = useQueryClient();
   const deleteScanMutation = useDeleteScan();
   const deleteAllScansMutation = useDeleteAllScans();
+  const retryScanMutation = useRetryScan();
+  const batchScanMutation = useBatchScan();
+  const { data: billing } = useBillingUsage();
   
   const campaigns = allCampaigns.filter((c: Campaign) => c.status === "active");
+  const canBatchScan = billing?.plan && ["professional", "business", "enterprise"].includes(billing.plan);
 
   const handleRefresh = () => {
     queryClient.invalidateQueries({ queryKey: ["scans"] });
@@ -254,6 +272,43 @@ export default function ScansPage() {
           </CardContent>
         </Card>
 
+        {/* Batch Scan */}
+        {canBatchScan && (
+          <Card className="border-border/60 opacity-0 animate-fade-up" style={{ animationFillMode: "forwards" }}>
+            <CardContent className="p-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center bg-primary/10 border border-primary/20">
+                    <Layers className="h-5 w-5 text-primary" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium">Batch Scan</p>
+                    <p className="text-xs text-muted-foreground">
+                      Scan all dealers across every available channel at once
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  onClick={() => {
+                    if (confirm("Start scanning all dealers across all channels? This will create one scan per channel.")) {
+                      batchScanMutation.mutate();
+                    }
+                  }}
+                  disabled={batchScanMutation.isPending}
+                >
+                  <Layers className="mr-2 h-4 w-4" />
+                  {batchScanMutation.isPending ? "Starting..." : "Scan All Channels"}
+                </Button>
+              </div>
+              {batchScanMutation.isSuccess && batchScanMutation.data && (
+                <p className="text-xs text-success mt-2">
+                  {batchScanMutation.data.message}
+                </p>
+              )}
+            </CardContent>
+          </Card>
+        )}
+
         {/* Scan Jobs List */}
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">All Scan History</h2>
@@ -365,10 +420,39 @@ export default function ScansPage() {
                     </div>
                   </div>
 
-                  {job.error_message && (
-                    <p className="mt-3 text-sm text-red-400 bg-red-500/10 rounded p-2">
-                      {job.error_message}
-                    </p>
+                  {job.status === "failed" && (
+                    <div className="mt-3 border border-red-500/20 bg-red-500/5 p-3 space-y-2">
+                      <div className="flex items-start gap-2">
+                        <XCircle className="h-4 w-4 text-red-400 mt-0.5 flex-shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-red-400">Scan failed</p>
+                          {job.error_message && (
+                            <p className="text-xs text-muted-foreground mt-1 break-words">
+                              {job.error_message}
+                            </p>
+                          )}
+                          <p className="text-xs text-muted-foreground mt-1.5">
+                            {job.error_message?.toLowerCase().includes("timeout")
+                              ? "The scan timed out. Try scanning fewer dealers or a different channel."
+                              : job.error_message?.toLowerCase().includes("rate")
+                              ? "API rate limit hit. Wait a few minutes and retry."
+                              : job.error_message?.toLowerCase().includes("url") || job.error_message?.toLowerCase().includes("404")
+                              ? "A dealer URL may be invalid. Check your distributor settings."
+                              : "Check your campaign assets and dealer URLs, then retry."}
+                          </p>
+                        </div>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="flex-shrink-0 text-xs"
+                          onClick={() => retryScanMutation.mutate(job.id)}
+                          disabled={retryScanMutation.isPending}
+                        >
+                          <RefreshCw className={`h-3 w-3 mr-1 ${retryScanMutation.isPending ? "animate-spin" : ""}`} />
+                          {retryScanMutation.isPending ? "Retrying..." : "Retry"}
+                        </Button>
+                      </div>
+                    </div>
                   )}
 
                   {job.pipeline_stats && (

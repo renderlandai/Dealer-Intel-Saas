@@ -10,6 +10,7 @@ import {
   ScanSearch,
   Settings,
   Bell,
+  CreditCard,
   Zap,
   ChevronLeft,
   ChevronRight,
@@ -18,6 +19,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useSidebar } from "./sidebar-context";
 import { useAuth } from "@/lib/auth-context";
+import { useUnreadAlertCount } from "@/lib/hooks";
 
 const navigation = [
   { name: "Dashboard", href: "/", icon: LayoutDashboard },
@@ -29,6 +31,7 @@ const navigation = [
 
 const secondaryNav = [
   { name: "Alerts", href: "/alerts", icon: Bell },
+  { name: "Billing", href: "/settings?tab=billing", icon: CreditCard },
   { name: "Settings", href: "/settings", icon: Settings },
 ];
 
@@ -36,6 +39,8 @@ export function Sidebar() {
   const pathname = usePathname();
   const { isCollapsed, toggleSidebar } = useSidebar();
   const { user, signOut } = useAuth();
+  const { data: alertData } = useUnreadAlertCount();
+  const unreadCount = alertData?.unread_count ?? 0;
 
   return (
     <aside 
@@ -141,18 +146,18 @@ export function Sidebar() {
                 >
                   <div className="relative flex-shrink-0">
                     <item.icon className="h-4 w-4" />
-                    {item.name === "Alerts" && isCollapsed && (
+                    {item.name === "Alerts" && isCollapsed && unreadCount > 0 && (
                       <span className="absolute -top-1.5 -right-1.5 flex h-4 w-4 items-center justify-center bg-destructive text-[9px] font-mono text-white rounded-full">
-                        3
+                        {unreadCount > 9 ? "9+" : unreadCount}
                       </span>
                     )}
                   </div>
                   {!isCollapsed && (
                     <>
                       <span className="truncate">{item.name}</span>
-                      {item.name === "Alerts" && (
-                        <span className="ml-auto flex h-5 w-5 items-center justify-center bg-destructive text-2xs font-mono text-white flex-shrink-0">
-                          3
+                      {item.name === "Alerts" && unreadCount > 0 && (
+                        <span className="ml-auto flex h-5 min-w-5 px-1 items-center justify-center bg-destructive text-2xs font-mono text-white flex-shrink-0">
+                          {unreadCount > 99 ? "99+" : unreadCount}
                         </span>
                       )}
                     </>

@@ -29,6 +29,8 @@ const AuthContext = createContext<AuthContextType>({
   updatePassword: async () => ({ error: null }),
 });
 
+export const PUBLIC_PATHS = ["/login", "/reset-password", "/landing", "/pricing"];
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [session, setSession] = useState<Session | null>(null);
@@ -48,8 +50,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       (_event, session) => {
         setSession(session);
         setUser(session?.user ?? null);
-        if (!session && pathname !== "/login" && pathname !== "/reset-password") {
-          router.push("/login");
+        if (!session && !PUBLIC_PATHS.includes(pathname)) {
+          router.push("/landing");
         }
       }
     );
@@ -57,11 +59,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => subscription.unsubscribe();
   }, []);
 
-  const publicPaths = ["/login", "/reset-password"];
-
   useEffect(() => {
-    if (!session && !loading && !publicPaths.includes(pathname)) {
-      router.push("/login");
+    if (!session && !loading && !PUBLIC_PATHS.includes(pathname)) {
+      router.push("/landing");
     }
   }, [session, loading, pathname]);
 

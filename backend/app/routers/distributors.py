@@ -8,6 +8,7 @@ from ..database import supabase
 from ..models import (
     Distributor, DistributorCreate, DistributorUpdate
 )
+from ..plan_enforcement import OrgPlan, get_org_plan, check_dealer_limit, check_dealer_limit_bulk
 
 router = APIRouter(prefix="/distributors", tags=["distributors"])
 
@@ -73,8 +74,14 @@ async def get_distributor(distributor_id: UUID):
 
 
 @router.post("", response_model=Distributor)
-async def create_distributor(distributor: DistributorCreate, user: AuthUser = Depends(get_current_user)):
+async def create_distributor(
+    distributor: DistributorCreate,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
     """Create a new distributor."""
+    check_dealer_limit(op)
+
     data = distributor.model_dump()
     data["organization_id"] = str(user.org_id)
 
@@ -126,8 +133,14 @@ async def get_distributor_matches(
 
 
 @router.post("/bulk", response_model=List[Distributor])
-async def bulk_create_distributors(distributors: List[DistributorCreate], user: AuthUser = Depends(get_current_user)):
+async def bulk_create_distributors(
+    distributors: List[DistributorCreate],
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
     """Bulk create distributors."""
+    check_dealer_limit_bulk(op, len(distributors))
+
     data = [d.model_dump() for d in distributors]
     for d in data:
         d["organization_id"] = str(user.org_id)

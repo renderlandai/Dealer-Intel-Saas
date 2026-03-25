@@ -1,78 +1,161 @@
-"""Dashboard routes."""
-from fastapi import APIRouter, Depends
-from typing import Optional
+"""Dashboard routes — all queries scoped to the authenticated user's organization."""
+import logging
+from fastapi import APIRouter, Depends, HTTPException
+from typing import List, Optional
 from uuid import UUID
 from datetime import datetime, timedelta
 
 from ..auth import AuthUser, get_current_user
 from ..database import supabase
 from ..models import DashboardStats
+from ..plan_enforcement import OrgPlan, get_org_plan
+
+log = logging.getLogger("dealer_intel.dashboard")
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
 
+def _org_distributor_ids(org_id: str) -> List[str]:
+    """Return all distributor IDs belonging to an organization."""
+    result = supabase.table("distributors") \
+        .select("id") \
+        .eq("organization_id", org_id) \
+        .execute()
+    return [d["id"] for d in (result.data or [])]
+
+
+def _org_campaign_ids(org_id: str) -> List[str]:
+    """Return all campaign IDs belonging to an organization."""
+    result = supabase.table("campaigns") \
+        .select("id") \
+        .eq("organization_id", org_id) \
+        .execute()
+    return [c["id"] for c in (result.data or [])]
+
+
 @router.get("/stats", response_model=DashboardStats)
 async def get_dashboard_stats(user: AuthUser = Depends(get_current_user)):
-    """Get dashboard statistics."""
-    org_filter = str(user.org_id)
+    """Get dashboard statistics via single Postgres RPC (falls back to sequential queries)."""
+    org_id = str(user.org_id)
+
+    try:
+        result = supabase.rpc("get_dashboard_stats", {"p_org_id": org_id}).execute()
+        if result.data:
+            d = result.data
+            return DashboardStats(
+                active_campaigns=d.get("active_campaigns", 0),
+                total_assets=d.get("total_assets", 0),
+                active_distributors=d.get("active_distributors", 0),
+                total_matches=d.get("total_matches", 0),
+                unread_alerts=d.get("unread_alerts", 0),
+                compliance_rate=float(d.get("compliance_rate", 0)),
+                matches_today=d.get("matches_today", 0),
+                violations_count=d.get("violations_count", 0),
+            )
+    except Exception as rpc_err:
+        log.debug("Dashboard RPC unavailable, falling back to sequential queries: %s", rpc_err)
+
+    return await _get_dashboard_stats_fallback(org_id)
+
+
+async def _get_dashboard_stats_fallback(org_id: str) -> DashboardStats:
+    """Legacy sequential queries — used when the RPC hasn't been deployed yet."""
     today = datetime.utcnow().date().isoformat()
 
-    campaigns_q = supabase.table("campaigns").select("id", count="exact").eq("status", "active")
-    if org_filter:
-        campaigns_q = campaigns_q.eq("organization_id", org_filter)
-    campaigns = campaigns_q.execute()
+    distributor_ids = _org_distributor_ids(org_id)
+    campaign_ids = _org_campaign_ids(org_id)
 
-    assets = supabase.table("assets").select("id", count="exact").execute()
+    campaigns = supabase.table("campaigns") \
+        .select("id", count="exact") \
+        .eq("organization_id", org_id) \
+        .eq("status", "active").execute()
 
-    distributors_q = supabase.table("distributors").select("id", count="exact").eq("status", "active")
-    if org_filter:
-        distributors_q = distributors_q.eq("organization_id", org_filter)
-    distributors = distributors_q.execute()
+    if campaign_ids:
+        assets = supabase.table("assets") \
+            .select("id", count="exact") \
+            .in_("campaign_id", campaign_ids).execute()
+        assets_count = assets.count or 0
+    else:
+        assets_count = 0
 
-    matches = supabase.table("matches").select("id", count="exact").execute()
+    distributors = supabase.table("distributors") \
+        .select("id", count="exact") \
+        .eq("organization_id", org_id) \
+        .eq("status", "active").execute()
 
-    alerts_q = supabase.table("alerts").select("id", count="exact").eq("is_read", False)
-    if org_filter:
-        alerts_q = alerts_q.eq("organization_id", org_filter)
-    alerts = alerts_q.execute()
+    alerts = supabase.table("alerts") \
+        .select("id", count="exact") \
+        .eq("organization_id", org_id) \
+        .eq("is_read", False).execute()
 
-    compliant = supabase.table("matches").select("id", count="exact").eq("compliance_status", "compliant").execute()
-    violations = supabase.table("matches").select("id", count="exact").eq("compliance_status", "violation").execute()
-    matches_today = supabase.table("matches").select("id", count="exact").gte("created_at", today).execute()
+    if distributor_ids:
+        matches = supabase.table("matches") \
+            .select("id", count="exact") \
+            .in_("distributor_id", distributor_ids).execute()
+        compliant = supabase.table("matches") \
+            .select("id", count="exact") \
+            .in_("distributor_id", distributor_ids) \
+            .eq("compliance_status", "compliant").execute()
+        violations = supabase.table("matches") \
+            .select("id", count="exact") \
+            .in_("distributor_id", distributor_ids) \
+            .eq("compliance_status", "violation").execute()
+        matches_today = supabase.table("matches") \
+            .select("id", count="exact") \
+            .in_("distributor_id", distributor_ids) \
+            .gte("created_at", today).execute()
 
-    total_matches = matches.count or 0
-    compliant_count = compliant.count or 0
+        total_matches = matches.count or 0
+        compliant_count = compliant.count or 0
+        violations_count = violations.count or 0
+        today_count = matches_today.count or 0
+    else:
+        total_matches = compliant_count = violations_count = today_count = 0
+
     compliance_rate = (compliant_count / max(total_matches, 1)) * 100
 
     return DashboardStats(
         active_campaigns=campaigns.count or 0,
-        total_assets=assets.count or 0,
+        total_assets=assets_count,
         active_distributors=distributors.count or 0,
         total_matches=total_matches,
         unread_alerts=alerts.count or 0,
         compliance_rate=round(compliance_rate, 1),
-        matches_today=matches_today.count or 0,
-        violations_count=violations.count or 0
+        matches_today=today_count,
+        violations_count=violations_count,
     )
 
 
 @router.get("/recent-matches")
-async def get_recent_matches(limit: int = 10):
-    """Get recent matches for dashboard."""
-    result = supabase.table("recent_matches")\
-        .select("*")\
-        .order("created_at", desc=True)\
-        .limit(limit)\
+async def get_recent_matches(
+    limit: int = 10,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Get recent matches scoped to the user's organization."""
+    distributor_ids = _org_distributor_ids(str(user.org_id))
+    if not distributor_ids:
+        return []
+
+    result = supabase.table("recent_matches") \
+        .select("*") \
+        .in_("distributor_id", distributor_ids) \
+        .order("created_at", desc=True) \
+        .limit(limit) \
         .execute()
     return result.data
 
 
 @router.get("/recent-alerts")
-async def get_recent_alerts(limit: int = 10, unread_only: bool = True):
-    """Get recent alerts for dashboard."""
-    q = supabase.table("alerts")\
-        .select("*, distributors(name), matches(confidence_score)")\
-        .order("created_at", desc=True)\
+async def get_recent_alerts(
+    limit: int = 10,
+    unread_only: bool = True,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Get recent alerts scoped to the user's organization."""
+    q = supabase.table("alerts") \
+        .select("*, distributors(name), matches(confidence_score)") \
+        .eq("organization_id", str(user.org_id)) \
+        .order("created_at", desc=True) \
         .limit(limit)
     if unread_only:
         q = q.eq("is_read", False)
@@ -81,11 +164,18 @@ async def get_recent_alerts(limit: int = 10, unread_only: bool = True):
 
 
 @router.get("/coverage-by-channel")
-async def get_coverage_by_channel():
-    """Get match coverage by channel."""
-    result = supabase.table("matches").select("channel").execute()
+async def get_coverage_by_channel(user: AuthUser = Depends(get_current_user)):
+    """Get match coverage by channel scoped to the user's organization."""
+    distributor_ids = _org_distributor_ids(str(user.org_id))
+    if not distributor_ids:
+        return []
 
-    channel_counts = {}
+    result = supabase.table("matches") \
+        .select("channel") \
+        .in_("distributor_id", distributor_ids) \
+        .execute()
+
+    channel_counts: dict = {}
     for match in result.data:
         channel = match.get("channel") or "unknown"
         channel_counts[channel] = channel_counts.get(channel, 0) + 1
@@ -97,12 +187,22 @@ async def get_coverage_by_channel():
 
 
 @router.get("/coverage-by-distributor")
-async def get_coverage_by_distributor(limit: int = 10):
-    """Get match coverage by distributor."""
-    result = supabase.table("matches").select("distributor_id, distributors(name)").execute()
+async def get_coverage_by_distributor(
+    limit: int = 10,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Get match coverage by distributor scoped to the user's organization."""
+    distributor_ids = _org_distributor_ids(str(user.org_id))
+    if not distributor_ids:
+        return []
 
-    dist_counts = {}
-    dist_names = {}
+    result = supabase.table("matches") \
+        .select("distributor_id, distributors(name)") \
+        .in_("distributor_id", distributor_ids) \
+        .execute()
+
+    dist_counts: dict = {}
+    dist_names: dict = {}
     for match in result.data:
         dist_id = match.get("distributor_id")
         if dist_id:
@@ -116,24 +216,39 @@ async def get_coverage_by_distributor(limit: int = 10):
         {
             "distributor_id": k,
             "distributor_name": dist_names.get(k, "Unknown"),
-            "match_count": v
+            "match_count": v,
         }
         for k, v in sorted_dists
     ]
 
 
 @router.get("/compliance-trend")
-async def get_compliance_trend(days: int = 30):
-    """Get compliance trend over time."""
+async def get_compliance_trend(
+    days: int = 30,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    """Get compliance trend over time scoped to the user's organization."""
+    if not op.limits.get("compliance_trends"):
+        raise HTTPException(
+            403,
+            f"Compliance trend analytics are not available on your {op.plan} plan. "
+            "Upgrade to Pro to unlock this feature.",
+        )
+    distributor_ids = _org_distributor_ids(str(user.org_id))
+    if not distributor_ids:
+        return []
+
     start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
 
-    result = supabase.table("matches")\
-        .select("created_at, compliance_status")\
-        .gte("created_at", start_date)\
-        .order("created_at")\
+    result = supabase.table("matches") \
+        .select("created_at, compliance_status") \
+        .in_("distributor_id", distributor_ids) \
+        .gte("created_at", start_date) \
+        .order("created_at") \
         .execute()
 
-    daily_stats = {}
+    daily_stats: dict = {}
     for match in result.data:
         date = match["created_at"][:10]
         if date not in daily_stats:

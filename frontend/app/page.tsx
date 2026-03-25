@@ -40,8 +40,13 @@ import {
   useChannelCoverage,
   useCampaigns,
   useDistributors,
+  useBillingUsage,
 } from "@/lib/hooks";
 import { downloadComplianceReport } from "@/lib/api";
+import { TrialBanner } from "@/components/dashboard/trial-banner";
+import { UsageCard } from "@/components/dashboard/usage-card";
+import { OnboardingChecklist } from "@/components/dashboard/onboarding-checklist";
+import { ComplianceTrend } from "@/components/dashboard/compliance-trend";
 
 interface Campaign {
   id: string;
@@ -67,6 +72,7 @@ export default function DashboardPage() {
   const { data: channelData = [] } = useChannelCoverage();
   const { data: allCampaigns = [], isError: campaignsError } = useCampaigns();
   const { data: distributors = [], isError: distributorsError } = useDistributors();
+  const { data: billing } = useBillingUsage();
   
   const campaigns = allCampaigns.filter((c: Campaign) => c.status === "active");
   const loading = statsLoading;
@@ -91,6 +97,25 @@ export default function DashboardPage() {
       />
 
       <div className="p-8 space-y-8">
+        {/* Trial Banner */}
+        {billing && (
+          <TrialBanner
+            plan={billing.plan}
+            planStatus={billing.plan_status}
+            trialDaysLeft={billing.trial_days_left}
+          />
+        )}
+
+        {/* Onboarding Checklist */}
+        {!statsLoading && (
+          <OnboardingChecklist
+            campaignCount={stats.active_campaigns}
+            assetCount={stats.total_assets}
+            distributorCount={stats.active_distributors}
+            scanCount={stats.total_matches}
+          />
+        )}
+
         {/* Connection Error Banner */}
         {(statsError || campaignsError || distributorsError) && (
           <div className="flex items-center gap-3 p-4 border border-destructive/30 bg-destructive/5 opacity-0 animate-fade-up">
@@ -234,6 +259,11 @@ export default function DashboardPage() {
               </Card>
             </div>
 
+            {/* Compliance Trend — Pro/Business */}
+            <ComplianceTrend
+              enabled={!!billing?.features?.compliance_trends}
+            />
+
             {/* Scan Action Card */}
             <Card className="border-primary/20 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-0 animate-fade-up">
               <CardHeader className="pb-4">
@@ -339,6 +369,14 @@ export default function DashboardPage() {
             </Card>
           </div>
           <div className="opacity-0 animate-fade-up delay-200 space-y-6" style={{ animationFillMode: 'forwards' }}>
+            {billing && (
+              <UsageCard
+                dealers={billing.dealers}
+                campaigns={billing.campaigns}
+                scans={billing.scans}
+                plan={billing.plan}
+              />
+            )}
             <RecentMatches matches={matches} />
             <AlertsPanel alerts={alerts} />
           </div>

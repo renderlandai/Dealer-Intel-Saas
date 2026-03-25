@@ -1,6 +1,6 @@
 """Scanning and analysis routes."""
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from typing import List, Optional, Dict, Any
 from uuid import UUID
 
@@ -9,7 +9,15 @@ from ..database import supabase
 from ..models import ScanJobCreate, ScanJob, ScanSource
 from ..services import screenshot_service, extraction_service, ai_service, serpapi_service, apify_meta_service, apify_instagram_service
 from ..services.notification_service import notify_scan_complete
+from ..plan_enforcement import (
+    OrgPlan, get_org_plan,
+    check_scan_quota, check_concurrent_scans, check_channel_allowed,
+)
 import logging
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
 
 log = logging.getLogger("dealer_intel.scanning")
 
@@ -111,15 +119,21 @@ router = APIRouter(prefix="/scans", tags=["scanning"])
 
 
 @router.post("/start", response_model=ScanJob)
+@limiter.limit("10/minute")
 async def start_scan(
+    request: Request,
     scan_request: ScanJobCreate,
     user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
 ):
     """
     Start a new scan job.
     
     Dispatches the scan to a Celery worker for durable background execution.
     """
+    check_channel_allowed(op, scan_request.source.value)
+    check_scan_quota(op)
+    check_concurrent_scans(op)
     from ..tasks import (
         run_google_ads_scan_task, run_facebook_scan_task,
         run_instagram_scan_task, run_website_scan_task,
@@ -490,7 +504,13 @@ async def run_website_scan(
 
     Supports **early stopping**: when all campaign assets have been matched,
     remaining pages are skipped to save time and API costs.
+
+    Supports **page hit caching**: on repeat scans, pages that previously
+    produced matches are scanned first. If all assets are matched from
+    cached pages alone, full page discovery is skipped entirely.
     """
+    from ..services import page_cache_service
+
     log.info("Website scan started for job %s — URLs: %s, campaign: %s",
              scan_job_id, website_urls, campaign_id)
 
@@ -502,28 +522,27 @@ async def run_website_scan(
         if campaign_assets:
             log.info("Loaded %d campaign asset(s)", len(campaign_assets))
 
-        expanded_urls = await extraction_service.discover_website_urls(website_urls)
-        total_pages = len(expanded_urls)
-        log.info("Discovered %d pages to scan", total_pages)
-
         can_early_stop = bool(campaign_id and campaign_assets)
         all_asset_ids = {str(a["id"]) for a in campaign_assets} if can_early_stop else set()
         matched_asset_ids: set = set()
+
+        # Track which pages produce matches (for cache update at the end)
+        page_match_tracker: Dict[str, set] = {}
 
         asset_hashes: Dict = {}
         asset_embeddings: Dict = {}
         brand_rules: Dict[str, Any] = {}
         org_id: Optional[str] = None
 
+        job_data = supabase.table("scan_jobs")\
+            .select("organization_id").eq("id", str(scan_job_id)).single().execute()
+        org_id = job_data.data.get("organization_id") if job_data.data else None
+
         if can_early_stop:
             log.info("Early stopping enabled — will stop after all %d assets are matched", len(all_asset_ids))
             asset_hashes = await ai_service._precompute_asset_hashes(campaign_assets)
             asset_embeddings = await ai_service._precompute_asset_embeddings(campaign_assets)
             log.info("Cached %d hash sets, %d CLIP embeddings", len(asset_hashes), len(asset_embeddings))
-
-            job_data = supabase.table("scan_jobs")\
-                .select("organization_id").eq("id", str(scan_job_id)).single().execute()
-            org_id = job_data.data.get("organization_id") if job_data.data else None
 
             if org_id:
                 rules = supabase.table("compliance_rules")\
@@ -536,6 +555,96 @@ async def run_website_scan(
                     elif rule["rule_type"] == "forbidden_element":
                         brand_rules.setdefault("forbidden_elements", []).append(
                             rule["rule_config"].get("element"))
+
+        # ---- Phase 1: Try cached hot pages first ----
+        cached_pages: List[str] = []
+        cache_early_stopped = False
+        if can_early_stop and org_id:
+            for base_url in website_urls:
+                dist_id = extraction_service._match_distributor_by_domain(
+                    base_url, distributor_mapping)
+                if dist_id:
+                    cached = page_cache_service.get_cached_pages(
+                        org_id, str(dist_id),
+                        str(campaign_id) if campaign_id else None,
+                    )
+                    cached_pages.extend(cached)
+
+        supabase.table("scan_jobs").update({
+            "status": "running",
+            "started_at": _utc_now(),
+        }).eq("id", str(scan_job_id)).execute()
+
+        total_discovered = 0
+
+        if cached_pages:
+            log.info("Phase 1: Scanning %d cached hot page(s) first", len(cached_pages))
+
+            for cidx, page_url in enumerate(cached_pages):
+                log.info("[Cache %d/%d] Extracting: %s", cidx + 1, len(cached_pages), page_url)
+
+                distributor_id = extraction_service._match_distributor_by_domain(
+                    page_url, distributor_mapping)
+                count, evidence_url = await extraction_service.extract_dealer_website(
+                    page_url, scan_job_id, distributor_id,
+                    campaign_assets=campaign_assets,
+                )
+                if count == 0 and _settings.enable_tiling_fallback and evidence_url:
+                    supabase.table("discovered_images").insert({
+                        "scan_job_id": str(scan_job_id),
+                        "distributor_id": str(distributor_id) if distributor_id else None,
+                        "source_url": page_url,
+                        "image_url": evidence_url,
+                        "source_type": "page_screenshot",
+                        "channel": "website",
+                        "metadata": {"capture_method": "playwright_fallback", "full_page": True},
+                    }).execute()
+                    count = 1
+
+                total_discovered += count
+
+                if can_early_stop and count > 0:
+                    page_images = supabase.table("discovered_images")\
+                        .select("*")\
+                        .eq("scan_job_id", str(scan_job_id))\
+                        .eq("source_url", page_url)\
+                        .eq("is_processed", False)\
+                        .execute()
+
+                    for image in (page_images.data or []):
+                        asset_id = await _analyze_single_image(
+                            image, campaign_assets, brand_rules,
+                            org_id, str(scan_job_id),
+                            asset_hashes, asset_embeddings, {},
+                        )
+                        if asset_id:
+                            matched_asset_ids.add(asset_id)
+                            page_match_tracker.setdefault(page_url, set()).add(asset_id)
+
+                    if all_asset_ids and matched_asset_ids >= all_asset_ids:
+                        log.info(
+                            "CACHE HIT: All %d assets matched from %d cached page(s) — skipping discovery",
+                            len(all_asset_ids), cidx + 1,
+                        )
+                        cache_early_stopped = True
+                        break
+
+        # ---- Phase 2: Full page discovery (skipped if cache covered everything) ----
+        if cache_early_stopped:
+            expanded_urls = cached_pages
+            total_pages = len(cached_pages)
+            pages_from_discovery = 0
+        else:
+            expanded_urls = await extraction_service.discover_website_urls(website_urls)
+
+            # Exclude pages already scanned from cache phase
+            cached_set = set(cached_pages)
+            remaining_urls = [u for u in expanded_urls if u not in cached_set]
+            total_pages = len(cached_pages) + len(remaining_urls)
+            pages_from_discovery = len(remaining_urls)
+
+            log.info("Phase 2: %d additional page(s) from discovery (after %d cached)",
+                     pages_from_discovery, len(cached_pages))
 
         pipeline_stats: Dict[str, Any] = {
             "total_images": 0,
@@ -550,80 +659,81 @@ async def run_website_scan(
             "drift_detected": 0,
             "errors": 0,
             "pages_discovered": total_pages,
-            "pages_scanned": 0,
+            "pages_scanned": len(cached_pages) if cache_early_stopped else len(cached_pages),
             "pages_skipped": 0,
-            "early_stopped": False,
+            "early_stopped": cache_early_stopped,
+            "cache_hit": cache_early_stopped,
+            "cached_pages_used": len(cached_pages),
         }
 
-        total_discovered = 0
-        early_stopped = False
+        early_stopped = cache_early_stopped
 
-        supabase.table("scan_jobs").update({
-            "status": "running",
-            "started_at": _utc_now(),
-        }).eq("id", str(scan_job_id)).execute()
+        if not cache_early_stopped:
+            remaining_to_scan = [u for u in expanded_urls if u not in set(cached_pages)] if cached_pages else expanded_urls
 
-        for page_idx, page_url in enumerate(expanded_urls):
-            log.info("[Page %d/%d] Extracting: %s", page_idx + 1, total_pages, page_url)
+            for page_idx, page_url in enumerate(remaining_to_scan):
+                overall_idx = len(cached_pages) + page_idx
+                log.info("[Page %d/%d] Extracting: %s", overall_idx + 1, total_pages, page_url)
 
-            distributor_id = extraction_service._match_distributor_by_domain(
-                page_url, distributor_mapping)
+                distributor_id = extraction_service._match_distributor_by_domain(
+                    page_url, distributor_mapping)
 
-            count, evidence_url = await extraction_service.extract_dealer_website(
-                page_url, scan_job_id, distributor_id,
-                campaign_assets=campaign_assets,
-            )
+                count, evidence_url = await extraction_service.extract_dealer_website(
+                    page_url, scan_job_id, distributor_id,
+                    campaign_assets=campaign_assets,
+                )
 
-            if count == 0 and _settings.enable_tiling_fallback and evidence_url:
-                log.info("Zero images from %s — inserting screenshot for tiling", page_url)
-                supabase.table("discovered_images").insert({
-                    "scan_job_id": str(scan_job_id),
-                    "distributor_id": str(distributor_id) if distributor_id else None,
-                    "source_url": page_url,
-                    "image_url": evidence_url,
-                    "source_type": "page_screenshot",
-                    "channel": "website",
-                    "metadata": {
-                        "capture_method": "playwright_fallback",
-                        "full_page": True,
-                        "reason": "no_images_extracted",
-                    },
-                }).execute()
-                count = 1
+                if count == 0 and _settings.enable_tiling_fallback and evidence_url:
+                    log.info("Zero images from %s — inserting screenshot for tiling", page_url)
+                    supabase.table("discovered_images").insert({
+                        "scan_job_id": str(scan_job_id),
+                        "distributor_id": str(distributor_id) if distributor_id else None,
+                        "source_url": page_url,
+                        "image_url": evidence_url,
+                        "source_type": "page_screenshot",
+                        "channel": "website",
+                        "metadata": {
+                            "capture_method": "playwright_fallback",
+                            "full_page": True,
+                            "reason": "no_images_extracted",
+                        },
+                    }).execute()
+                    count = 1
 
-            total_discovered += count
-            pipeline_stats["pages_scanned"] += 1
+                total_discovered += count
+                pipeline_stats["pages_scanned"] += 1
 
-            if can_early_stop and count > 0:
-                page_images = supabase.table("discovered_images")\
-                    .select("*")\
-                    .eq("scan_job_id", str(scan_job_id))\
-                    .eq("source_url", page_url)\
-                    .eq("is_processed", False)\
-                    .execute()
+                if can_early_stop and count > 0:
+                    page_images = supabase.table("discovered_images")\
+                        .select("*")\
+                        .eq("scan_job_id", str(scan_job_id))\
+                        .eq("source_url", page_url)\
+                        .eq("is_processed", False)\
+                        .execute()
 
-                for image in (page_images.data or []):
-                    pipeline_stats["total_images"] += 1
-                    log.info("[Page %d/%d] Analyzing image %s",
-                             page_idx + 1, total_pages, image["id"])
-                    asset_id = await _analyze_single_image(
-                        image, campaign_assets, brand_rules,
-                        org_id, str(scan_job_id),
-                        asset_hashes, asset_embeddings, pipeline_stats,
-                    )
-                    if asset_id:
-                        matched_asset_ids.add(asset_id)
+                    for image in (page_images.data or []):
+                        pipeline_stats["total_images"] += 1
+                        log.info("[Page %d/%d] Analyzing image %s",
+                                 overall_idx + 1, total_pages, image["id"])
+                        asset_id = await _analyze_single_image(
+                            image, campaign_assets, brand_rules,
+                            org_id, str(scan_job_id),
+                            asset_hashes, asset_embeddings, pipeline_stats,
+                        )
+                        if asset_id:
+                            matched_asset_ids.add(asset_id)
+                            page_match_tracker.setdefault(page_url, set()).add(asset_id)
 
-                if all_asset_ids and matched_asset_ids >= all_asset_ids:
-                    remaining = total_pages - (page_idx + 1)
-                    pipeline_stats["early_stopped"] = True
-                    pipeline_stats["pages_skipped"] = remaining
-                    log.info(
-                        "EARLY STOP: All %d assets matched after %d/%d pages (%d skipped)",
-                        len(all_asset_ids), page_idx + 1, total_pages, remaining,
-                    )
-                    early_stopped = True
-                    break
+                    if all_asset_ids and matched_asset_ids >= all_asset_ids:
+                        remaining = len(remaining_to_scan) - (page_idx + 1)
+                        pipeline_stats["early_stopped"] = True
+                        pipeline_stats["pages_skipped"] = remaining
+                        log.info(
+                            "EARLY STOP: All %d assets matched after %d/%d pages (%d skipped)",
+                            len(all_asset_ids), overall_idx + 1, total_pages, remaining,
+                        )
+                        early_stopped = True
+                        break
 
         if not can_early_stop and campaign_id and total_discovered > 0:
             log.info("Starting batch analysis for campaign %s", campaign_id)
@@ -634,13 +744,25 @@ async def run_website_scan(
         cache_stats = ai_service.get_image_cache_stats()
         pipeline_stats["image_cache"] = cache_stats
 
+        # ---- Update page hit cache ----
+        if org_id and page_match_tracker:
+            for page_url, asset_ids in page_match_tracker.items():
+                dist_id = extraction_service._match_distributor_by_domain(
+                    page_url, distributor_mapping)
+                if dist_id:
+                    page_cache_service.record_page_hits(
+                        org_id, str(dist_id),
+                        str(campaign_id) if campaign_id else None,
+                        {page_url: asset_ids},
+                    )
+
         log.info(
             "Website scan complete — pages=%d/%d images=%d matches=%d "
-            "(new=%d confirmed=%d) early_stop=%s",
+            "(new=%d confirmed=%d) early_stop=%s cache_hit=%s",
             pipeline_stats["pages_scanned"], total_pages,
             pipeline_stats["total_images"], total_matches,
             pipeline_stats["matched_new"], pipeline_stats["matched_confirmed"],
-            early_stopped,
+            early_stopped, cache_early_stopped,
         )
         log.info("Pipeline funnel: %s", pipeline_stats)
 
@@ -809,11 +931,12 @@ async def list_scan_jobs(
 
 
 @router.get("/{job_id}", response_model=ScanJob)
-async def get_scan_job(job_id: UUID):
+async def get_scan_job(job_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get scan job details."""
     result = supabase.table("scan_jobs")\
         .select("*")\
         .eq("id", str(job_id))\
+        .eq("organization_id", str(user.org_id))\
         .single()\
         .execute()
     
@@ -823,8 +946,85 @@ async def get_scan_job(job_id: UUID):
     return result.data
 
 
+@router.post("/{job_id}/retry", response_model=ScanJob)
+async def retry_scan_job(
+    job_id: UUID,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    """Retry a failed scan by creating a new scan job with the same parameters."""
+    old_job = supabase.table("scan_jobs") \
+        .select("*") \
+        .eq("id", str(job_id)) \
+        .single().execute()
+    if not old_job.data:
+        raise HTTPException(404, "Scan job not found")
+    if old_job.data.get("organization_id") != str(user.org_id):
+        raise HTTPException(403, "Not your scan")
+    if old_job.data["status"] != "failed":
+        raise HTTPException(400, "Only failed scans can be retried")
+
+    source = old_job.data["source"]
+    campaign_id = old_job.data.get("campaign_id")
+
+    check_channel_allowed(op, source)
+    check_scan_quota(op)
+    check_concurrent_scans(op)
+
+    from ..tasks import (
+        run_google_ads_scan_task, run_facebook_scan_task,
+        run_instagram_scan_task, run_website_scan_task,
+    )
+
+    new_job = supabase.table("scan_jobs").insert({
+        "organization_id": str(user.org_id),
+        "campaign_id": campaign_id,
+        "source": source,
+        "status": "pending",
+    }).execute()
+    new_id = new_job.data[0]["id"]
+
+    distributors = supabase.table("distributors") \
+        .select("*") \
+        .eq("organization_id", str(user.org_id)) \
+        .eq("status", "active").execute()
+    dist_list = distributors.data
+
+    campaign_id_str = campaign_id if campaign_id else None
+
+    if source == "google_ads":
+        names = [d.get("google_ads_advertiser_id") or d["name"] for d in dist_list]
+        mapping = {(d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"] for d in dist_list}
+        run_google_ads_scan_task.delay(names, new_id, mapping, campaign_id_str)
+    elif source == "instagram":
+        urls = [d["instagram_url"] for d in dist_list if d.get("instagram_url")]
+        mapping = {}
+        for d in dist_list:
+            ig_url = d.get("instagram_url")
+            if ig_url:
+                username = apify_instagram_service._extract_username(ig_url)
+                if username:
+                    mapping[username.lower()] = d["id"]
+                mapping[d["name"].lower()] = d["id"]
+        run_instagram_scan_task.delay(urls, new_id, mapping, campaign_id_str)
+    elif source == "facebook":
+        urls = [d["facebook_url"] for d in dist_list if d.get("facebook_url")]
+        mapping = {d["name"].lower(): d["id"] for d in dist_list}
+        run_facebook_scan_task.delay(urls, new_id, mapping, campaign_id_str, "facebook")
+    elif source == "website":
+        urls = [d["website_url"] for d in dist_list if d.get("website_url")]
+        mapping = {
+            d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: d["id"]
+            for d in dist_list if d.get("website_url")
+        }
+        run_website_scan_task.delay(urls, new_id, mapping, campaign_id_str)
+
+    log.info("Retried scan %s → new scan %s (source=%s)", job_id, new_id, source)
+    return new_job.data[0]
+
+
 @router.delete("/{job_id}")
-async def delete_scan_job(job_id: UUID):
+async def delete_scan_job(job_id: UUID, user: AuthUser = Depends(get_current_user)):
     """
     Delete a scan job and all its associated data.
     
@@ -832,7 +1032,15 @@ async def delete_scan_job(job_id: UUID):
     - discovered_images (via ON DELETE CASCADE)
     - matches linked to those discovered images (via ON DELETE CASCADE)
     """
-    # First delete matches that reference discovered images from this scan
+    job = supabase.table("scan_jobs")\
+        .select("id")\
+        .eq("id", str(job_id))\
+        .eq("organization_id", str(user.org_id))\
+        .maybe_single()\
+        .execute()
+    if not job.data:
+        raise HTTPException(status_code=404, detail="Scan job not found")
+
     discovered = supabase.table("discovered_images")\
         .select("id")\
         .eq("scan_job_id", str(job_id))\
@@ -845,8 +1053,7 @@ async def delete_scan_job(job_id: UUID):
             .in_("discovered_image_id", discovered_ids)\
             .execute()
     
-    # Delete the scan job (discovered_images cascade automatically)
-    result = supabase.table("scan_jobs")\
+    supabase.table("scan_jobs")\
         .delete()\
         .eq("id", str(job_id))\
         .execute()
@@ -855,35 +1062,47 @@ async def delete_scan_job(job_id: UUID):
 
 
 @router.delete("")
-async def delete_all_scans():
+async def delete_all_scans(user: AuthUser = Depends(get_current_user)):
     """
-    Delete all scan jobs and associated data. Use with caution - for testing purposes.
+    Delete all scan jobs and associated data for the current org.
     Only available when ENABLE_DANGEROUS_ENDPOINTS=true.
     """
     from ..config import get_settings
     if not get_settings().enable_dangerous_endpoints:
         raise HTTPException(status_code=403, detail="Bulk delete is disabled in this environment")
-    # First delete all matches that reference discovered images
-    supabase.table("matches")\
-        .delete()\
-        .neq("discovered_image_id", "00000000-0000-0000-0000-000000000000")\
+
+    org_jobs = supabase.table("scan_jobs")\
+        .select("id")\
+        .eq("organization_id", str(user.org_id))\
         .execute()
-    
-    # Delete all scan jobs (discovered_images cascade automatically)
-    result = supabase.table("scan_jobs")\
-        .delete()\
-        .neq("id", "00000000-0000-0000-0000-000000000000")\
+    job_ids = [j["id"] for j in (org_jobs.data or [])]
+    if not job_ids:
+        return {"status": "deleted", "count": 0}
+
+    discovered = supabase.table("discovered_images")\
+        .select("id")\
+        .in_("scan_job_id", job_ids)\
         .execute()
-    
-    deleted_count = len(result.data) if result.data else 0
-    
-    return {"status": "deleted", "count": deleted_count}
+    if discovered.data:
+        discovered_ids = [d["id"] for d in discovered.data]
+        supabase.table("matches")\
+            .delete()\
+            .in_("discovered_image_id", discovered_ids)\
+            .execute()
+
+    supabase.table("scan_jobs")\
+        .delete()\
+        .eq("organization_id", str(user.org_id))\
+        .execute()
+
+    return {"status": "deleted", "count": len(job_ids)}
 
 
 @router.post("/{job_id}/analyze")
 async def analyze_discovered_images(
     job_id: UUID,
-    campaign_id: Optional[UUID] = None
+    campaign_id: Optional[UUID] = None,
+    user: AuthUser = Depends(get_current_user),
 ):
     """
     Analyze discovered images from a completed scan.
@@ -894,6 +1113,7 @@ async def analyze_discovered_images(
     job = supabase.table("scan_jobs")\
         .select("*")\
         .eq("id", str(job_id))\
+        .eq("organization_id", str(user.org_id))\
         .single()\
         .execute()
     
@@ -1000,6 +1220,105 @@ async def run_image_analysis(
         }).eq("id", str(job_id)).execute()
 
 
+@router.post("/batch")
+@limiter.limit("2/minute")
+async def batch_scan(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    """Scan all dealers across all allowed channels. Pro and Business plans only."""
+    if op.plan not in ("professional", "business", "enterprise"):
+        raise HTTPException(
+            403,
+            "Batch scanning is available on Pro and Business plans. "
+            "Upgrade to unlock this feature.",
+        )
+
+    check_scan_quota(op)
+
+    from ..tasks import (
+        run_google_ads_scan_task, run_facebook_scan_task,
+        run_instagram_scan_task, run_website_scan_task,
+    )
+
+    distributors = supabase.table("distributors") \
+        .select("*") \
+        .eq("organization_id", str(user.org_id)) \
+        .eq("status", "active").execute()
+    dist_list = distributors.data or []
+    if not dist_list:
+        raise HTTPException(400, "No active dealers found. Add dealers first.")
+
+    campaigns_resp = supabase.table("campaigns") \
+        .select("id") \
+        .eq("organization_id", str(user.org_id)) \
+        .eq("status", "active") \
+        .limit(1).execute()
+    campaign_id_str = campaigns_resp.data[0]["id"] if campaigns_resp.data else None
+
+    allowed_channels = op.limits.get("allowed_channels", [])
+    created_jobs = []
+
+    for channel in allowed_channels:
+        # Check concurrent limits before each job
+        active = supabase.table("scan_jobs") \
+            .select("id", count="exact") \
+            .eq("organization_id", str(user.org_id)) \
+            .in_("status", ["pending", "running", "analyzing"]).execute()
+        max_concurrent = op.limits.get("max_concurrent_scans", 1)
+        if (active.count or 0) >= max_concurrent:
+            break
+
+        job = supabase.table("scan_jobs").insert({
+            "organization_id": str(user.org_id),
+            "campaign_id": campaign_id_str,
+            "source": channel,
+            "status": "pending",
+        }).execute()
+        job_id = job.data[0]["id"]
+
+        if channel == "google_ads":
+            names = [d.get("google_ads_advertiser_id") or d["name"] for d in dist_list]
+            mapping = {(d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"] for d in dist_list}
+            run_google_ads_scan_task.delay(names, job_id, mapping, campaign_id_str)
+        elif channel == "instagram":
+            urls = [d["instagram_url"] for d in dist_list if d.get("instagram_url")]
+            mapping = {}
+            for d in dist_list:
+                ig_url = d.get("instagram_url")
+                if ig_url:
+                    username = apify_instagram_service._extract_username(ig_url)
+                    if username:
+                        mapping[username.lower()] = d["id"]
+                    mapping[d["name"].lower()] = d["id"]
+            if urls:
+                run_instagram_scan_task.delay(urls, job_id, mapping, campaign_id_str)
+        elif channel == "facebook":
+            urls = [d["facebook_url"] for d in dist_list if d.get("facebook_url")]
+            mapping = {d["name"].lower(): d["id"] for d in dist_list}
+            if urls:
+                run_facebook_scan_task.delay(urls, job_id, mapping, campaign_id_str, "facebook")
+        elif channel == "website":
+            urls = [d["website_url"] for d in dist_list if d.get("website_url")]
+            mapping = {
+                d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: d["id"]
+                for d in dist_list if d.get("website_url")
+            }
+            if urls:
+                run_website_scan_task.delay(urls, job_id, mapping, campaign_id_str)
+
+        created_jobs.append({"id": job_id, "source": channel})
+
+    log.info("Batch scan started for org %s: %d jobs across %s",
+             user.org_id, len(created_jobs), [j["source"] for j in created_jobs])
+
+    return {
+        "message": f"Batch scan started — {len(created_jobs)} scan(s) queued",
+        "jobs": created_jobs,
+    }
+
+
 @router.post("/quick-scan")
 async def quick_scan(
     source: ScanSource,
@@ -1026,7 +1345,8 @@ async def quick_scan(
 @router.post("/reprocess-unprocessed")
 async def reprocess_unprocessed_images(
     campaign_id: UUID,
-    limit: int = 100
+    limit: int = 100,
+    user: AuthUser = Depends(get_current_user),
 ):
     """
     Reprocess images that were never analyzed.
@@ -1037,6 +1357,7 @@ async def reprocess_unprocessed_images(
     campaign = supabase.table("campaigns")\
         .select("organization_id")\
         .eq("id", str(campaign_id))\
+        .eq("organization_id", str(user.org_id))\
         .single()\
         .execute()
     
@@ -1070,7 +1391,7 @@ async def reprocess_unprocessed_images(
 
 
 @router.get("/debug/{scan_id}")
-async def debug_scan(scan_id: UUID):
+async def debug_scan(scan_id: UUID, user: AuthUser = Depends(get_current_user)):
     """
     Debug endpoint to inspect scan details and identify issues.
     Only available when ENABLE_DANGEROUS_ENDPOINTS=true.
@@ -1078,10 +1399,11 @@ async def debug_scan(scan_id: UUID):
     from ..config import get_settings
     if not get_settings().enable_dangerous_endpoints:
         raise HTTPException(status_code=403, detail="Debug endpoint is disabled in this environment")
-    # Get scan job
+
     job = supabase.table("scan_jobs")\
         .select("*")\
         .eq("id", str(scan_id))\
+        .eq("organization_id", str(user.org_id))\
         .single()\
         .execute()
     

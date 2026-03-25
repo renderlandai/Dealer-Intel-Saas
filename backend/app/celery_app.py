@@ -4,7 +4,10 @@ import ssl
 
 from celery import Celery
 
-redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# REDIS_URL is the canonical env var for both Celery and app config.
+# Pydantic Settings (config.py) reads it case-insensitively as `redis_url`,
+# but Celery is configured before FastAPI boots, so we read the env directly.
+redis_url = os.getenv("REDIS_URL", os.getenv("redis_url", "redis://localhost:6379/0"))
 
 celery_app = Celery("dealer_intel")
 

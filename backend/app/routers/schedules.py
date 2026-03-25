@@ -11,6 +11,10 @@ from pydantic import BaseModel
 from ..auth import AuthUser, get_current_user
 from ..database import supabase
 from ..services import scheduler_service
+from ..plan_enforcement import (
+    OrgPlan, get_org_plan,
+    check_frequency_allowed, check_schedule_limit, check_channel_allowed,
+)
 
 log = logging.getLogger("dealer_intel.schedules")
 router = APIRouter(prefix="/schedules", tags=["schedules"])
@@ -83,7 +87,7 @@ async def list_schedules(campaign_id: Optional[UUID] = None, user: AuthUser = De
 
 
 @router.post("", response_model=ScheduleOut, status_code=201)
-async def create_schedule(body: ScheduleCreate):
+async def create_schedule(body: ScheduleCreate, op: OrgPlan = Depends(get_org_plan)):
     if body.source not in VALID_SOURCES:
         raise HTTPException(400, f"source must be one of {VALID_SOURCES}")
     if body.frequency not in VALID_FREQS:
@@ -91,6 +95,10 @@ async def create_schedule(body: ScheduleCreate):
     _validate_time(body.run_at_time)
     if body.run_on_day is not None and not (0 <= body.run_on_day <= 6):
         raise HTTPException(400, "run_on_day must be 0 (Mon) – 6 (Sun)")
+
+    check_channel_allowed(op, body.source)
+    check_frequency_allowed(op, body.frequency)
+    check_schedule_limit(op, str(body.campaign_id))
 
     campaign = (
         supabase.table("campaigns")

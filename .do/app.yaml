@@ -22,6 +22,13 @@ services:
       success_threshold: 1
       failure_threshold: 5
     envs:
+      - key: REDIS_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SCHEDULER_ENABLED
+        scope: RUN_TIME
+        value: "true"
       - key: SUPABASE_URL
         scope: RUN_TIME
         type: SECRET
@@ -74,10 +81,105 @@ services:
         value: "false"
       - key: CORS_ORIGINS
         scope: RUN_TIME
-        value: "https://dealer-intel.vercel.app"
+        value: "https://dealer-intel-saas.vercel.app"
       - key: WEB_CONCURRENCY
         scope: RUN_TIME
         value: "2"
+      - key: LOG_LEVEL
+        scope: RUN_TIME
+        value: "info"
+      - key: STRIPE_SECRET_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: STRIPE_WEBHOOK_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: STRIPE_PRICE_STARTER
+        scope: RUN_TIME
+        value: "price_1TErtI0COvcjk66W1oAcOUrw"
+      - key: STRIPE_PRICE_PROFESSIONAL
+        scope: RUN_TIME
+        value: "price_1TEruD0COvcjk66WpBy5vYSR"
+      - key: STRIPE_PRICE_BUSINESS
+        scope: RUN_TIME
+        value: "price_1TErv10COvcjk66WcBviXnsQ"
+      - key: STRIPE_PRICE_EXTRA_DEALER_STARTER
+        scope: RUN_TIME
+        value: "price_1TEsl00COvcjk66WpdvZc0ky"
+      - key: STRIPE_PRICE_EXTRA_DEALER_PROFESSIONAL
+        scope: RUN_TIME
+        value: "price_1TEslk0COvcjk66WuOiRqVnV"
+      - key: STRIPE_PRICE_EXTRA_DEALER_BUSINESS
+        scope: RUN_TIME
+        value: "price_1TEsm50COvcjk66WtqMsasSp"
+      - key: FRONTEND_URL
+        scope: RUN_TIME
+        value: "https://dealer-intel-saas.vercel.app"
+workers:
+  - name: worker
+    github:
+      repo: renderlandai/Dealer-Intel-Saas
+      branch: main
+      deploy_on_push: true
+    source_dir: backend
+    dockerfile_path: Dockerfile
+    instance_count: 1
+    instance_size_slug: professional-xs
+    run_command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+    envs:
+      - key: REDIS_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SUPABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SUPABASE_ANON_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SUPABASE_JWT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: ANTHROPIC_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SCREENSHOTONE_ACCESS_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SCREENSHOTONE_SECRET_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SERPAPI_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: APIFY_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: RESEND_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SENTRY_DSN
+        scope: RUN_TIME
+        type: SECRET
+        value: ""
+      - key: DEBUG
+        scope: RUN_TIME
+        value: "false"
       - key: LOG_LEVEL
         scope: RUN_TIME
         value: "info"

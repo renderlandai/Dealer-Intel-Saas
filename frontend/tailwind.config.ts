@@ -55,8 +55,8 @@ const config: Config = {
         sharp: "2px",
       },
       fontFamily: {
-        sans: ["Sora", "system-ui", "sans-serif"],
-        mono: ["JetBrains Mono", "monospace"],
+        sans: ["Geist", "system-ui", "sans-serif"],
+        mono: ["Geist Mono", "monospace"],
       },
       fontSize: {
         "2xs": ["0.625rem", { lineHeight: "1rem" }],

@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Sora:wght@300;400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -54,7 +54,7 @@
 
   body {
     @apply bg-background text-foreground;
-    font-family: 'Sora', system-ui, sans-serif;
+    font-family: 'Geist', system-ui, sans-serif;
     font-feature-settings: "ss01" 1, "cv01" 1;
     letter-spacing: -0.01em;
   }
@@ -67,7 +67,7 @@
 
   /* Monospace for data/numbers */
   .font-mono {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: 'Geist Mono', monospace;
   }
 }
 
