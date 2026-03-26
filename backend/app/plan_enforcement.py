@@ -177,16 +177,30 @@ def check_scan_quota(op: OrgPlan) -> None:
 
 
 def check_concurrent_scans(op: OrgPlan) -> None:
-    """Raise 429 if too many scans are already running."""
+    """Raise 429 if too many scans are already running.
+
+    Only counts 'pending' scans from the last 5 minutes to avoid stale
+    pending scans permanently blocking the concurrent slot.
+    """
+    from datetime import timedelta
+
     max_concurrent = op.limits.get("max_concurrent_scans")
     if max_concurrent is None:
         return
 
-    count = supabase.table("scan_jobs") \
+    running = supabase.table("scan_jobs") \
         .select("id", count="exact") \
         .eq("organization_id", str(op.org_id)) \
-        .in_("status", ["pending", "running", "analyzing"]).execute()
-    current = count.count or 0
+        .in_("status", ["running", "analyzing"]).execute()
+
+    pending_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    pending = supabase.table("scan_jobs") \
+        .select("id", count="exact") \
+        .eq("organization_id", str(op.org_id)) \
+        .eq("status", "pending") \
+        .gte("created_at", pending_cutoff).execute()
+
+    current = (running.count or 0) + (pending.count or 0)
 
     if current >= max_concurrent:
         raise HTTPException(

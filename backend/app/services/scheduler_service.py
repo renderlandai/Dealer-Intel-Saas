@@ -146,11 +146,13 @@ async def _trigger_scan(schedule_id: str) -> None:
             run_facebook_scan_task,
             run_instagram_scan_task,
             run_website_scan_task,
+            dispatch_task,
         )
         from ..services import apify_instagram_service
 
         cid_str = campaign_id
         job_id_str = str(scan_job_id)
+        dispatched = False
 
         if source == "google_ads":
             names = [d.get("google_ads_advertiser_id") or d["name"] for d in dist_list]
@@ -158,7 +160,7 @@ async def _trigger_scan(schedule_id: str) -> None:
                 (d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"]
                 for d in dist_list
             }
-            run_google_ads_scan_task.delay(names, job_id_str, mapping, cid_str)
+            dispatched = dispatch_task(run_google_ads_scan_task, [names, job_id_str, mapping, cid_str], job_id_str, "google_ads")
 
         elif source == "instagram":
             urls = [d["instagram_url"] for d in dist_list if d.get("instagram_url")]
@@ -170,12 +172,12 @@ async def _trigger_scan(schedule_id: str) -> None:
                     if username:
                         mapping[username.lower()] = d["id"]
                     mapping[d["name"].lower()] = d["id"]
-            run_instagram_scan_task.delay(urls, job_id_str, mapping, cid_str)
+            dispatched = dispatch_task(run_instagram_scan_task, [urls, job_id_str, mapping, cid_str], job_id_str, "instagram")
 
         elif source == "facebook":
             urls = [d["facebook_url"] for d in dist_list if d.get("facebook_url")]
             mapping = {d["name"].lower(): d["id"] for d in dist_list}
-            run_facebook_scan_task.delay(urls, job_id_str, mapping, cid_str, "facebook")
+            dispatched = dispatch_task(run_facebook_scan_task, [urls, job_id_str, mapping, cid_str, "facebook"], job_id_str, "facebook")
 
         elif source == "website":
             urls = [d["website_url"] for d in dist_list if d.get("website_url")]
@@ -184,7 +186,12 @@ async def _trigger_scan(schedule_id: str) -> None:
                 for d in dist_list
                 if d.get("website_url")
             }
-            run_website_scan_task.delay(urls, job_id_str, mapping, cid_str)
+            dispatched = dispatch_task(run_website_scan_task, [urls, job_id_str, mapping, cid_str], job_id_str, "website")
+
+        if not dispatched:
+            log.error("Scheduled scan %s: task dispatch failed, job %s left as failed", schedule_id, job_id_str)
+            _update_schedule_timestamps(sched)
+            return
 
         supabase.table("scan_jobs").update({
             "status": "running",
@@ -273,6 +280,29 @@ def upsert_job(schedule: dict) -> None:
     _register_job(schedule)
 
 
+async def _cleanup_stale_scans() -> None:
+    """Auto-fail scans stuck in 'pending' for more than 5 minutes."""
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        stale = supabase.table("scan_jobs") \
+            .select("id") \
+            .eq("status", "pending") \
+            .lt("created_at", cutoff) \
+            .execute()
+
+        for job in (stale.data or []):
+            supabase.table("scan_jobs").update({
+                "status": "failed",
+                "error_message": "Scan timed out in pending state — task was not picked up by worker",
+            }).eq("id", job["id"]).execute()
+            log.warning("Auto-failed stale pending scan: %s", job["id"])
+
+        if stale.data:
+            log.info("Cleaned up %d stale pending scan(s)", len(stale.data))
+    except Exception:
+        log.exception("Error cleaning up stale scans")
+
+
 async def _run_retention() -> None:
     """Wrapper for the daily data retention sweep."""
     from .retention_service import run_retention_sweep
@@ -293,6 +323,15 @@ async def start() -> None:
     _scheduler = AsyncIOScheduler(timezone="UTC")
     _scheduler.start()
     log.info("APScheduler started")
+
+    # Auto-fail scans stuck in pending for too long (every 5 minutes)
+    _scheduler.add_job(
+        _cleanup_stale_scans,
+        trigger=CronTrigger(minute="*/5", timezone="UTC"),
+        id="stale_scan_cleanup",
+        replace_existing=True,
+    )
+    log.info("Stale scan cleanup scheduled every 5 minutes")
 
     # Daily data retention sweep at 03:00 UTC
     _scheduler.add_job(

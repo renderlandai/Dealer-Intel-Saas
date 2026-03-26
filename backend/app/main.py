@@ -122,7 +122,10 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check — verifies database and Redis connectivity."""
+    """Health check — verifies database and Celery broker connectivity."""
+    import re
+    import redis as redis_lib
+
     checks = {"database": "unknown", "redis": "unknown"}
     healthy = True
 
@@ -136,14 +139,22 @@ async def health_check():
         log.warning("Health check: database unreachable — %s", e)
 
     try:
-        import redis as redis_lib
-        r = redis_lib.from_url(settings.redis_url, socket_connect_timeout=3)
+        from .celery_app import celery_app
+        broker_url = str(celery_app.conf.broker_url)
+        masked = re.sub(r"://[^:]*:[^@]*@", "://***:***@", broker_url) if "@" in broker_url else broker_url
+
+        r = redis_lib.from_url(broker_url, socket_connect_timeout=3)
         r.ping()
+        queue_depth = r.llen("celery") or 0
+        r.close()
+
         checks["redis"] = "connected"
+        checks["celery_broker_url"] = masked
+        checks["task_queue_depth"] = queue_depth
     except Exception as e:
         checks["redis"] = f"error: {type(e).__name__}"
         healthy = False
-        log.warning("Health check: Redis unreachable — %s", e)
+        log.warning("Health check: Celery broker unreachable — %s", e)
 
     status_code = 200 if healthy else 503
     return JSONResponse(

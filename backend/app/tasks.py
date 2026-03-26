@@ -1,7 +1,7 @@
 """Celery task definitions wrapping async scan pipelines."""
 import asyncio
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 from uuid import UUID
 
 from .celery_app import celery_app
@@ -33,6 +33,24 @@ def _mark_job_failed(scan_job_id: str, error: str) -> None:
         }).eq("id", scan_job_id).execute()
     except Exception as db_err:
         log.error("Could not mark scan job %s as failed: %s", scan_job_id, db_err)
+
+
+def dispatch_task(task: Any, args: Sequence, scan_job_id: str, source: str) -> Optional[str]:
+    """Dispatch a Celery task with error handling.
+
+    Returns the Celery task ID on success, None on failure.
+    On failure the scan job is marked as 'failed' in the database so it
+    doesn't permanently block the concurrent-scan slot.
+    """
+    try:
+        result = task.delay(*args)
+        log.info("Task dispatched: source=%s job=%s celery_task_id=%s", source, scan_job_id, result.id)
+        return result.id
+    except Exception as e:
+        log.error("DISPATCH FAILED: source=%s job=%s broker=%s error=%s",
+                  source, scan_job_id, celery_app.conf.broker_url, e, exc_info=True)
+        _mark_job_failed(scan_job_id, f"Task dispatch failed: {e}")
+        return None
 
 
 @celery_app.task(bind=True, max_retries=2, default_retry_delay=60)

@@ -20,6 +20,8 @@ from ..plan_enforcement import (
 
 log = logging.getLogger("dealer_intel.campaigns")
 
+log = logging.getLogger("dealer_intel.campaigns")
+
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
 
@@ -281,6 +283,7 @@ async def start_campaign_scan(
     from ..tasks import (
         run_google_ads_scan_task, run_facebook_scan_task,
         run_instagram_scan_task, run_website_scan_task,
+        dispatch_task,
     )
     from ..services import apify_instagram_service
 
@@ -330,6 +333,7 @@ async def start_campaign_scan(
         return scan_job
     
     campaign_id_str = str(campaign_id)
+    dispatched = False
     
     if source == ScanSource.GOOGLE_ADS:
         names = [d.get("google_ads_advertiser_id") or d["name"] for d in distributor_list]
@@ -337,7 +341,8 @@ async def start_campaign_scan(
             (d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"]
             for d in distributor_list
         }
-        run_google_ads_scan_task.delay(names, scan_job_id, mapping, campaign_id_str)
+        log.info("Starting Google Ads scan for %d advertisers, job=%s", len(names), scan_job_id)
+        dispatched = dispatch_task(run_google_ads_scan_task, [names, scan_job_id, mapping, campaign_id_str], scan_job_id, "google_ads")
 
     elif source == ScanSource.INSTAGRAM:
         urls = [d["instagram_url"] for d in distributor_list if d.get("instagram_url")]
@@ -349,12 +354,14 @@ async def start_campaign_scan(
                 if username:
                     mapping[username.lower()] = d["id"]
                 mapping[d["name"].lower()] = d["id"]
-        run_instagram_scan_task.delay(urls, scan_job_id, mapping, campaign_id_str)
+        log.info("Starting Instagram scan for %d profiles, job=%s", len(urls), scan_job_id)
+        dispatched = dispatch_task(run_instagram_scan_task, [urls, scan_job_id, mapping, campaign_id_str], scan_job_id, "instagram")
 
     elif source == ScanSource.FACEBOOK:
         urls = [d["facebook_url"] for d in distributor_list if d.get("facebook_url")]
         mapping = {d["name"].lower(): d["id"] for d in distributor_list}
-        run_facebook_scan_task.delay(urls, scan_job_id, mapping, campaign_id_str, "facebook")
+        log.info("Starting Facebook scan for %d pages, job=%s", len(urls), scan_job_id)
+        dispatched = dispatch_task(run_facebook_scan_task, [urls, scan_job_id, mapping, campaign_id_str, "facebook"], scan_job_id, "facebook")
         
     elif source == ScanSource.WEBSITE:
         urls = [d["website_url"] for d in distributor_list if d.get("website_url")]
@@ -362,7 +369,11 @@ async def start_campaign_scan(
             d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: d["id"]
             for d in distributor_list if d.get("website_url")
         }
-        run_website_scan_task.delay(urls, scan_job_id, mapping, campaign_id_str)
+        log.info("Starting website scan for %d URLs, job=%s: %s", len(urls), scan_job_id, urls)
+        dispatched = dispatch_task(run_website_scan_task, [urls, scan_job_id, mapping, campaign_id_str], scan_job_id, "website")
+
+    if not dispatched:
+        raise HTTPException(status_code=503, detail="Failed to queue scan task — the background worker may be unavailable. Please try again.")
     
     return scan_job
 
