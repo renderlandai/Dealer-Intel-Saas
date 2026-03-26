@@ -22,7 +22,10 @@ from reportlab.platypus import (
     Spacer,
     HRFlowable,
     Image as RLImage,
+    Flowable,
 )
+from reportlab.graphics.shapes import Drawing, Rect, Polygon
+from reportlab.graphics import renderPDF
 
 from ..config import get_settings
 from ..database import supabase
@@ -76,16 +79,38 @@ def _resolve_brand_color(organization_id: Optional[UUID] = None) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _org_distributor_ids(org_id: str) -> List[str]:
+    """Return all distributor IDs belonging to an organization."""
+    result = supabase.table("distributors") \
+        .select("id") \
+        .eq("organization_id", org_id) \
+        .execute()
+    return [d["id"] for d in (result.data or [])]
+
+
 def _fetch_report_data(
     *,
     days: int = 30,
     campaign_id: Optional[UUID] = None,
     distributor_id: Optional[UUID] = None,
+    organization_id: Optional[UUID] = None,
 ) -> Dict[str, Any]:
     """Pull matches, stats, and trend data for report generation."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
 
     q = supabase.table("recent_matches").select("*").gte("created_at", cutoff)
+
+    if organization_id:
+        dist_ids = _org_distributor_ids(str(organization_id))
+        if not dist_ids:
+            return {
+                "matches": [], "total": 0, "compliant": 0, "violations": 0,
+                "pending": 0, "compliance_rate": 0.0, "channel_counts": {},
+                "distributor_counts": {}, "daily_stats": {},
+                "scope_label": "Full Organization", "days": days,
+            }
+        q = q.in_("distributor_id", dist_ids)
+
     if campaign_id:
         q = q.eq("campaign_id", str(campaign_id))
     if distributor_id:
@@ -180,7 +205,7 @@ def generate_csv(
     organization_id: Optional[UUID] = None,
 ) -> bytes:
     """Return CSV bytes for the compliance report."""
-    data = _fetch_report_data(days=days, campaign_id=campaign_id, distributor_id=distributor_id)
+    data = _fetch_report_data(days=days, campaign_id=campaign_id, distributor_id=distributor_id, organization_id=organization_id)
     buf = io.StringIO()
     writer = csv.writer(buf)
 
@@ -344,6 +369,37 @@ def _resolve_logo(organization_id: Optional[UUID] = None) -> Optional[str]:
     return None
 
 
+_AMBER_BRAND = colors.HexColor("#e5a125")
+
+
+class _LogoIcon(Flowable):
+    """Render the Dealer Intel lightning-bolt icon as a vector flowable."""
+
+    def __init__(self, size: float = 20):
+        super().__init__()
+        self.size = size
+        self.width = size
+        self.height = size
+
+    def draw(self):
+        s = self.size
+        c = self.canv
+        c.setFillColor(_AMBER_BRAND)
+        r = s * 0.15
+        c.roundRect(0, 0, s, s, r, fill=1, stroke=0)
+        c.setFillColor(colors.white)
+        cx, cy = s * 0.5, s * 0.5
+        bolt = c.beginPath()
+        bolt.moveTo(cx + s * 0.05, cy + s * 0.38)
+        bolt.lineTo(cx - s * 0.12, cy + s * 0.02)
+        bolt.lineTo(cx + s * 0.02, cy + s * 0.02)
+        bolt.lineTo(cx - s * 0.05, cy - s * 0.38)
+        bolt.lineTo(cx + s * 0.12, cy - s * 0.02)
+        bolt.lineTo(cx - s * 0.02, cy - s * 0.02)
+        bolt.close()
+        c.drawPath(bolt, fill=1, stroke=0)
+
+
 def _build_header(
     elements: List,
     doc,
@@ -352,37 +408,68 @@ def _build_header(
     pal: dict,
     organization_id: Optional[UUID] = None,
 ) -> None:
-    """Render the side-by-side logo + title header row."""
-    logo_path = _resolve_logo(organization_id)
+    """Render the branded logo + title header row."""
     subtitle_text = (
         f"{data['scope_label']}  &bull;  Last {data['days']} days  &bull;  "
         f"Generated {datetime.now(timezone.utc).strftime('%b %d, %Y %H:%M UTC')}"
     )
 
-    title_block = [
-        Paragraph("Compliance Report", st["title"]),
-        Paragraph(subtitle_text, st["subtitle"]),
-    ]
+    # Compact brand lockup: icon + "DI | DEALER INTEL" inline
+    brand_style = ParagraphStyle(
+        "BrandInline", parent=st["body"],
+        fontSize=8, leading=10, spaceAfter=0, spaceBefore=0,
+        textColor=colors.HexColor("#1e293b"),
+    )
+    brand_sub = ParagraphStyle(
+        "BrandTagline", parent=st["body"],
+        fontSize=5.5, leading=7, spaceAfter=0, spaceBefore=0,
+        textColor=_GRAY,
+    )
 
-    if logo_path:
-        logo = RLImage(logo_path, width=1.4 * inch, height=0.35 * inch)
-        logo.hAlign = "LEFT"
-        header_table = Table(
-            [[[logo], title_block]],
-            colWidths=[1.6 * inch, doc.width - 1.6 * inch],
-        )
-        header_table.setStyle(TableStyle([
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 0),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-            ("TOPPADDING", (0, 0), (-1, -1), 0),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
-        ]))
-        elements.append(header_table)
-    else:
-        elements.extend(title_block)
+    title_center_style = ParagraphStyle(
+        "TitleCenter", parent=st["title"],
+        alignment=1, spaceAfter=4, spaceBefore=0, leading=26,
+    )
+    subtitle_center_style = ParagraphStyle(
+        "SubtitleCenter", parent=st["subtitle"],
+        alignment=1, fontSize=9, spaceAfter=0, spaceBefore=2,
+    )
 
-    elements.append(HRFlowable(width="100%", color=pal["brand"], thickness=1.5, spaceAfter=12))
+    # Small icon + brand text as a tight lockup on the left
+    brand_lockup = Table(
+        [[_LogoIcon(20), [
+            Paragraph("<b>DEALER INTEL</b>", brand_style),
+            Paragraph("ASSET INTELLIGENCE", brand_sub),
+        ]]],
+        colWidths=[24, 90],
+    )
+    brand_lockup.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+
+    # Full-width header: brand-left | title center | empty right (mirror for balance)
+    brand_w = 1.6 * inch
+    header_table = Table(
+        [[brand_lockup,
+          [Paragraph("Compliance Report", title_center_style),
+           Paragraph(subtitle_text, subtitle_center_style)],
+          ""]],
+        colWidths=[brand_w, doc.width - 2 * brand_w, brand_w],
+    )
+    header_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+    ]))
+    elements.append(header_table)
+
+    elements.append(HRFlowable(width="100%", color=pal["brand"], thickness=1, spaceAfter=14))
 
 
 def generate_pdf(
@@ -393,7 +480,7 @@ def generate_pdf(
     organization_id: Optional[UUID] = None,
 ) -> bytes:
     """Return PDF bytes for the compliance report."""
-    data = _fetch_report_data(days=days, campaign_id=campaign_id, distributor_id=distributor_id)
+    data = _fetch_report_data(days=days, campaign_id=campaign_id, distributor_id=distributor_id, organization_id=organization_id)
     brand_hex = _resolve_brand_color(organization_id)
     pal = _derive_palette(brand_hex)
     st = _styles(pal)
@@ -526,7 +613,7 @@ def generate_pdf(
                 Paragraph(discovered, st["body"]),
             ])
         col_w = doc.width
-        v_table = Table(v_rows, colWidths=[col_w * 0.18, col_w * 0.17, col_w * 0.12, col_w * 0.1, col_w * 0.28, col_w * 0.15])
+        v_table = Table(v_rows, colWidths=[col_w * 0.17, col_w * 0.16, col_w * 0.12, col_w * 0.14, col_w * 0.26, col_w * 0.15])
         v_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), _RED),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -575,7 +662,7 @@ def generate_pdf(
         ])
     col_w = doc.width
     a_table = Table(a_rows, colWidths=[
-        col_w * 0.18, col_w * 0.17, col_w * 0.12, col_w * 0.11, col_w * 0.1, col_w * 0.12, col_w * 0.2
+        col_w * 0.17, col_w * 0.16, col_w * 0.11, col_w * 0.14, col_w * 0.1, col_w * 0.12, col_w * 0.2
     ])
     a_table.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), pal["brand"]),
