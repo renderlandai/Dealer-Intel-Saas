@@ -1,10 +1,8 @@
 """Celery task definitions wrapping async scan pipelines."""
 import asyncio
-import base64
 import json
 import logging
 import os
-import ssl as ssl_lib
 import uuid as uuid_mod
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import UUID
@@ -24,8 +22,9 @@ _redis_publisher: Optional[redis_lib.Redis] = None
 def _get_redis_publisher() -> redis_lib.Redis:
     """Return a Redis client connected to the Celery broker.
 
-    Uses redis-py directly (proven reliable via /health) instead of
-    kombu's transport layer which silently drops messages over rediss://.
+    Uses redis-py directly (same connection style as /health endpoint)
+    instead of kombu's transport which has connection-recovery bugs
+    over rediss:// (see celery/celery#10205, celery/kombu#2007).
     """
     global _redis_publisher
     if _redis_publisher is not None:
@@ -36,15 +35,12 @@ def _get_redis_publisher() -> redis_lib.Redis:
             _redis_publisher = None
 
     broker_url = str(celery_app.conf.broker_url)
-    kwargs: Dict[str, Any] = {
-        "socket_connect_timeout": 10,
-        "socket_timeout": 10,
-        "retry_on_timeout": True,
-    }
-    if broker_url.startswith("rediss://"):
-        kwargs["ssl_cert_reqs"] = ssl_lib.CERT_NONE
-
-    _redis_publisher = redis_lib.from_url(broker_url, **kwargs)
+    _redis_publisher = redis_lib.from_url(
+        broker_url,
+        socket_connect_timeout=10,
+        socket_timeout=10,
+        retry_on_timeout=True,
+    )
     _redis_publisher.ping()
     log.info("Redis publisher connected to broker")
     return _redis_publisher
@@ -83,9 +79,11 @@ def _mark_job_failed(scan_job_id: str, error: str) -> None:
 def dispatch_task(task: Any, args: Sequence, scan_job_id: str, source: str) -> Optional[str]:
     """Publish a Celery task directly to Redis, bypassing kombu.
 
-    kombu's Redis+SSL transport silently drops messages in some environments.
-    This function builds a Celery-compatible message and LPUSHes it to the
-    ``celery`` queue using redis-py, which we've proven works via /health.
+    kombu's Redis transport has known connection-recovery bugs that cause
+    workers to silently stop consuming after SSL connection resets
+    (celery/celery#10205).  This function builds a Celery-compatible
+    message (matching kombu's default utf-8 body encoding) and LPUSHes
+    it to the ``celery`` queue using redis-py.
 
     Returns the task ID on success, None on failure.
     """
@@ -96,10 +94,9 @@ def dispatch_task(task: Any, args: Sequence, scan_job_id: str, source: str) -> O
             list(args), {},
             {"callbacks": None, "errbacks": None, "chain": None, "chord": None},
         ])
-        body_b64 = base64.b64encode(body_raw.encode("utf-8")).decode("utf-8")
 
         message = json.dumps({
-            "body": body_b64,
+            "body": body_raw,
             "content-encoding": "utf-8",
             "content-type": "application/json",
             "headers": {
@@ -129,7 +126,7 @@ def dispatch_task(task: Any, args: Sequence, scan_job_id: str, source: str) -> O
                 "delivery_mode": 2,
                 "delivery_info": {"exchange": "", "routing_key": "celery"},
                 "priority": 0,
-                "body_encoding": "base64",
+                "body_encoding": "utf-8",
                 "delivery_tag": str(uuid_mod.uuid4()),
             },
         })

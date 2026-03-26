@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import os
-import ssl as ssl_lib
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 from uuid import UUID
@@ -288,10 +287,11 @@ def _get_lock_redis() -> redis_lib.Redis:
     """Get a Redis client for scheduler lock operations."""
     from ..celery_app import celery_app
     broker_url = str(celery_app.conf.broker_url)
-    kwargs: Dict = {"socket_connect_timeout": 5, "socket_timeout": 5}
-    if broker_url.startswith("rediss://"):
-        kwargs["ssl_cert_reqs"] = ssl_lib.CERT_NONE
-    return redis_lib.from_url(broker_url, **kwargs)
+    return redis_lib.from_url(
+        broker_url,
+        socket_connect_timeout=5,
+        socket_timeout=5,
+    )
 
 
 async def _renew_scheduler_lock() -> None:

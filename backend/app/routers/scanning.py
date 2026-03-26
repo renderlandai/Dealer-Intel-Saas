@@ -1132,7 +1132,7 @@ async def analyze_discovered_images(
     Analyze discovered images from a completed scan.
     Dispatched to Celery worker for durable execution.
     """
-    from ..tasks import analyze_scan_task
+    from ..tasks import analyze_scan_task, dispatch_task
 
     job = supabase.table("scan_jobs")\
         .select("*")\
@@ -1157,11 +1157,15 @@ async def analyze_discovered_images(
     if image_count == 0:
         return {"message": "No unprocessed images found", "count": 0}
     
-    analyze_scan_task.delay(
+    dispatched = dispatch_task(
+        analyze_scan_task,
+        [str(job_id), str(campaign_id) if campaign_id else None],
         str(job_id),
-        str(campaign_id) if campaign_id else None,
+        "analyze_scan",
     )
-    
+    if not dispatched:
+        raise HTTPException(status_code=503, detail="Failed to queue analysis task")
+
     return {
         "message": "Analysis queued",
         "image_count": image_count,
@@ -1376,7 +1380,7 @@ async def reprocess_unprocessed_images(
     Reprocess images that were never analyzed.
     Dispatched to Celery worker for durable execution.
     """
-    from ..tasks import reprocess_images_task
+    from ..tasks import reprocess_images_task, dispatch_task
 
     campaign = supabase.table("campaigns")\
         .select("organization_id")\
@@ -1415,8 +1419,15 @@ async def reprocess_unprocessed_images(
     if not (assets.count or 0):
         return {"message": "No campaign assets to match against", "count": 0}
     
-    reprocess_images_task.delay(str(campaign_id), limit)
-    
+    dispatched = dispatch_task(
+        reprocess_images_task,
+        [str(campaign_id), limit],
+        str(campaign_id),
+        "reprocess_images",
+    )
+    if not dispatched:
+        raise HTTPException(status_code=503, detail="Failed to queue reprocessing task")
+
     return {
         "message": "Reprocessing queued",
         "image_count": unprocessed.count,

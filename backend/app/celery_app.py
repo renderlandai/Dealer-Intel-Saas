@@ -1,7 +1,6 @@
 """Celery application configuration for Dealer Intel background tasks."""
 import os
 import re
-import ssl
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -34,7 +33,12 @@ celery_app.conf.update(
     task_time_limit=2400,
     include=["app.tasks"],
     broker_connection_retry_on_startup=True,
+    # Force periodic reconnection — prevents kombu from hanging on a dead
+    # BRPOP after managed Valkey/Redis drops idle SSL connections.
+    # See: https://github.com/celery/celery/issues/10205
+    broker_transport_options={
+        "socket_timeout": 15,
+        "socket_connect_timeout": 15,
+        "visibility_timeout": 3600,
+    },
 )
-
-if redis_url.startswith("rediss://"):
-    celery_app.conf.broker_use_ssl = {"ssl_cert_reqs": ssl.CERT_NONE}

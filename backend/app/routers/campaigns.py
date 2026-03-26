@@ -423,7 +423,7 @@ async def analyze_campaign_scan(
     Analyze discovered images from a campaign scan.
     Dispatched to Celery worker for durable execution.
     """
-    from ..tasks import analyze_scan_task
+    from ..tasks import analyze_scan_task, dispatch_task
 
     job = supabase.table("scan_jobs")\
         .select("*")\
@@ -448,8 +448,15 @@ async def analyze_campaign_scan(
     if image_count == 0:
         return {"message": "No unprocessed images found", "count": 0}
     
-    analyze_scan_task.delay(str(scan_id), str(campaign_id))
-    
+    dispatched = dispatch_task(
+        analyze_scan_task,
+        [str(scan_id), str(campaign_id)],
+        str(scan_id),
+        "analyze_campaign",
+    )
+    if not dispatched:
+        raise HTTPException(status_code=503, detail="Failed to queue analysis task")
+
     return {
         "message": "Analysis queued for campaign",
         "campaign_id": str(campaign_id),
