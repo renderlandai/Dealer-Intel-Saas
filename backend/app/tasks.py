@@ -53,7 +53,13 @@ async def dispatch_task(
             log.error("DISPATCH FAILED (duplicate?): source=%s job=%s", source, scan_job_id)
             _mark_job_failed(scan_job_id, "Task dispatch returned None — possible duplicate")
             return None
-        log.info("Task enqueued: source=%s job=%s arq_job_id=%s", source, scan_job_id, job.job_id)
+
+        queue_depth = await pool.zcard("arq:queue")
+        job_exists = await pool.exists(f"arq:job:{job.job_id}")
+        log.info(
+            "Task enqueued: source=%s job=%s arq_job_id=%s queue_depth=%d job_key_exists=%s",
+            source, scan_job_id, job.job_id, queue_depth, bool(job_exists),
+        )
         return job.job_id
     except Exception as e:
         log.error("DISPATCH FAILED: source=%s job=%s error=%s", source, scan_job_id, e, exc_info=True)
@@ -87,6 +93,7 @@ def _mark_job_failed(scan_job_id: str, error: str) -> None:
 
 async def run_website_scan_task(ctx: dict, urls, scan_job_id, distributor_mapping, campaign_id=None):
     from .routers.scanning import run_website_scan
+    print(f"[TASK PICKED UP] run_website_scan_task job={scan_job_id}")
     log.info("Worker: website scan job=%s urls=%d", scan_job_id, len(urls))
     try:
         await run_website_scan(
