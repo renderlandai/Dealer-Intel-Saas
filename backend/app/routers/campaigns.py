@@ -275,7 +275,7 @@ async def start_campaign_scan(
 ):
     """
     Start a scan specifically for this campaign.
-    Dispatched to ARQ worker for durable background execution.
+    Dispatches the scan as a background task.
     """
     check_channel_allowed(op, source.value)
     check_scan_quota(op)
@@ -369,7 +369,7 @@ async def start_campaign_scan(
         dispatched = await dispatch_task("run_website_scan_task", [urls, scan_job_id, mapping, campaign_id_str], scan_job_id, "website")
 
     if not dispatched:
-        raise HTTPException(status_code=503, detail="Failed to queue scan task — the background worker may be unavailable. Please try again.")
+        raise HTTPException(status_code=503, detail="Failed to start scan task. Please try again.")
     
     return scan_job
 
@@ -417,7 +417,7 @@ async def analyze_campaign_scan(
 ):
     """
     Analyze discovered images from a campaign scan.
-    Dispatched to ARQ worker for durable execution.
+    Runs as a background task.
     """
     from ..tasks import dispatch_task
 

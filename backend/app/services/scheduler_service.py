@@ -90,7 +90,7 @@ def compute_next_run(frequency: str, run_at_time: str = "09:00", run_on_day: Opt
 # Trigger a single scheduled scan
 # ------------------------------------------------------------------
 async def _trigger_scan(schedule_id: str) -> None:
-    """Look up a schedule row, create a scan job, and dispatch via ARQ."""
+    """Look up a schedule row, create a scan job, and dispatch it."""
     try:
         row = (
             supabase.table("scan_schedules")
@@ -303,6 +303,29 @@ async def _run_retention() -> None:
     await run_retention_sweep()
 
 
+async def _cleanup_stale_scans() -> None:
+    """Auto-fail scans stuck in 'pending' for more than 5 minutes."""
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+        stale = supabase.table("scan_jobs") \
+            .select("id") \
+            .eq("status", "pending") \
+            .lt("created_at", cutoff) \
+            .execute()
+
+        for job in (stale.data or []):
+            supabase.table("scan_jobs").update({
+                "status": "failed",
+                "error_message": "Scan timed out in pending state",
+            }).eq("id", job["id"]).execute()
+            log.warning("Auto-failed stale pending scan: %s", job["id"])
+
+        if stale.data:
+            log.info("Cleaned up %d stale pending scan(s)", len(stale.data))
+    except Exception:
+        log.exception("Error cleaning up stale scans")
+
+
 async def start() -> None:
     """Start the APScheduler background scheduler and load persisted schedules.
 
@@ -342,6 +365,14 @@ async def start() -> None:
         replace_existing=True,
     )
     log.info("Data retention sweep scheduled for 03:00 UTC daily")
+
+    _scheduler.add_job(
+        _cleanup_stale_scans,
+        trigger=CronTrigger(minute="*/5", timezone="UTC"),
+        id="cleanup_stale_scans",
+        replace_existing=True,
+    )
+    log.info("Stale scan cleanup scheduled every 5 minutes")
 
     await load_schedules()
 

@@ -41,8 +41,8 @@ class Settings(BaseSettings):
     # Error Tracking
     sentry_dsn: str = ""
     
-    # Redis / Celery
-    redis_url: str = Field(default="redis://localhost:6379/0", description="Redis/Valkey URL for Celery broker")
+    # Redis (scheduler lock)
+    redis_url: str = Field(default="redis://localhost:6379/0", description="Redis/Valkey URL for scheduler lock")
     
     # App
     debug: bool = False

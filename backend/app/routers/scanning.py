@@ -129,7 +129,7 @@ async def start_scan(
     """
     Start a new scan job.
     
-    Dispatches the scan to an ARQ worker for durable background execution.
+    Dispatches the scan as a background task.
     """
     check_channel_allowed(op, scan_request.source.value)
     check_scan_quota(op)
@@ -212,7 +212,7 @@ async def start_scan(
         dispatched = await dispatch_task("run_website_scan_task", [urls, scan_job_id, mapping, campaign_id_str], scan_job_id, "website")
 
     if not dispatched:
-        raise HTTPException(status_code=503, detail="Failed to queue scan task — the background worker may be unavailable. Please try again.")
+        raise HTTPException(status_code=503, detail="Failed to start scan task. Please try again.")
     
     return scan_job
 
@@ -1033,7 +1033,7 @@ async def retry_scan_job(
         dispatched = await dispatch_task("run_website_scan_task", [urls, new_id, mapping, campaign_id_str], new_id, "website")
 
     if not dispatched:
-        raise HTTPException(status_code=503, detail="Failed to queue scan task — the background worker may be unavailable. Please try again.")
+        raise HTTPException(status_code=503, detail="Failed to start scan task. Please try again.")
 
     log.info("Retried scan %s → new scan %s (source=%s)", job_id, new_id, source)
     return new_job.data[0]
@@ -1122,7 +1122,7 @@ async def analyze_discovered_images(
 ):
     """
     Analyze discovered images from a completed scan.
-    Dispatched to ARQ worker for durable execution.
+    Runs as a background task.
     """
     from ..tasks import dispatch_task
 
@@ -1366,7 +1366,7 @@ async def reprocess_unprocessed_images(
 ):
     """
     Reprocess images that were never analyzed.
-    Dispatched to ARQ worker for durable execution.
+    Runs as a background task.
     """
     from ..tasks import dispatch_task
 

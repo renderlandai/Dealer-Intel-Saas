@@ -122,12 +122,10 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check — verifies database and Redis (ARQ broker) connectivity."""
-    import os
-    import re
-    import redis as redis_lib
+    """Health check — verifies database connectivity and background task state."""
+    from .tasks import _running_tasks
 
-    checks = {"database": "unknown", "redis": "unknown"}
+    checks: dict = {"database": "unknown"}
     healthy = True
 
     try:
@@ -139,22 +137,7 @@ async def health_check():
         healthy = False
         log.warning("Health check: database unreachable — %s", e)
 
-    try:
-        redis_url = os.getenv("REDIS_URL", os.getenv("redis_url", "redis://localhost:6379/0"))
-        masked = re.sub(r"://[^:]*:[^@]*@", "://***:***@", redis_url) if "@" in redis_url else redis_url
-
-        r = redis_lib.from_url(redis_url, socket_connect_timeout=3)
-        r.ping()
-        queue_depth = r.zcard("arq:queue") or 0
-        r.close()
-
-        checks["redis"] = "connected"
-        checks["redis_url"] = masked
-        checks["task_queue_depth"] = queue_depth
-    except Exception as e:
-        checks["redis"] = f"error: {type(e).__name__}"
-        healthy = False
-        log.warning("Health check: Redis unreachable — %s", e)
+    checks["background_tasks_running"] = len(_running_tasks)
 
     status_code = 200 if healthy else 503
     return JSONResponse(
