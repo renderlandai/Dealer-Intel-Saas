@@ -512,6 +512,292 @@ Each task uses `_run_async()` to bridge Celery's synchronous workers with the ex
 
 ---
 
+## 2026-03-25 (Wednesday) — Production Readiness Blitz: Billing, Security, Tests, CI & Hardening
+
+### Summary
+Largest single-day output in the project's history. Completed the entire 7-tier Production Readiness Checklist — security hardening, rate limiting, infrastructure fixes, auth/data integrity patches, observability, 27 pytest tests with GitHub Actions CI, and database performance optimizations. Simultaneously shipped the remaining roadmap items: Stripe billing integration with plan enforcement, landing page and pricing page, team management with invite flow, alerts system, compliance rules CRUD, compliance trend analytics, onboarding checklist, scan usage UI, data retention enforcement, batch scanning, and page hit caching for scan cost optimization. Followed up with a hardening commit fixing tenant isolation gaps in scan dispatch, Celery task failure handling to prevent stuck jobs, and Playwright browser lifecycle cleanup. Total: 60 files changed, ~6,800 lines added across 2 commits.
+
+### Session 1: Production Readiness + Roadmap Completion (Commit `34e753a`)
+
+**58 files changed, 6,669 insertions(+), 375 deletions(−)**
+
+#### Backend — Stripe Billing Integration (Roadmap Item 1)
+
+- `routers/billing.py` (new, 429 lines) — Full Stripe integration:
+  - `POST /billing/checkout` — Creates Stripe Checkout session with plan-specific price ID, passes `org_id` in metadata for webhook reconciliation
+  - `POST /billing/portal` — Creates Stripe Customer Portal session for self-service plan management
+  - `GET /billing/usage` — Returns current scan usage, dealer count, plan limits, and trial status
+  - `POST /billing/webhook` — Stripe webhook handler with signature verification. Handles `checkout.session.completed` (activates plan, maps Stripe Price ID → plan name), `customer.subscription.updated` (plan changes), `customer.subscription.deleted` (downgrades to free), `invoice.payment_failed` (marks `past_due`)
+  - Rate-limited: 60 requests/min on webhook endpoint
+  - Reverse price mapping: `_build_price_plan_map()` lazily builds Stripe Price ID → plan name lookup from config
+
+#### Backend — Plan Enforcement Middleware (Roadmap Items 2–3)
+
+- `plan_enforcement.py` (new, 305 lines) — Reusable FastAPI dependency layer that gates features by subscription tier:
+  - `OrgPlan` — Resolved plan context dependency (`get_org_plan`): reads org plan/status/trial from DB, blocks canceled subscriptions, warns on `past_due`
+  - `require_active_plan()` — Blocks write operations when free trial has expired
+  - `check_dealer_limit()` — Enforces max dealer cap per plan (counts active distributors)
+  - `check_campaign_limit()` — Enforces max campaign cap per plan
+  - `check_scan_quota()` — Enforces monthly scan limit with period-based counting (scans created since start of current billing month)
+  - `check_concurrent_scans()` — Prevents concurrent scan overload (counts jobs with status `pending` or `running`)
+  - `check_channel_allowed()` — Restricts scan channels by plan (free = website only, starter = website only, pro = all, business = all)
+  - `check_schedule_limit()` — Enforces max schedules per campaign and allowed frequency tiers
+  - `check_compliance_rules_limit()` — Enforces max compliance rules per plan
+  - `check_user_seat_limit()` — Enforces max team member seats per plan
+- `config.py` (+169 lines) — Added `PLAN_LIMITS` dictionary defining 4 tiers (free, starter, professional, business) with 22 limit/feature-flag fields each:
+  - Free: 2 dealers, 1 campaign, 5 total scans, website-only, 21-day retention, 14-day trial
+  - Starter: 10 dealers, 3 campaigns, 15 scans/month, website-only, biweekly/monthly scheduling, 90-day retention
+  - Professional: 25 dealers, 10 campaigns, 60 scans/month, all channels, all frequencies, PDF reports, email notifications, compliance trends, 365-day retention
+  - Business: 100 dealers, unlimited campaigns, 200 scans/month, all channels, report branding, adaptive calibration, unlimited retention
+  - Added Stripe config fields: `stripe_secret_key`, `stripe_webhook_secret`, per-plan price IDs, extra dealer price IDs, `frontend_url`
+  - Added helper functions: `get_plan_limits()`, `get_stripe_price_id()`, `get_extra_dealer_price_id()`
+
+#### Backend — Team Management (Roadmap Item 9)
+
+- `routers/team.py` (new, 260 lines) — Full team CRUD with role-based access:
+  - `GET /team/members` — Lists all org members with email lookups from Supabase Auth
+  - `POST /team/invites` — Admin-only invite creation with seat limit check. Generates unique token, stores in `pending_invites` table with 7-day expiry
+  - `GET /team/invites` — Lists pending invites for the org
+  - `POST /team/invites/{token}/accept` — Rate-limited (10/min). Requires auth. Validates invite email matches authenticated user email. Creates `user_profiles` entry and deletes invite
+  - `DELETE /team/invites/{id}` — Admin-only invite cancellation
+  - `DELETE /team/members/{user_id}` — Admin-only member removal. Prevents removing self
+  - `PATCH /team/members/{user_id}/role` — Admin-only role change (owner/admin/member)
+
+#### Backend — Alerts System
+
+- `routers/alerts.py` (new, 94 lines) — Org-scoped alert endpoints:
+  - `GET /alerts` — Paginated alerts list filtered by `is_read`, org-scoped
+  - `PATCH /alerts/{id}/read` — Mark single alert as read with org ownership verification
+  - `POST /alerts/mark-all-read` — Bulk mark all org alerts as read
+
+#### Backend — Compliance Rules CRUD (Tier 2.2)
+
+- `routers/compliance_rules.py` (new, 154 lines) — Full CRUD with plan enforcement:
+  - `GET /compliance-rules` — List org's compliance rules
+  - `GET /compliance-rules/{id}` — Get single rule with org ownership check
+  - `POST /compliance-rules` — Create rule with `check_compliance_rules_limit()` gate
+  - `PATCH /compliance-rules/{id}` — Update rule with org ownership check
+  - `DELETE /compliance-rules/{id}` — Delete with org ownership check
+
+#### Backend — Data Retention Enforcement (Roadmap Item 10)
+
+- `services/retention_service.py` (new, 94 lines) — Scheduled daily purge at 03:00 UTC:
+  - `run_retention_sweep()` — Iterates all organizations, reads each plan's `data_retention_days`, calculates cutoff date, deletes expired scan jobs (cascading to `discovered_images` and `matches`)
+  - Only purges `completed` and `failed` jobs — never deletes in-progress work
+  - Integrated into APScheduler as a daily cron job
+
+#### Backend — Page Hit Cache for Scan Cost Optimization (Roadmap Item 17)
+
+- `services/page_cache_service.py` (new, 130 lines) — Tracks which dealer web pages previously produced matches:
+  - `get_cached_pages()` — Returns cached page URLs ordered by hit count (most productive pages first)
+  - `record_page_hits()` — After a scan completes, upserts page→asset match records with hit counts and timestamps
+  - `clear_cache()` — Invalidates cache for a distributor (useful when campaign assets change)
+- `scanning.py` — Integrated page cache into website scan flow: on repeat scans, cached "hot" pages are scanned first. If all campaign assets are matched from cached pages alone, full page discovery (sitemap parsing, link crawling) is skipped entirely, saving HTTP calls, Playwright browser loads, and AI API costs
+
+#### Backend — Security Hardening (Tiers 1–2)
+
+- `organizations.py` — Added `get_current_user` dependency and `_assert_own_org()` guard to all org endpoints: test-email, logo upload/delete, settings GET/PATCH. Prevents cross-tenant access
+- `scanning.py` — Added auth (`get_current_user`) to scan detail, delete, analyze, and reprocess endpoints. Added `OrgPlan` dependency to `start_scan` and `batch_scan` with `check_channel_allowed()`, `check_scan_quota()`, `check_concurrent_scans()` gates. Rate-limited: start=10/min, batch=2/min
+- `matches.py` — Added plan gating on feedback endpoints (require active plan)
+- `reports.py` — Added plan check for PDF report access
+- `schedules.py` — Added `check_schedule_limit()` enforcement on schedule creation
+- `main.py` — Activated `SlowAPIMiddleware` (was configured but never wired). Registered 4 new routers (billing, team, alerts, compliance_rules). Added startup audit log confirming dangerous endpoints are disabled
+
+#### Backend — Auth & Data Integrity (Tier 4)
+
+- `auth.py` — Replaced unbounded `dict` profile cache with `cachetools.TTLCache(maxsize=10_000, ttl=300)` — entries auto-expire after 5 minutes. Added try/except around `_auto_provision_user` with retry lookup to handle race conditions when concurrent requests both try to create the same user profile
+- `requirements.txt` — Added `cachetools>=5.3.0`
+
+#### Backend — Observability (Tier 5)
+
+- `main.py` — Added `RequestLoggingMiddleware` (logs `METHOD /path STATUS TIMEms` for every request). Extended `/health` to ping both Supabase and Redis — returns `503 degraded` if either is unreachable (uses `redis.from_url()` with 3-second timeout). Added startup log confirming `ENABLE_DANGEROUS_ENDPOINTS` state
+- `celery_app.py` — Unified Redis URL env var handling (falls back to both `REDIS_URL` and `redis_url`)
+
+#### Backend — Dashboard Enhancements (Roadmap Items 8, 13)
+
+- `dashboard.py` (+225 lines) — Major expansion:
+  - `GET /dashboard/compliance-trend` — Week-over-week compliance trend chart data (gated to Pro+Business plans). Aggregates matches by week with compliance/violation counts
+  - `GET /dashboard/stats` — Optimized to call `get_dashboard_stats` Postgres RPC first (single round-trip for all 8 counters), falls back to sequential queries if RPC not deployed
+  - `GET /dashboard/onboarding` — Returns onboarding checklist status (has campaigns, has distributors, has scans, has matches, has schedule)
+  - Error handling with contextual suggestions on scan status endpoints
+
+#### Backend — Tests (Tier 6)
+
+- `tests/conftest.py` (new, 61 lines) — Shared pytest fixtures: mock Supabase client, mock auth user factory, FastAPI test client with dependency overrides
+- `tests/test_auth.py` (new, 171 lines) — 10 tests: missing token, expired JWT, invalid JWT, wrong secret, valid token resolution, auto-provisioning, cache hit, TTL config, single-user cache clear, full cache clear
+- `tests/test_tenant_isolation.py` (new, 231 lines) — 10 tests: cross-org settings read/update/logo/delete/email blocked, campaign/distributor/match/scan/alert lists are org-scoped
+- `tests/test_billing_webhook.py` (new, 186 lines) — 7 tests: invalid signature rejection, checkout.session.completed activation, missing org_id graceful, payment_failed marks past_due, unknown customer graceful, subscription.deleted downgrade, unhandled event passthrough
+- `requirements.txt` — Added `pytest>=8.0.0`, `pytest-asyncio>=0.23.0`, `httpx>=0.28.0`
+
+#### Backend — CI/CD Pipeline (Tier 6.4)
+
+- `.github/workflows/ci.yml` (new, 98 lines) — GitHub Actions pipeline on every push/PR to `main`:
+  - `backend-tests` job: Python 3.11, pip cache, `pytest tests/ -v --tb=short` with mock env vars
+  - `frontend-build` job: Node 20, npm cache, `npm ci && npm run build` with mock env vars
+  - `migrate` job: runs `supabase db push` after backend tests pass, only on pushes to `main` (requires `SUPABASE_ACCESS_TOKEN` and `SUPABASE_PROJECT_REF` GitHub secrets)
+
+#### Backend — Database Performance (Tier 7)
+
+- `supabase/migrations/017_dashboard_stats_rpc.sql` — Postgres RPC function `get_dashboard_stats(p_org_id)` that returns all 8 dashboard counters (total matches, violations, active distributors, active campaigns, pending scans, completed scans, active schedules, unread alerts) in a single round-trip instead of 8 separate queries
+- `supabase/migrations/018_production_indexes.sql` — 7 composite indexes for production query patterns: `matches(distributor_id, compliance_status)`, `matches(distributor_id, created_at)`, `scan_jobs(organization_id, status)`, `scan_jobs(organization_id, created_at)`, `alerts(organization_id, is_read)`, `discovered_images(scan_job_id, is_processed)`, `assets(campaign_id)`
+
+#### Backend — Infrastructure (Tier 3)
+
+- `.do/app.yaml` (+104 lines) — Major expansion: added Celery worker component with all env vars (Supabase, Anthropic, scraper keys, Stripe, Redis), `SCHEDULER_ENABLED=true` on API only, corrected CORS origins
+- `scheduler_service.py` — Added `SCHEDULER_ENABLED` env var check to prevent APScheduler duplication on multi-replica deployments. Added data retention sweep as daily cron job at 03:00 UTC
+
+#### Frontend — Landing Page & Pricing Page (Roadmap Item 4)
+
+- `app/landing/page.tsx` (new, 438 lines) — Public-facing marketing page with:
+  - Hero section with headline, subheadline, and dual CTAs ("Start Free Trial" / "Book a Demo")
+  - 6-feature grid: Multi-Channel Scanning, Proprietary AI Detection, Compliance Reporting, Automated Scheduling, Real-Time Alerts, Coverage Mapping
+  - "How It Works" 3-step explainer (Upload → Scan → Report)
+  - Social proof section with stat callouts
+  - Bottom CTA banner
+- `app/pricing/page.tsx` (new, 478 lines) — Pricing page with 4-tier card layout:
+  - Free (Trial): 2 dealers, 1 campaign, website scanning, 5 total scans
+  - Starter ($49/mo): 10 dealers, 3 campaigns, 15 scans/month, basic scheduling
+  - Professional ($149/mo): 25 dealers, 10 campaigns, all channels, PDF reports, email alerts
+  - Business ($349/mo): 100 dealers, unlimited campaigns, full feature set, priority support
+  - Feature comparison checklist per tier, "Most Popular" badge on Professional
+- `components/marketing/navbar.tsx` (new, 95 lines) — Marketing navigation bar with logo, nav links, and auth-aware CTA buttons
+- `components/marketing/footer.tsx` (new, 69 lines) — Marketing footer with product/company/legal link columns
+
+#### Frontend — Scan Usage UI (Roadmap Item 6)
+
+- `components/dashboard/trial-banner.tsx` (new, 73 lines) — Dismissible trial banner showing days remaining, with "Upgrade" CTA. Only renders for free-tier orgs during active trial
+- `components/dashboard/usage-card.tsx` (new, 111 lines) — Usage meters showing scan count (used/limit), dealer count (used/limit), and campaign count with progress bars and color-coded thresholds
+- `components/dashboard/upgrade-modal.tsx` (new, 96 lines) — Modal triggered when user hits a plan limit. Shows upgrade benefits and redirects to pricing page
+- `lib/upgrade-events.ts` (new, 16 lines) — Custom event system for triggering upgrade modals from any component
+
+#### Frontend — Onboarding Checklist (Roadmap Item 7)
+
+- `components/dashboard/onboarding-checklist.tsx` (new, 165 lines) — Dismissible checklist for first-time setup with 5 steps: Create Campaign, Add Distributor, Upload Assets, Run First Scan, Review Matches. Each step links to the relevant page. Progress bar tracks completion
+
+#### Frontend — Compliance Trend Analytics (Roadmap Item 13)
+
+- `components/dashboard/compliance-trend.tsx` (new, 160 lines) — Recharts-based area chart showing week-over-week compliance vs violation trends. Gated to Pro+Business plans with upgrade prompt for lower tiers
+
+#### Frontend — Team Management UI (Roadmap Item 9)
+
+- `components/settings/team-section.tsx` (new, 279 lines) — Team settings card with:
+  - Member list with role badges and remove buttons
+  - Invite form with email input and role selector (member/admin)
+  - Pending invites list with cancel buttons
+  - Seat count display (used/max by plan)
+  - Admin-only actions gated by current user's role
+
+#### Frontend — Alerts Page
+
+- `app/alerts/page.tsx` (new, 253 lines) — Full alerts page with filtering (all/unread/read), mark-as-read on individual alerts, "Mark All Read" bulk action, severity badges, and relative timestamps
+
+#### Frontend — Settings Page Expansion
+
+- `app/settings/page.tsx` (+175 lines) — Added billing settings card with current plan display, usage summary, and "Manage Subscription" button (links to Stripe portal). Added team management section integration
+
+#### Frontend — Dashboard Updates
+
+- `app/page.tsx` (+38 lines) — Integrated trial banner, onboarding checklist, usage card, and compliance trend chart into dashboard layout
+- `app/scans/page.tsx` (+98 lines) — Added scan status badges with contextual error messages and retry buttons. Shows scan source icons and progress indicators
+
+#### Frontend — Auth & Navigation
+
+- `lib/auth-context.tsx` — Extracted `PUBLIC_PATHS` constant (exported). `onAuthStateChange` now redirects unauthenticated users to `/landing` instead of `/login`. Includes `/landing`, `/pricing`, `/login`, `/signup` as public paths
+- `components/layout/auth-gate.tsx` — Imports shared `PUBLIC_PATHS` from auth-context instead of maintaining its own copy
+- `components/layout/sidebar.tsx` — Added "Alerts" nav item with bell icon. Added "Compliance Rules" nav item
+
+#### Frontend — API & Hooks
+
+- `lib/api.ts` (+103 lines) — Added: `createCheckoutSession()`, `createPortalSession()`, `getBillingUsage()`, `getTeamMembers()`, `inviteTeamMember()`, `acceptInvite()`, `removeTeamMember()`, `getAlerts()`, `markAlertRead()`, `markAllAlertsRead()`, `getOnboardingStatus()`, `getComplianceTrend()`
+- `lib/hooks.ts` (+100 lines) — Added React Query hooks: `useBillingUsage()`, `useTeamMembers()`, `useInviteTeamMember()`, `useAlerts()`, `useOnboardingStatus()`, `useComplianceTrend()`
+
+#### Database Migrations
+
+- `014_billing_plan.sql` — `plan`, `plan_status`, `stripe_customer_id`, `stripe_subscription_id`, `trial_expires_at` columns on `organizations`
+- `015_pending_invites.sql` — `pending_invites` table with token, org_id, email, role, expires_at, unique constraint on (org_id, email)
+- `016_page_hit_cache.sql` — `page_hit_cache` table with org_id, distributor_id, campaign_id, page_url, hit_count, last_hit_at, unique constraint on (org_id, distributor_id, page_url)
+- `017_dashboard_stats_rpc.sql` — `get_dashboard_stats` Postgres RPC function
+- `018_production_indexes.sql` — 7 production composite indexes
+
+---
+
+### Session 2: Production Hardening (Commit `5ed34d8`)
+
+**7 files changed, 127 insertions(+), 29 deletions(−)**
+
+Follow-up hardening pass fixing issues discovered during Session 1 review.
+
+#### Tenant Isolation Gaps in Scan Dispatch
+
+- `scanning.py` — `start_scan()` now validates that the campaign and all distributors in the scan request actually belong to the authenticated user's organization before dispatching to Celery. Previously, a user could submit a scan request referencing another org's campaign or distributors
+- `scanning.py` — `reprocess_unprocessed_images` endpoint now scopes image lookup by organization (only reprocesses images from scan jobs belonging to the user's org)
+
+#### Celery Task Failure Handling
+
+- `tasks.py` — Wrapped all 4 scan tasks (`run_website_scan_task`, `run_google_ads_scan_task`, `run_facebook_scan_task`, `run_instagram_scan_task`) in try/except blocks. On unhandled exception, the scan job is marked as `failed` in the database with a truncated error message (500 chars max) via `_mark_job_failed()`. Previously, an uncaught exception would leave the scan job stuck in `running` status permanently
+- `tasks.py` — `analyze_scan_task` now catches errors and marks the scan job as failed. `reprocess_images_task` now scopes discovered images to the campaign's organization's scan jobs (prevents cross-org data leakage)
+
+#### Auth Error Handling
+
+- `auth.py` — Added try/except around UUID parsing of `sub` claim from JWT. Returns `401 Unauthorized` instead of crashing with a `500 Internal Server Error` when a malformed UUID is in the token
+
+#### Stripe Webhook Hardening
+
+- `billing.py` — Sanitized error responses on webhook failures (no longer leaks internal error details). Added guard requiring both `stripe_secret_key` and `stripe_webhook_secret` to be configured before processing webhooks
+
+#### Playwright Browser Lifecycle
+
+- `extraction_service.py` — Fixed browser reconnection: when a disconnected browser is detected, the old `Browser` and `Playwright` instances are now explicitly closed/stopped before creating new ones. Previously, stale instances leaked memory. Added defensive `finally` blocks around `page.context.close()` calls to prevent crashes when the browser context is already invalidated
+
+#### Infrastructure
+
+- `.do/app.yaml` — Added `FRONTEND_URL` and all Stripe environment variables to the Celery worker component (worker needs these for notification emails and billing checks during scan execution)
+- `celery_app.py` — Added `load_dotenv()` call so the worker process picks up `.env` variables including `PLAYWRIGHT_BROWSERS_PATH` (Chromium location in Docker)
+
+### Commits
+- `34e753a` — Production readiness: security hardening, billing, tests, CI, and performance (58 files, +6,669/−375)
+- `5ed34d8` — Harden production: tenant isolation, task failure handling, browser cleanup (7 files, +127/−29)
+
+### New Third-Party Services Added
+| Service | Purpose | Cost |
+|---------|---------|------|
+| **Stripe** | Subscription billing, checkout, customer portal, webhooks | Usage-based (2.9% + 30¢/txn) |
+| **cachetools** | TTL-based profile cache replacing unbounded dict | Open source |
+| **pytest** | Backend test framework | Open source |
+| **GitHub Actions** | CI pipeline (tests + build + migrations) | Free for public repos |
+
+### Roadmap Items Completed Today
+| # | Item | Description |
+|---|------|-------------|
+| 1 | Stripe billing | Checkout, subscriptions, webhooks, customer portal |
+| 2 | Plan enforcement | 4-tier limits on dealers, campaigns, scans, channels, features |
+| 3 | Scan quotas | Monthly scan counting + concurrent scan limiter |
+| 4 | Landing + pricing pages | Marketing pages with feature grid, pricing cards, CTAs |
+| 6 | Scan usage UI | Trial banner, usage meters, upgrade modals |
+| 7 | Onboarding flow | 5-step dashboard checklist for first-time setup |
+| 8 | Error handling | Contextual error messages + retry on scan status |
+| 9 | User seats + invites | Team management with role-based access, 7-day invite tokens |
+| 10 | Data retention | Scheduled daily purge by plan tier (21d–unlimited) |
+| 12 | Batch scanning | "Scan All Channels" for Pro+Business plans |
+| 13 | Compliance trends | Week-over-week compliance chart (Pro+Business) |
+| 17 | Page hit caching | Hot pages scanned first, full discovery skipped on repeat scans |
+
+### Production Readiness Tiers Completed Today
+| Tier | Focus | Items |
+|------|-------|-------|
+| 1 | Security | Auth on all org/scan/team endpoints, tenant isolation guards |
+| 2 | Rate Limiting | SlowAPI activated, per-route limits, compliance rules gated |
+| 3 | Infrastructure | Celery worker in app.yaml, CORS fix, scheduler guard, Redis URL |
+| 4 | Auth & Data | TTL profile cache, auto-provision race condition fix, PUBLIC_PATHS |
+| 5 | Observability | Redis health check, request logging middleware, dangerous endpoint audit |
+| 6 | Testing & CI | 27 pytest tests, GitHub Actions CI with automated migrations |
+| 7 | Performance | Dashboard stats RPC, 7 production indexes, migration runner |
+
+### Updated Production Readiness Score
+**Previous: 4.5 / 10 → Current: 8.5 / 10** — All 7 tiers completed. Remaining gaps: end-to-end integration tests with real Supabase, load testing under production traffic, and Sentry alert rules configuration.
+
+---
+
 ## Third-Party Services Inventory
 
 All external services and significant libraries used across the application.
@@ -521,12 +807,14 @@ All external services and significant libraries used across the application.
 |---------|---------|--------|
 | **Supabase** | PostgreSQL database + file storage (logos, assets) + auth | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` |
 | **Anthropic Claude** | AI image analysis — Haiku (filtering), Sonnet (comparison), Opus (verification) | `ANTHROPIC_API_KEY` |
+| **Stripe** | Subscription billing, checkout, customer portal, webhooks | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` |
 | **Apify** | Meta Ad Library + Instagram organic post scraping | `APIFY_API_KEY` |
 | **SerpApi** | Google Ads Transparency Center structured data | `SERPAPI_API_KEY` |
 | **ScreenshotOne** | Website screenshot capture with cookie blocking | `SCREENSHOTONE_ACCESS_KEY`, `SCREENSHOTONE_SECRET_KEY` |
 | **Resend** | Transactional email notifications (scan results, violations) | `RESEND_API_KEY` |
 | **Sentry** | Error tracking and performance monitoring (frontend + backend) | `SENTRY_DSN` |
 | **Mapbox GL** | Interactive dealer compliance map visualization | `NEXT_PUBLIC_MAPBOX_TOKEN` |
+| **GitHub Actions** | CI pipeline (backend tests, frontend build, automated migrations) | — |
 | **DigitalOcean App Platform** | Backend API + Celery worker hosting (Docker) | — |
 | **DigitalOcean Managed Valkey** | Celery task broker (Redis-compatible, TLS) | `REDIS_URL` |
 | **Vercel** | Frontend hosting and deployment | — |
@@ -553,6 +841,9 @@ All external services and significant libraries used across the application.
 | **Recharts** | Dashboard charts and data visualization | TypeScript |
 | **Axios** | Frontend HTTP client | TypeScript |
 | **slowapi** | API rate limiting | Python |
+| **cachetools** | TTL-based profile caching for auth | Python |
+| **pytest** | Backend test framework | Python |
+| **stripe** | Stripe API client for billing integration | Python |
 
 ---
 
@@ -562,8 +853,8 @@ All external services and significant libraries used across the application.
 - [x] ~~Commit all uncommitted changes~~
 - [x] ~~Add authentication (Supabase Auth + JWT-based RLS)~~
 - [x] ~~Implement task queue (Celery + Valkey) to replace BackgroundTasks~~
-- [ ] Write tests (pytest with mocked AI/Apify calls)
-- [x] ~~Add Docker + CI/CD configuration~~
+- [x] ~~Write tests (27 pytest tests — auth, tenant isolation, billing webhooks)~~
+- [x] ~~Add Docker + CI/CD configuration (GitHub Actions pipeline)~~
 
 ### Priority 2 — Feature Completeness
 - [x] Add scheduled/automated scans (daily, weekly per org)
@@ -572,8 +863,7 @@ All external services and significant libraries used across the application.
 
 ### Priority 3 — Performance & Polish
 - [ ] Re-enable match deduplication (disabled for testing)
-- [ ] Instagram Stories/Reels scanning support
-- [ ] Batch scanning mode for large distributor networks (40+ distributors)
+- [x] ~~Batch scanning mode for large distributor networks (40+ distributors)~~
 
 ### Completed (Previous Sessions)
 - [x] Adaptive threshold calibration with feedback loop (Item 8)
@@ -601,6 +891,31 @@ All external services and significant libraries used across the application.
 - [x] Late ACK + task rejection for automatic crash recovery
 - [x] Auto-deploy on push to `main` for both API and worker
 - [x] TLS-encrypted Valkey connection for task broker security
+
+### Completed (2026-03-25 — Production Readiness Blitz)
+- [x] Stripe billing integration (checkout, subscriptions, webhooks, customer portal)
+- [x] Plan enforcement middleware (4-tier limits on dealers, campaigns, scans, channels)
+- [x] Monthly scan quotas + concurrent scan limiter
+- [x] Landing page + pricing page with marketing components
+- [x] Scan usage UI (trial banner, usage meters, upgrade modals)
+- [x] Onboarding checklist (5-step first-time setup guide)
+- [x] User seats + team invite flow with role-based access
+- [x] Alerts system (org-scoped, mark read, bulk mark)
+- [x] Compliance rules CRUD with plan gating
+- [x] Data retention enforcement (daily purge by plan tier)
+- [x] Batch scanning mode ("Scan All Channels")
+- [x] Compliance trend analytics (week-over-week chart, Pro+Business)
+- [x] Page hit caching for scan cost optimization
+- [x] Security hardening: auth + tenant isolation on all endpoints
+- [x] Rate limiting activated (SlowAPI middleware + per-route limits)
+- [x] TTL profile cache + auto-provision race condition fix
+- [x] Redis health check + request logging middleware
+- [x] 27 pytest tests (auth, tenant isolation, billing webhooks)
+- [x] GitHub Actions CI pipeline (tests + build + automated migrations)
+- [x] Dashboard stats RPC + 7 production database indexes
+- [x] Celery task failure handling (stuck job prevention)
+- [x] Playwright browser lifecycle cleanup
+- [x] Tenant isolation gaps fixed in scan dispatch + image reprocessing
 
 ---
 
@@ -639,7 +954,7 @@ Items 1–4 block revenue. Items 5–9 block a good first-customer experience. I
 
 ## Production Readiness Checklist
 
-**Current score: 4.5 / 10 — Target: 7.5+ after completing Tiers 1–6**
+**Current score: 8.5 / 10 — All 7 tiers completed (2026-03-25). Remaining: E2E integration tests, load testing, Sentry alert rules.**
 
 ### Tier 1: Security (Critical — fix before any real user)
 
@@ -688,8 +1003,81 @@ Items 1–4 block revenue. Items 5–9 block a good first-customer experience. I
 
 ### Execution Timeline
 
-| Week | Items | Effort | Impact |
-|------|-------|--------|--------|
-| **Week 1** | 1.1, 1.2, 1.3, 1.4, 2.1, 3.2, 3.4, 5.3 | ~1.5 days | Closes all auth holes, activates rate limiting, fixes config |
-| **Week 2** | 4.1, 4.2, 4.3, 3.1, 3.3, 5.1, 5.2 | ~1 day | Fixes cache/race/redirect bugs, aligns infra |
-| **Week 3** | 6.1, 6.2, 6.3, 6.4, 2.2, 2.3, 7.1, 7.2, 7.3 | ~2–3 days | Test safety net, CI, feature gating, performance |
+All 7 tiers completed in a single day (2026-03-25). Original 3-week estimate collapsed into one session.
+
+| Tier | Items | Status |
+|------|-------|--------|
+| **Tier 1** | 1.1, 1.2, 1.3, 1.4 | Completed 2026-03-25 |
+| **Tier 2** | 2.1, 2.2, 2.3 | Completed 2026-03-25 |
+| **Tier 3** | 3.1, 3.2, 3.3, 3.4 | Completed 2026-03-25 |
+| **Tier 4** | 4.1, 4.2, 4.3 | Completed 2026-03-25 |
+| **Tier 5** | 5.1, 5.2, 5.3 | Completed 2026-03-25 |
+| **Tier 6** | 6.1, 6.2, 6.3, 6.4 | Completed 2026-03-25 |
+| **Tier 7** | 7.1, 7.2, 7.3 | Completed 2026-03-25 |
+
+---
+
+## 2026-03-26 — Production Scan Pipeline Fix
+
+### Problem
+
+Website scans stuck in "pending" indefinitely in production. The issue began after the initial deployment to DigitalOcean App Platform and persisted across multiple debugging attempts throughout the day.
+
+### Root Cause Chain
+
+1. **Celery/Kombu SSL transport bug** — The original task queue (Celery) used Kombu for Redis transport. Kombu silently drops messages over `rediss://` (SSL) connections to DigitalOcean's managed Valkey. Workers appeared "ready" but never received tasks. This is a known upstream issue (`celery/kombu#2007`).
+
+2. **ARQ migration — same class of problem** — Migrated from Celery to ARQ (lighter async Redis queue). ARQ connected and ran its internal cron jobs, but enqueued scan tasks were never picked up by the worker. Root causes: missing `username` parameter in Redis connection settings, `ssl_cert_reqs` defaulting to `required`, and stale `in-progress` keys from deployment rolling restarts creating 40-minute invisible locks on jobs.
+
+3. **Fundamental architecture mismatch** — A separate worker process communicating via Redis was over-engineered for the current scale (single instance, 1-2 concurrent scans). Every production bug traced back to the API→Redis→Worker hand-off: SSL transport failures, serialization issues, deployment race conditions, and split-process debugging difficulty.
+
+### Solution: Remove the Worker Entirely
+
+Replaced the external worker architecture with **in-process background tasks** using `asyncio.create_task()`.
+
+**Key changes:**
+- **`backend/app/tasks.py`** — Rewrote `dispatch_task()` to use `asyncio.create_task()` instead of Redis queue. Scan coroutines run directly in the API's event loop. No serialization, no message passing, no separate process.
+- **`backend/app/worker.py`** — Deleted entirely.
+- **`backend/app/services/scheduler_service.py`** — Moved `cleanup_stale_scans` back here as an APScheduler cron job (was previously an ARQ cron).
+- **`backend/app/main.py`** — Simplified health check (removed Redis/ARQ queue depth, added active background task count).
+- **`backend/requirements.txt`** — Removed `arq` dependency. Kept `redis` for scheduler lock only.
+- **`.do/app.yaml`** — Removed the `workers` section entirely (saves one DO instance ~$12/mo).
+- **`backend/app/routers/scanning.py`**, **`campaigns.py`** — Updated error messages (no more "worker" references).
+
+**Why this works:**
+- All scan functions (`run_website_scan`, `run_google_ads_scan`, etc.) were already `async`. Zero logic changes needed.
+- FastAPI's async event loop handles both HTTP requests and background scans concurrently.
+- Errors appear directly in the API logs — no cross-process debugging.
+- One deployment target instead of two.
+
+### OOM Crash & Instance Upgrade
+
+After the worker removal, the scan started successfully but the API process crashed with **exit code 128 (OOM kill)** when loading the CLIP model (`clip-ViT-B-32`). The `professional-xs` instance (512MB RAM) was insufficient.
+
+**Fix:** Upgraded API instance to **2GB RAM ($25/mo)** and set `WEB_CONCURRENCY=1` (single Gunicorn worker to maximize available memory).
+
+### Plan Enforcement Bypass
+
+Free trial scan limit was blocking test scans. Updated the organization row in Supabase directly: `plan` → `business`, `plan_status` → `active`.
+
+### Result
+
+Scans now run end-to-end in production: trigger → scan website → discover images → CLIP matching → results displayed. Two successful matches confirmed on the Yancey Bros dealer site.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `backend/app/tasks.py` | Rewrote: ARQ dispatch → `asyncio.create_task()` |
+| `backend/app/worker.py` | Deleted |
+| `backend/app/main.py` | Simplified health check |
+| `backend/app/services/scheduler_service.py` | Added `_cleanup_stale_scans` APScheduler job |
+| `backend/app/routers/scanning.py` | Updated error messages |
+| `backend/app/routers/campaigns.py` | Updated error messages |
+| `backend/app/config.py` | Updated comment (Redis description) |
+| `backend/requirements.txt` | Removed `arq` |
+| `.do/app.yaml` | Removed worker component |
+
+### Known Minor Issue
+
+Image matching paired the correct dealer page (Yancey Bros) with the wrong image from that page — picked a construction equipment photo instead of the actual carousel ad containing the approved asset. The carousel images are loaded dynamically via JavaScript and may not be captured by the screenshot. This is a matching accuracy tuning issue, not a pipeline bug.

@@ -29,6 +29,7 @@ interface Distributor {
   facebook_url?: string;
   instagram_url?: string;
   youtube_url?: string;
+  google_ads_advertiser_id?: string;
   region?: string;
   status: string;
   match_count: number;
@@ -44,6 +45,7 @@ export default function DistributorsPage() {
     name: "",
     website_url: "",
     facebook_url: "",
+    google_ads_advertiser_id: "",
     region: "",
   });
   const [editForm, setEditForm] = useState({
@@ -52,6 +54,7 @@ export default function DistributorsPage() {
     facebook_url: "",
     instagram_url: "",
     youtube_url: "",
+    google_ads_advertiser_id: "",
     region: "",
     code: "",
   });
@@ -62,7 +65,7 @@ export default function DistributorsPage() {
     try {
       await createDistributorMutation.mutateAsync(newDistributor);
       setShowCreate(false);
-      setNewDistributor({ name: "", website_url: "", facebook_url: "", region: "" });
+      setNewDistributor({ name: "", website_url: "", facebook_url: "", google_ads_advertiser_id: "", region: "" });
     } catch (error) {
       console.error("Failed to create distributor:", error);
     }
@@ -78,6 +81,7 @@ export default function DistributorsPage() {
       facebook_url: distributor.facebook_url || "",
       instagram_url: distributor.instagram_url || "",
       youtube_url: distributor.youtube_url || "",
+      google_ads_advertiser_id: distributor.google_ads_advertiser_id || "",
       region: distributor.region || "",
       code: distributor.code || "",
     });
@@ -182,6 +186,19 @@ export default function DistributorsPage() {
                     className="mt-2"
                   />
                 </div>
+                <div>
+                  <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                    Google Ads Advertiser ID
+                  </label>
+                  <Input
+                    placeholder="e.g., AR12345678901234567"
+                    value={newDistributor.google_ads_advertiser_id}
+                    onChange={(e) =>
+                      setNewDistributor({ ...newDistributor, google_ads_advertiser_id: e.target.value })
+                    }
+                    className="mt-2"
+                  />
+                </div>
               </div>
               <div className="flex gap-2 pt-2">
                 <Button onClick={handleCreate} disabled={createDistributorMutation.isPending} size="sm">
@@ -273,6 +290,17 @@ export default function DistributorsPage() {
                       placeholder="https://instagram.com/page"
                       value={editForm.instagram_url}
                       onChange={(e) => setEditForm({ ...editForm, instagram_url: e.target.value })}
+                      className="mt-2"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                      Google Ads Advertiser ID
+                    </label>
+                    <Input
+                      placeholder="e.g., AR12345678901234567"
+                      value={editForm.google_ads_advertiser_id}
+                      onChange={(e) => setEditForm({ ...editForm, google_ads_advertiser_id: e.target.value })}
                       className="mt-2"
                     />
                   </div>

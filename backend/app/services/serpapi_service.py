@@ -29,7 +29,7 @@ SERPAPI_ENDPOINT = "https://serpapi.com/search"
 async def _fetch_ad_creatives(
     advertiser_id: str,
     creative_format: str = "image",
-    region: str = "anywhere",
+    region: str = "",
     max_pages: int = 3,
 ) -> List[Dict[str, Any]]:
     """
@@ -125,7 +125,8 @@ async def scan_google_ads(
         try:
             creatives = await _fetch_ad_creatives(adv_id)
         except httpx.HTTPStatusError as e:
-            log.error("SerpApi HTTP error for %s: %d", adv_id, e.response.status_code)
+            body = e.response.text[:500]
+            log.error("SerpApi HTTP error for %s: %d — %s", adv_id, e.response.status_code, body)
             continue
         except Exception as e:
             log.error("SerpApi error for %s: %s", adv_id, e)
