@@ -48,8 +48,8 @@ reportlab>=4.0.0
 # Scheduling
 apscheduler>=3.10.0
 
-# Task Queue
-celery[redis]>=5.4.0
+# Task Queue (ARQ — async, uses redis-py directly, no kombu)
+arq>=0.26.0
 redis[hiredis]>=5.0.0
 
 # Billing

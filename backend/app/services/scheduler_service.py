@@ -90,7 +90,7 @@ def compute_next_run(frequency: str, run_at_time: str = "09:00", run_on_day: Opt
 # Trigger a single scheduled scan
 # ------------------------------------------------------------------
 async def _trigger_scan(schedule_id: str) -> None:
-    """Look up a schedule row, create a scan job, and kick off the scan."""
+    """Look up a schedule row, create a scan job, and dispatch via ARQ."""
     try:
         row = (
             supabase.table("scan_schedules")
@@ -144,13 +144,7 @@ async def _trigger_scan(schedule_id: str) -> None:
         scan_job = result.data[0]
         scan_job_id = UUID(scan_job["id"])
 
-        from ..tasks import (
-            run_google_ads_scan_task,
-            run_facebook_scan_task,
-            run_instagram_scan_task,
-            run_website_scan_task,
-            dispatch_task,
-        )
+        from ..tasks import dispatch_task
         from ..services import apify_instagram_service
 
         cid_str = campaign_id
@@ -163,7 +157,7 @@ async def _trigger_scan(schedule_id: str) -> None:
                 (d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"]
                 for d in dist_list
             }
-            dispatched = dispatch_task(run_google_ads_scan_task, [names, job_id_str, mapping, cid_str], job_id_str, "google_ads")
+            dispatched = await dispatch_task("run_google_ads_scan_task", [names, job_id_str, mapping, cid_str], job_id_str, "google_ads")
 
         elif source == "instagram":
             urls = [d["instagram_url"] for d in dist_list if d.get("instagram_url")]
@@ -175,12 +169,12 @@ async def _trigger_scan(schedule_id: str) -> None:
                     if username:
                         mapping[username.lower()] = d["id"]
                     mapping[d["name"].lower()] = d["id"]
-            dispatched = dispatch_task(run_instagram_scan_task, [urls, job_id_str, mapping, cid_str], job_id_str, "instagram")
+            dispatched = await dispatch_task("run_instagram_scan_task", [urls, job_id_str, mapping, cid_str], job_id_str, "instagram")
 
         elif source == "facebook":
             urls = [d["facebook_url"] for d in dist_list if d.get("facebook_url")]
             mapping = {d["name"].lower(): d["id"] for d in dist_list}
-            dispatched = dispatch_task(run_facebook_scan_task, [urls, job_id_str, mapping, cid_str, "facebook"], job_id_str, "facebook")
+            dispatched = await dispatch_task("run_facebook_scan_task", [urls, job_id_str, mapping, cid_str, "facebook"], job_id_str, "facebook")
 
         elif source == "website":
             urls = [d["website_url"] for d in dist_list if d.get("website_url")]
@@ -189,7 +183,7 @@ async def _trigger_scan(schedule_id: str) -> None:
                 for d in dist_list
                 if d.get("website_url")
             }
-            dispatched = dispatch_task(run_website_scan_task, [urls, job_id_str, mapping, cid_str], job_id_str, "website")
+            dispatched = await dispatch_task("run_website_scan_task", [urls, job_id_str, mapping, cid_str], job_id_str, "website")
 
         if not dispatched:
             log.error("Scheduled scan %s: task dispatch failed, job %s left as failed", schedule_id, job_id_str)
@@ -285,10 +279,9 @@ def upsert_job(schedule: dict) -> None:
 
 def _get_lock_redis() -> redis_lib.Redis:
     """Get a Redis client for scheduler lock operations."""
-    from ..celery_app import celery_app
-    broker_url = str(celery_app.conf.broker_url)
+    redis_url = os.getenv("REDIS_URL", os.getenv("redis_url", "redis://localhost:6379/0"))
     return redis_lib.from_url(
-        broker_url,
+        redis_url,
         socket_connect_timeout=5,
         socket_timeout=5,
     )
@@ -302,29 +295,6 @@ async def _renew_scheduler_lock() -> None:
         r.close()
     except Exception:
         log.warning("Failed to renew scheduler lock", exc_info=True)
-
-
-async def _cleanup_stale_scans() -> None:
-    """Auto-fail scans stuck in 'pending' for more than 5 minutes."""
-    try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-        stale = supabase.table("scan_jobs") \
-            .select("id") \
-            .eq("status", "pending") \
-            .lt("created_at", cutoff) \
-            .execute()
-
-        for job in (stale.data or []):
-            supabase.table("scan_jobs").update({
-                "status": "failed",
-                "error_message": "Scan timed out in pending state — task was not picked up by worker",
-            }).eq("id", job["id"]).execute()
-            log.warning("Auto-failed stale pending scan: %s", job["id"])
-
-        if stale.data:
-            log.info("Cleaned up %d stale pending scan(s)", len(stale.data))
-    except Exception:
-        log.exception("Error cleaning up stale scans")
 
 
 async def _run_retention() -> None:
@@ -343,7 +313,6 @@ async def start() -> None:
         log.info("APScheduler disabled on this instance (SCHEDULER_ENABLED != true)")
         return
 
-    # Singleton: only one worker should run the scheduler
     try:
         r = _get_lock_redis()
         acquired = r.set(_LOCK_KEY, str(os.getpid()), nx=True, ex=_LOCK_TTL)
@@ -359,7 +328,6 @@ async def start() -> None:
     _scheduler.start()
     log.info("APScheduler started (PID %d)", os.getpid())
 
-    # Renew the Redis lock every minute so it doesn't expire
     _scheduler.add_job(
         _renew_scheduler_lock,
         trigger=CronTrigger(minute="*", timezone="UTC"),
@@ -367,16 +335,6 @@ async def start() -> None:
         replace_existing=True,
     )
 
-    # Auto-fail scans stuck in pending for too long (every 5 minutes)
-    _scheduler.add_job(
-        _cleanup_stale_scans,
-        trigger=CronTrigger(minute="*/5", timezone="UTC"),
-        id="stale_scan_cleanup",
-        replace_existing=True,
-    )
-    log.info("Stale scan cleanup scheduled every 5 minutes")
-
-    # Daily data retention sweep at 03:00 UTC
     _scheduler.add_job(
         _run_retention,
         trigger=CronTrigger(hour=3, minute=0, timezone="UTC"),

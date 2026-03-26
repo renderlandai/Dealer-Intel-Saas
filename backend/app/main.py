@@ -122,7 +122,8 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check — verifies database and Celery broker connectivity."""
+    """Health check — verifies database and Redis (ARQ broker) connectivity."""
+    import os
     import re
     import redis as redis_lib
 
@@ -139,22 +140,21 @@ async def health_check():
         log.warning("Health check: database unreachable — %s", e)
 
     try:
-        from .celery_app import celery_app
-        broker_url = str(celery_app.conf.broker_url)
-        masked = re.sub(r"://[^:]*:[^@]*@", "://***:***@", broker_url) if "@" in broker_url else broker_url
+        redis_url = os.getenv("REDIS_URL", os.getenv("redis_url", "redis://localhost:6379/0"))
+        masked = re.sub(r"://[^:]*:[^@]*@", "://***:***@", redis_url) if "@" in redis_url else redis_url
 
-        r = redis_lib.from_url(broker_url, socket_connect_timeout=3)
+        r = redis_lib.from_url(redis_url, socket_connect_timeout=3)
         r.ping()
-        queue_depth = r.llen("celery") or 0
+        queue_depth = r.zcard("arq:queue") or 0
         r.close()
 
         checks["redis"] = "connected"
-        checks["celery_broker_url"] = masked
+        checks["redis_url"] = masked
         checks["task_queue_depth"] = queue_depth
     except Exception as e:
         checks["redis"] = f"error: {type(e).__name__}"
         healthy = False
-        log.warning("Health check: Celery broker unreachable — %s", e)
+        log.warning("Health check: Redis unreachable — %s", e)
 
     status_code = 200 if healthy else 503
     return JSONResponse(

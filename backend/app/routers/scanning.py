@@ -129,16 +129,12 @@ async def start_scan(
     """
     Start a new scan job.
     
-    Dispatches the scan to a Celery worker for durable background execution.
+    Dispatches the scan to an ARQ worker for durable background execution.
     """
     check_channel_allowed(op, scan_request.source.value)
     check_scan_quota(op)
     check_concurrent_scans(op)
-    from ..tasks import (
-        run_google_ads_scan_task, run_facebook_scan_task,
-        run_instagram_scan_task, run_website_scan_task,
-        dispatch_task,
-    )
+    from ..tasks import dispatch_task
 
     job_data = {
         "organization_id": str(user.org_id),
@@ -185,7 +181,7 @@ async def start_scan(
             for d in distributor_list
         }
         log.info("Starting Google Ads scan for %d advertisers, job=%s", len(names), scan_job_id)
-        dispatched = dispatch_task(run_google_ads_scan_task, [names, scan_job_id, mapping, campaign_id_str], scan_job_id, "google_ads")
+        dispatched = await dispatch_task("run_google_ads_scan_task", [names, scan_job_id, mapping, campaign_id_str], scan_job_id, "google_ads")
         
     elif scan_request.source == ScanSource.INSTAGRAM:
         urls = [d["instagram_url"] for d in distributor_list if d.get("instagram_url")]
@@ -198,13 +194,13 @@ async def start_scan(
                     mapping[username.lower()] = d["id"]
                 mapping[d["name"].lower()] = d["id"]
         log.info("Starting Instagram organic scan for %d profiles, job=%s", len(urls), scan_job_id)
-        dispatched = dispatch_task(run_instagram_scan_task, [urls, scan_job_id, mapping, campaign_id_str], scan_job_id, "instagram")
+        dispatched = await dispatch_task("run_instagram_scan_task", [urls, scan_job_id, mapping, campaign_id_str], scan_job_id, "instagram")
 
     elif scan_request.source == ScanSource.FACEBOOK:
         urls = [d["facebook_url"] for d in distributor_list if d.get("facebook_url")]
         mapping = {d["name"].lower(): d["id"] for d in distributor_list}
         log.info("Starting Facebook scan for %d pages, job=%s", len(urls), scan_job_id)
-        dispatched = dispatch_task(run_facebook_scan_task, [urls, scan_job_id, mapping, campaign_id_str, "facebook"], scan_job_id, "facebook")
+        dispatched = await dispatch_task("run_facebook_scan_task", [urls, scan_job_id, mapping, campaign_id_str, "facebook"], scan_job_id, "facebook")
         
     elif scan_request.source == ScanSource.WEBSITE:
         urls = [d["website_url"] for d in distributor_list if d.get("website_url")]
@@ -213,7 +209,7 @@ async def start_scan(
             for d in distributor_list if d.get("website_url")
         }
         log.info("Starting website scan for %d URLs, job=%s: %s", len(urls), scan_job_id, urls)
-        dispatched = dispatch_task(run_website_scan_task, [urls, scan_job_id, mapping, campaign_id_str], scan_job_id, "website")
+        dispatched = await dispatch_task("run_website_scan_task", [urls, scan_job_id, mapping, campaign_id_str], scan_job_id, "website")
 
     if not dispatched:
         raise HTTPException(status_code=503, detail="Failed to queue scan task — the background worker may be unavailable. Please try again.")
@@ -990,11 +986,7 @@ async def retry_scan_job(
     check_scan_quota(op)
     check_concurrent_scans(op)
 
-    from ..tasks import (
-        run_google_ads_scan_task, run_facebook_scan_task,
-        run_instagram_scan_task, run_website_scan_task,
-        dispatch_task,
-    )
+    from ..tasks import dispatch_task
 
     new_job = supabase.table("scan_jobs").insert({
         "organization_id": str(user.org_id),
@@ -1016,7 +1008,7 @@ async def retry_scan_job(
     if source == "google_ads":
         names = [d.get("google_ads_advertiser_id") or d["name"] for d in dist_list]
         mapping = {(d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"] for d in dist_list}
-        dispatched = dispatch_task(run_google_ads_scan_task, [names, new_id, mapping, campaign_id_str], new_id, "google_ads")
+        dispatched = await dispatch_task("run_google_ads_scan_task", [names, new_id, mapping, campaign_id_str], new_id, "google_ads")
     elif source == "instagram":
         urls = [d["instagram_url"] for d in dist_list if d.get("instagram_url")]
         mapping = {}
@@ -1027,18 +1019,18 @@ async def retry_scan_job(
                 if username:
                     mapping[username.lower()] = d["id"]
                 mapping[d["name"].lower()] = d["id"]
-        dispatched = dispatch_task(run_instagram_scan_task, [urls, new_id, mapping, campaign_id_str], new_id, "instagram")
+        dispatched = await dispatch_task("run_instagram_scan_task", [urls, new_id, mapping, campaign_id_str], new_id, "instagram")
     elif source == "facebook":
         urls = [d["facebook_url"] for d in dist_list if d.get("facebook_url")]
         mapping = {d["name"].lower(): d["id"] for d in dist_list}
-        dispatched = dispatch_task(run_facebook_scan_task, [urls, new_id, mapping, campaign_id_str, "facebook"], new_id, "facebook")
+        dispatched = await dispatch_task("run_facebook_scan_task", [urls, new_id, mapping, campaign_id_str, "facebook"], new_id, "facebook")
     elif source == "website":
         urls = [d["website_url"] for d in dist_list if d.get("website_url")]
         mapping = {
             d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: d["id"]
             for d in dist_list if d.get("website_url")
         }
-        dispatched = dispatch_task(run_website_scan_task, [urls, new_id, mapping, campaign_id_str], new_id, "website")
+        dispatched = await dispatch_task("run_website_scan_task", [urls, new_id, mapping, campaign_id_str], new_id, "website")
 
     if not dispatched:
         raise HTTPException(status_code=503, detail="Failed to queue scan task — the background worker may be unavailable. Please try again.")
@@ -1130,9 +1122,9 @@ async def analyze_discovered_images(
 ):
     """
     Analyze discovered images from a completed scan.
-    Dispatched to Celery worker for durable execution.
+    Dispatched to ARQ worker for durable execution.
     """
-    from ..tasks import analyze_scan_task, dispatch_task
+    from ..tasks import dispatch_task
 
     job = supabase.table("scan_jobs")\
         .select("*")\
@@ -1157,8 +1149,8 @@ async def analyze_discovered_images(
     if image_count == 0:
         return {"message": "No unprocessed images found", "count": 0}
     
-    dispatched = dispatch_task(
-        analyze_scan_task,
+    dispatched = await dispatch_task(
+        "run_analyze_scan_task",
         [str(job_id), str(campaign_id) if campaign_id else None],
         str(job_id),
         "analyze_scan",
@@ -1265,11 +1257,7 @@ async def batch_scan(
 
     check_scan_quota(op)
 
-    from ..tasks import (
-        run_google_ads_scan_task, run_facebook_scan_task,
-        run_instagram_scan_task, run_website_scan_task,
-        dispatch_task,
-    )
+    from ..tasks import dispatch_task
 
     distributors = supabase.table("distributors") \
         .select("*") \
@@ -1309,7 +1297,7 @@ async def batch_scan(
         if channel == "google_ads":
             names = [d.get("google_ads_advertiser_id") or d["name"] for d in dist_list]
             mapping = {(d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"] for d in dist_list}
-            dispatch_task(run_google_ads_scan_task, [names, job_id, mapping, campaign_id_str], job_id, "google_ads")
+            await dispatch_task("run_google_ads_scan_task", [names, job_id, mapping, campaign_id_str], job_id, "google_ads")
         elif channel == "instagram":
             urls = [d["instagram_url"] for d in dist_list if d.get("instagram_url")]
             mapping = {}
@@ -1321,12 +1309,12 @@ async def batch_scan(
                         mapping[username.lower()] = d["id"]
                     mapping[d["name"].lower()] = d["id"]
             if urls:
-                dispatch_task(run_instagram_scan_task, [urls, job_id, mapping, campaign_id_str], job_id, "instagram")
+                await dispatch_task("run_instagram_scan_task", [urls, job_id, mapping, campaign_id_str], job_id, "instagram")
         elif channel == "facebook":
             urls = [d["facebook_url"] for d in dist_list if d.get("facebook_url")]
             mapping = {d["name"].lower(): d["id"] for d in dist_list}
             if urls:
-                dispatch_task(run_facebook_scan_task, [urls, job_id, mapping, campaign_id_str, "facebook"], job_id, "facebook")
+                await dispatch_task("run_facebook_scan_task", [urls, job_id, mapping, campaign_id_str, "facebook"], job_id, "facebook")
         elif channel == "website":
             urls = [d["website_url"] for d in dist_list if d.get("website_url")]
             mapping = {
@@ -1334,7 +1322,7 @@ async def batch_scan(
                 for d in dist_list if d.get("website_url")
             }
             if urls:
-                dispatch_task(run_website_scan_task, [urls, job_id, mapping, campaign_id_str], job_id, "website")
+                await dispatch_task("run_website_scan_task", [urls, job_id, mapping, campaign_id_str], job_id, "website")
 
         created_jobs.append({"id": job_id, "source": channel})
 
@@ -1378,9 +1366,9 @@ async def reprocess_unprocessed_images(
 ):
     """
     Reprocess images that were never analyzed.
-    Dispatched to Celery worker for durable execution.
+    Dispatched to ARQ worker for durable execution.
     """
-    from ..tasks import reprocess_images_task, dispatch_task
+    from ..tasks import dispatch_task
 
     campaign = supabase.table("campaigns")\
         .select("organization_id")\
@@ -1419,8 +1407,8 @@ async def reprocess_unprocessed_images(
     if not (assets.count or 0):
         return {"message": "No campaign assets to match against", "count": 0}
     
-    dispatched = dispatch_task(
-        reprocess_images_task,
+    dispatched = await dispatch_task(
+        "run_reprocess_images_task",
         [str(campaign_id), limit],
         str(campaign_id),
         "reprocess_images",
