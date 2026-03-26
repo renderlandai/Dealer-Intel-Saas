@@ -1,13 +1,58 @@
 """Celery task definitions wrapping async scan pipelines."""
 import asyncio
+import base64
+import json
 import logging
+import os
+import ssl as ssl_lib
+import uuid as uuid_mod
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import UUID
+
+import redis as redis_lib
 
 from .celery_app import celery_app
 
 log = logging.getLogger("dealer_intel.tasks")
 
+# ---------------------------------------------------------------------------
+# Redis client for direct task publishing (bypasses kombu's SSL issues)
+# ---------------------------------------------------------------------------
+_redis_publisher: Optional[redis_lib.Redis] = None
+
+
+def _get_redis_publisher() -> redis_lib.Redis:
+    """Return a Redis client connected to the Celery broker.
+
+    Uses redis-py directly (proven reliable via /health) instead of
+    kombu's transport layer which silently drops messages over rediss://.
+    """
+    global _redis_publisher
+    if _redis_publisher is not None:
+        try:
+            _redis_publisher.ping()
+            return _redis_publisher
+        except Exception:
+            _redis_publisher = None
+
+    broker_url = str(celery_app.conf.broker_url)
+    kwargs: Dict[str, Any] = {
+        "socket_connect_timeout": 10,
+        "socket_timeout": 10,
+        "retry_on_timeout": True,
+    }
+    if broker_url.startswith("rediss://"):
+        kwargs["ssl_cert_reqs"] = ssl_lib.CERT_NONE
+
+    _redis_publisher = redis_lib.from_url(broker_url, **kwargs)
+    _redis_publisher.ping()
+    log.info("Redis publisher connected to broker")
+    return _redis_publisher
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _run_async(coro):
     """Run an async coroutine in a new event loop (Celery workers are sync)."""
@@ -36,19 +81,69 @@ def _mark_job_failed(scan_job_id: str, error: str) -> None:
 
 
 def dispatch_task(task: Any, args: Sequence, scan_job_id: str, source: str) -> Optional[str]:
-    """Dispatch a Celery task with error handling.
+    """Publish a Celery task directly to Redis, bypassing kombu.
 
-    Returns the Celery task ID on success, None on failure.
-    On failure the scan job is marked as 'failed' in the database so it
-    doesn't permanently block the concurrent-scan slot.
+    kombu's Redis+SSL transport silently drops messages in some environments.
+    This function builds a Celery-compatible message and LPUSHes it to the
+    ``celery`` queue using redis-py, which we've proven works via /health.
+
+    Returns the task ID on success, None on failure.
     """
     try:
-        result = task.delay(*args)
-        log.info("Task dispatched: source=%s job=%s celery_task_id=%s", source, scan_job_id, result.id)
-        return result.id
+        task_id = str(uuid_mod.uuid4())
+
+        body_raw = json.dumps([
+            list(args), {},
+            {"callbacks": None, "errbacks": None, "chain": None, "chord": None},
+        ])
+        body_b64 = base64.b64encode(body_raw.encode("utf-8")).decode("utf-8")
+
+        message = json.dumps({
+            "body": body_b64,
+            "content-encoding": "utf-8",
+            "content-type": "application/json",
+            "headers": {
+                "lang": "py",
+                "task": task.name,
+                "id": task_id,
+                "root_id": task_id,
+                "parent_id": None,
+                "group": None,
+                "meth": None,
+                "shadow": None,
+                "eta": None,
+                "expires": None,
+                "retries": 0,
+                "timelimit": [
+                    celery_app.conf.task_soft_time_limit,
+                    celery_app.conf.task_time_limit,
+                ],
+                "argsrepr": repr(list(args))[:200],
+                "kwargsrepr": "{}",
+                "origin": f"api@{os.getpid()}",
+                "ignore_result": True,
+            },
+            "properties": {
+                "correlation_id": task_id,
+                "reply_to": "",
+                "delivery_mode": 2,
+                "delivery_info": {"exchange": "", "routing_key": "celery"},
+                "priority": 0,
+                "body_encoding": "base64",
+                "delivery_tag": str(uuid_mod.uuid4()),
+            },
+        })
+
+        r = _get_redis_publisher()
+        r.lpush("celery", message)
+        depth = r.llen("celery")
+
+        log.info("Task published to Redis: source=%s job=%s task_id=%s queue_depth=%d",
+                 source, scan_job_id, task_id, depth)
+        return task_id
     except Exception as e:
-        log.error("DISPATCH FAILED: source=%s job=%s broker=%s error=%s",
-                  source, scan_job_id, celery_app.conf.broker_url, e, exc_info=True)
+        log.error("DISPATCH FAILED: source=%s job=%s error=%s",
+                  source, scan_job_id, e, exc_info=True)
         _mark_job_failed(scan_job_id, f"Task dispatch failed: {e}")
         return None
 

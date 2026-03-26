@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import logging
 import os
+import ssl as ssl_lib
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional
 from uuid import UUID
 
+import redis as redis_lib
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -15,6 +17,8 @@ from ..database import supabase
 log = logging.getLogger("dealer_intel.scheduler")
 
 _scheduler: Optional[AsyncIOScheduler] = None
+_LOCK_KEY = "dealer_intel:scheduler_lock"
+_LOCK_TTL = 300  # seconds
 
 DAY_NAMES = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -280,6 +284,26 @@ def upsert_job(schedule: dict) -> None:
     _register_job(schedule)
 
 
+def _get_lock_redis() -> redis_lib.Redis:
+    """Get a Redis client for scheduler lock operations."""
+    from ..celery_app import celery_app
+    broker_url = str(celery_app.conf.broker_url)
+    kwargs: Dict = {"socket_connect_timeout": 5, "socket_timeout": 5}
+    if broker_url.startswith("rediss://"):
+        kwargs["ssl_cert_reqs"] = ssl_lib.CERT_NONE
+    return redis_lib.from_url(broker_url, **kwargs)
+
+
+async def _renew_scheduler_lock() -> None:
+    """Renew the Redis lock so other workers don't start a second scheduler."""
+    try:
+        r = _get_lock_redis()
+        r.expire(_LOCK_KEY, _LOCK_TTL)
+        r.close()
+    except Exception:
+        log.warning("Failed to renew scheduler lock", exc_info=True)
+
+
 async def _cleanup_stale_scans() -> None:
     """Auto-fail scans stuck in 'pending' for more than 5 minutes."""
     try:
@@ -312,17 +336,36 @@ async def _run_retention() -> None:
 async def start() -> None:
     """Start the APScheduler background scheduler and load persisted schedules.
 
-    Only runs when SCHEDULER_ENABLED=true to prevent duplicate job firing
-    when multiple API instances are deployed.
+    Uses a Redis lock to guarantee only one Gunicorn worker runs the
+    scheduler, even when WEB_CONCURRENCY > 1.
     """
     if os.getenv("SCHEDULER_ENABLED", "true").lower() != "true":
         log.info("APScheduler disabled on this instance (SCHEDULER_ENABLED != true)")
         return
 
+    # Singleton: only one worker should run the scheduler
+    try:
+        r = _get_lock_redis()
+        acquired = r.set(_LOCK_KEY, str(os.getpid()), nx=True, ex=_LOCK_TTL)
+        r.close()
+        if not acquired:
+            log.info("Scheduler already running in another worker — skipping (PID %d)", os.getpid())
+            return
+    except Exception:
+        log.warning("Could not check scheduler lock — starting scheduler anyway", exc_info=True)
+
     global _scheduler
     _scheduler = AsyncIOScheduler(timezone="UTC")
     _scheduler.start()
-    log.info("APScheduler started")
+    log.info("APScheduler started (PID %d)", os.getpid())
+
+    # Renew the Redis lock every minute so it doesn't expire
+    _scheduler.add_job(
+        _renew_scheduler_lock,
+        trigger=CronTrigger(minute="*", timezone="UTC"),
+        id="scheduler_lock_renewal",
+        replace_existing=True,
+    )
 
     # Auto-fail scans stuck in pending for too long (every 5 minutes)
     _scheduler.add_job(
@@ -351,3 +394,9 @@ async def shutdown() -> None:
         _scheduler.shutdown(wait=False)
         log.info("APScheduler shut down")
         _scheduler = None
+        try:
+            r = _get_lock_redis()
+            r.delete(_LOCK_KEY)
+            r.close()
+        except Exception:
+            pass
