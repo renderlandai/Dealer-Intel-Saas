@@ -8,6 +8,7 @@ import {
   Building2,
   Search,
   ScanSearch,
+  ShieldCheck,
   Settings,
   Bell,
   CreditCard,
@@ -27,6 +28,7 @@ const navigation = [
   { name: "Distributors", href: "/distributors", icon: Building2 },
   { name: "Matches", href: "/matches", icon: Search },
   { name: "Scan Jobs", href: "/scans", icon: ScanSearch },
+  { name: "Compliance", href: "/compliance", icon: ShieldCheck },
 ];
 
 const secondaryNav = [

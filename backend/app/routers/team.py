@@ -12,8 +12,9 @@ from slowapi.util import get_remote_address
 from ..auth import AuthUser, get_current_user, clear_profile_cache
 
 limiter = Limiter(key_func=get_remote_address)
-from ..config import get_plan_limits
+from ..config import get_plan_limits, get_settings
 from ..database import supabase
+from ..services.notification_service import send_invite_email
 
 log = logging.getLogger("dealer_intel.team")
 
@@ -177,8 +178,31 @@ async def invite_member(
         "invited_by": str(user.user_id),
     }).execute()
 
+    invite_data = result.data[0]
+
+    # Send invite email with accept link
+    try:
+        settings = get_settings()
+        org = supabase.table("organizations") \
+            .select("name") \
+            .eq("id", str(user.org_id)) \
+            .single().execute()
+        org_name = (org.data or {}).get("name", "Your Organization")
+
+        accept_url = f"{settings.frontend_url}/invite/{invite_data['token']}"
+
+        send_invite_email(
+            to_email=body.email.lower(),
+            org_name=org_name,
+            inviter_email=user.email or "A team member",
+            role=body.role,
+            accept_url=accept_url,
+        )
+    except Exception as e:
+        log.warning("Invite created but email failed for %s***: %s", body.email[:3], e)
+
     log.info("Invite sent to %s*** for org %s by user %s", body.email[:3], user.org_id, user.user_id)
-    return result.data[0]
+    return invite_data
 
 
 @router.delete("/invites/{invite_id}", summary="Cancel invitation")
@@ -256,9 +280,43 @@ async def accept_invite(request: Request, token: UUID, user: AuthUser = Depends(
     except (ValueError, TypeError):
         pass
 
+    new_org_id = invite.data["organization_id"]
+    new_role = invite.data["role"]
+
+    # Move user to the invited organization
+    existing = supabase.table("user_profiles") \
+        .select("id") \
+        .eq("user_id", str(user.user_id)) \
+        .maybe_single().execute()
+
+    if existing.data:
+        supabase.table("user_profiles") \
+            .update({
+                "organization_id": new_org_id,
+                "role": new_role,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }) \
+            .eq("user_id", str(user.user_id)) \
+            .execute()
+    else:
+        supabase.table("user_profiles").insert({
+            "user_id": str(user.user_id),
+            "organization_id": new_org_id,
+            "role": new_role,
+        }).execute()
+
+    # Delete the accepted invite
+    supabase.table("pending_invites") \
+        .delete() \
+        .eq("id", invite.data["id"]) \
+        .execute()
+
+    clear_profile_cache(user.user_id)
+
+    log.info("User %s accepted invite and joined org %s as %s", user.user_id, new_org_id, new_role)
+
     return {
-        "organization_id": invite.data["organization_id"],
-        "role": invite.data["role"],
-        "email": invite.data["email"],
-        "invite_id": invite.data["id"],
+        "status": "accepted",
+        "organization_id": new_org_id,
+        "role": new_role,
     }

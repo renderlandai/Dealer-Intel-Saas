@@ -36,11 +36,17 @@ import {
   submitMatchFeedback,
   getFeedbackStats,
   getBillingUsage,
+  getComplianceRules,
+  createComplianceRule,
+  updateComplianceRule,
+  deleteComplianceRule,
 } from "./api";
 import type {
   MatchFilters,
   DistributorUpdate,
   FeedbackSubmission,
+  ComplianceRuleCreate,
+  ComplianceRuleUpdate,
 } from "./api";
 
 // Query keys for cache management
@@ -71,6 +77,9 @@ export const queryKeys = {
   },
   scans: {
     all: ["scans"] as const,
+  },
+  complianceRules: {
+    all: (activeOnly?: boolean) => ["complianceRules", { activeOnly }] as const,
   },
 };
 
@@ -414,6 +423,45 @@ export function useFeedbackStats() {
   return useQuery({
     queryKey: ["feedbackStats"],
     queryFn: getFeedbackStats,
+  });
+}
+
+// Compliance Rules hooks
+export function useComplianceRules(activeOnly = false) {
+  return useQuery({
+    queryKey: queryKeys.complianceRules.all(activeOnly),
+    queryFn: () => getComplianceRules(activeOnly),
+  });
+}
+
+export function useCreateComplianceRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (rule: ComplianceRuleCreate) => createComplianceRule(rule),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["complianceRules"] });
+    },
+  });
+}
+
+export function useUpdateComplianceRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, updates }: { id: string; updates: ComplianceRuleUpdate }) =>
+      updateComplianceRule(id, updates),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["complianceRules"] });
+    },
+  });
+}
+
+export function useDeleteComplianceRule() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: deleteComplianceRule,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["complianceRules"] });
+    },
   });
 }
 

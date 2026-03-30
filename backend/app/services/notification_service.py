@@ -212,6 +212,47 @@ def notify_scan_complete(
     return _send_via_resend(to=to_email, subject=subject, html=html)
 
 
+def send_invite_email(
+    *,
+    to_email: str,
+    org_name: str,
+    inviter_email: str,
+    role: str,
+    accept_url: str,
+) -> bool:
+    """Send a team invite email with an accept link."""
+    subject = f"[Dealer Intel] You've been invited to join {org_name}"
+
+    html = f"""
+    <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:500px;margin:0 auto;">
+      <div style="background:#334155;padding:20px 24px;">
+        <h1 style="color:#ffffff;font-size:18px;margin:0;">Dealer Intel</h1>
+      </div>
+      <div style="padding:24px;background:#ffffff;">
+        <h2 style="font-size:16px;color:#111827;margin:0 0 8px 0;">You're Invited</h2>
+        <p style="color:#374151;font-size:14px;line-height:1.6;margin:0 0 16px 0;">
+          <strong>{inviter_email}</strong> has invited you to join
+          <strong>{org_name}</strong> as a <strong>{role}</strong> on Dealer Intel.
+        </p>
+        <a href="{accept_url}"
+           style="display:inline-block;background:#334155;color:#ffffff;text-decoration:none;padding:12px 24px;font-size:14px;font-weight:600;">
+          Accept Invitation
+        </a>
+        <p style="color:#6b7280;font-size:12px;margin:16px 0 0 0;">
+          This invitation expires in 7 days. If you don't have an account yet,
+          you'll be asked to sign up first.
+        </p>
+      </div>
+      <div style="padding:16px 24px;background:#f8fafc;border-top:1px solid #e5e7eb;">
+        <p style="color:#9ca3af;font-size:11px;margin:0;">
+          Sent by Dealer Intel &mdash; AI-powered campaign asset compliance monitoring
+        </p>
+      </div>
+    </div>"""
+
+    return _send_via_resend(to=to_email, subject=subject, html=html)
+
+
 def send_test_email(organization_id: UUID) -> dict:
     """Send a test email to verify notifications are working."""
     to_email = _get_org_notify_email(organization_id)

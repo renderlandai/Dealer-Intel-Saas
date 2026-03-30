@@ -308,8 +308,9 @@ function MatchesContent() {
                     return (
                       <TableRow 
                         key={match.id}
-                        className="opacity-0 animate-fade-up"
+                        className="opacity-0 animate-fade-up cursor-pointer hover:bg-secondary/50 transition-colors"
                         style={{ animationDelay: `${250 + index * 30}ms`, animationFillMode: 'forwards' }}
+                        onClick={() => router.push(`/matches/${match.id}`)}
                       >
                         {/* Visual Comparison - Asset vs Discovered */}
                         <TableCell>
@@ -387,7 +388,7 @@ function MatchesContent() {
                             {timeAgo(match.created_at)}
                           </span>
                         </TableCell>
-                        <TableCell>
+                        <TableCell onClick={(e) => e.stopPropagation()}>
                           {feedbackGiven[match.id] ? (
                             <Badge className={
                               feedbackGiven[match.id] === "correct"
@@ -425,7 +426,7 @@ function MatchesContent() {
                             </div>
                           )}
                         </TableCell>
-                        <TableCell>
+                        <TableCell onClick={(e) => e.stopPropagation()}>
                           <div className="flex items-center justify-end gap-1">
                             <Link href={`/matches/${match.id}`}>
                               <Button variant="ghost" size="icon" className="h-8 w-8">

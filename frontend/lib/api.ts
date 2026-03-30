@@ -260,13 +260,37 @@ export interface TeamInvite {
   expires_at: string | null;
 }
 
+export type RuleType = "required_element" | "forbidden_element" | "date_check";
+export type RuleSeverity = "info" | "warning" | "critical";
+
 export interface ComplianceRule {
   id: string;
+  organization_id: string;
   name: string;
   description: string | null;
-  type: string;
-  severity: string;
+  rule_type: RuleType;
+  rule_config: Record<string, unknown>;
+  severity: RuleSeverity;
   is_active: boolean;
+  created_at: string;
+  updated_at: string | null;
+}
+
+export interface ComplianceRuleCreate {
+  name: string;
+  description?: string;
+  rule_type: RuleType;
+  rule_config: Record<string, unknown>;
+  severity?: RuleSeverity;
+}
+
+export interface ComplianceRuleUpdate {
+  name?: string;
+  description?: string;
+  rule_type?: RuleType;
+  rule_config?: Record<string, unknown>;
+  severity?: RuleSeverity;
+  is_active?: boolean;
 }
 
 export interface ComplianceTrendPoint {
@@ -727,6 +751,11 @@ export const removeTeamMember = async (userId: string): Promise<{ message: strin
   return data;
 };
 
+export const acceptInvite = async (token: string): Promise<{ status: string; organization_id: string; role: string }> => {
+  const { data } = await api.post(`/team/invites/${token}/accept`);
+  return data;
+};
+
 // ── Reports ────────────────────────────────────────────────────
 
 export const downloadComplianceReport = async (
@@ -813,4 +842,31 @@ export const updateSchedule = async (
 
 export const deleteSchedule = async (scheduleId: string): Promise<void> => {
   await api.delete(`/schedules/${scheduleId}`);
+};
+
+// ── Compliance Rules ──────────────────────────────────────────
+
+export const getComplianceRules = async (activeOnly = false): Promise<ComplianceRule[]> => {
+  const { data } = await api.get(`/compliance-rules?active_only=${activeOnly}`);
+  return data;
+};
+
+export const getComplianceRule = async (id: string): Promise<ComplianceRule> => {
+  const { data } = await api.get(`/compliance-rules/${id}`);
+  return data;
+};
+
+export const createComplianceRule = async (rule: ComplianceRuleCreate): Promise<ComplianceRule> => {
+  const { data } = await api.post("/compliance-rules", rule);
+  return data;
+};
+
+export const updateComplianceRule = async (id: string, updates: ComplianceRuleUpdate): Promise<ComplianceRule> => {
+  const { data } = await api.patch(`/compliance-rules/${id}`, updates);
+  return data;
+};
+
+export const deleteComplianceRule = async (id: string): Promise<{ status: string }> => {
+  const { data } = await api.delete(`/compliance-rules/${id}`);
+  return data;
 };
