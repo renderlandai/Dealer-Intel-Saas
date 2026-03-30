@@ -24,5 +24,4 @@ accesslog = "-"
 errorlog = "-"
 loglevel = os.getenv("LOG_LEVEL", "info")
 
-# Preload app so CLIP model loads once, shared across workers
-preload_app = True
+preload_app = False

@@ -38,21 +38,6 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 async def lifespan(application: FastAPI):
     await scheduler_service.start()
 
-    # Pre-warm CLIP model in a background thread so the first scan doesn't
-    # block the event loop for minutes while downloading/loading the model.
-    import asyncio
-    from .services import embedding_service
-
-    async def _warmup_clip():
-        loop = asyncio.get_running_loop()
-        ok = await loop.run_in_executor(None, embedding_service.warmup)
-        if ok:
-            log.info("CLIP model pre-warmed successfully")
-        else:
-            log.warning("CLIP model not available — embedding pre-filter will be skipped")
-
-    asyncio.create_task(_warmup_clip())
-
     yield
     await scheduler_service.shutdown()
 
