@@ -15,10 +15,10 @@ import { campaignCreateSchema } from "@/lib/schemas";
 interface Campaign {
   id: string;
   name: string;
-  description?: string;
+  description: string | null;
   status: string;
-  start_date?: string;
-  end_date?: string;
+  start_date: string | null;
+  end_date: string | null;
   asset_count: number;
   created_at: string;
 }
@@ -32,7 +32,7 @@ export default function CampaignsPage() {
   const handleCreate = async () => {
     const parsed = campaignCreateSchema.safeParse(newCampaign);
     if (!parsed.success) {
-      alert(parsed.error.errors[0].message);
+      alert(parsed.error.issues[0].message);
       return;
     }
 

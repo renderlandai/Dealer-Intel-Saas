@@ -88,7 +88,7 @@ export default function SettingsPage() {
 
     const parsed = orgSettingsSchema.safeParse({ name: trimmed });
     if (!parsed.success) {
-      alert(parsed.error.errors[0].message);
+      alert(parsed.error.issues[0].message);
       return;
     }
 
@@ -133,7 +133,7 @@ export default function SettingsPage() {
       notify_on_violation: notifyOn,
     });
     if (!parsed.success) {
-      alert(parsed.error.errors[0].message);
+      alert(parsed.error.issues[0].message);
       return;
     }
 
@@ -699,7 +699,7 @@ export default function SettingsPage() {
 
         {/* Team Management */}
         <TeamSection
-          maxSeats={billing?.features?.max_user_seats ?? null}
+          maxSeats={(billing as any)?.features?.max_user_seats ?? null}
         />
       </div>
     </div>

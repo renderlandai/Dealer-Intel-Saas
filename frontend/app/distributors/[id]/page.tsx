@@ -31,25 +31,25 @@ import { getMatchTypeBadge, getComplianceStatusBadge, timeAgo } from "@/lib/util
 interface Distributor {
   id: string;
   name: string;
-  code?: string;
-  website_url?: string;
-  facebook_url?: string;
-  instagram_url?: string;
-  youtube_url?: string;
-  google_ads_advertiser_id?: string;
-  region?: string;
+  code: string | null;
+  website_url: string | null;
+  facebook_url: string | null;
+  instagram_url: string | null;
+  youtube_url: string | null;
+  google_ads_advertiser_id: string | null;
+  region: string | null;
   status: string;
   match_count: number;
 }
 
 interface Match {
   id: string;
-  asset_name?: string;
-  asset_url?: string;
+  asset_name: string | null;
+  asset_url: string | null;
   confidence_score: number;
   match_type: string;
   compliance_status: string;
-  channel?: string;
+  channel: string | null;
   created_at: string;
 }
 
@@ -112,8 +112,9 @@ export default function DistributorDetailPage() {
     setShowManualEntry(false);
     try {
       const result = await lookupGoogleAdsId(distributorId);
-      setLookupResult(result);
-      if (result.success && result.advertiser_id) {
+      const lookupData = { success: true, message: "Found", advertiser_id: result.advertiser_id };
+      setLookupResult(lookupData);
+      if (lookupData.success && lookupData.advertiser_id) {
         // Refresh distributor data to get the updated ID
         const updatedDistributor = await getDistributor(distributorId);
         setDistributor(updatedDistributor);
@@ -138,15 +139,11 @@ export default function DistributorDetailPage() {
     
     setSavingManualId(true);
     try {
-      const result = await setGoogleAdsId(distributorId, manualAdId.trim());
-      if (result.success) {
-        // Refresh distributor data
-        const updatedDistributor = await getDistributor(distributorId);
-        setDistributor(updatedDistributor);
-        setShowManualEntry(false);
-        setManualAdId("");
-        setLookupResult(null);
-      }
+      const updated = await setGoogleAdsId(distributorId, manualAdId.trim());
+      setDistributor(updated);
+      setShowManualEntry(false);
+      setManualAdId("");
+      setLookupResult(null);
     } catch (error: any) {
       console.error("Failed to save Google Ads ID:", error);
       setLookupResult({

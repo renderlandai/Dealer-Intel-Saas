@@ -383,7 +383,7 @@ export const getAlerts = async (unreadOnly = false, limit = 50, offset = 0): Pro
   return data;
 };
 
-export const getUnreadAlertCount = async (): Promise<{ count: number }> => {
+export const getUnreadAlertCount = async (): Promise<{ unread_count: number }> => {
   const { data } = await api.get("/alerts/count");
   return data;
 };

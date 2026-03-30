@@ -10,10 +10,10 @@ interface Alert {
   alert_type: string;
   severity: string;
   title: string;
-  description?: string;
+  description: string | null;
   created_at: string;
   is_read: boolean;
-  match_id?: string;
+  match_id: string | null;
 }
 
 interface AlertsPanelProps {

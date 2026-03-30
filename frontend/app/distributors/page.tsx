@@ -25,13 +25,13 @@ import { distributorCreateSchema, distributorUpdateSchema } from "@/lib/schemas"
 interface Distributor {
   id: string;
   name: string;
-  code?: string;
-  website_url?: string;
-  facebook_url?: string;
-  instagram_url?: string;
-  youtube_url?: string;
-  google_ads_advertiser_id?: string;
-  region?: string;
+  code: string | null;
+  website_url: string | null;
+  facebook_url: string | null;
+  instagram_url: string | null;
+  youtube_url: string | null;
+  google_ads_advertiser_id: string | null;
+  region: string | null;
   status: string;
   match_count: number;
 }
@@ -63,7 +63,7 @@ export default function DistributorsPage() {
   const handleCreate = async () => {
     const parsed = distributorCreateSchema.safeParse(newDistributor);
     if (!parsed.success) {
-      alert(parsed.error.errors[0].message);
+      alert(parsed.error.issues[0].message);
       return;
     }
 
@@ -98,7 +98,7 @@ export default function DistributorsPage() {
 
     const parsed = distributorUpdateSchema.safeParse(editForm);
     if (!parsed.success) {
-      alert(parsed.error.errors[0].message);
+      alert(parsed.error.issues[0].message);
       return;
     }
 

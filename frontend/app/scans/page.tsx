@@ -52,16 +52,18 @@ interface PipelineStats {
 
 interface ScanJob {
   id: string;
-  campaign_id?: string;
+  campaign_id: string | null;
   source: string;
   status: string;
-  started_at?: string;
-  completed_at?: string;
+  started_at: string | null;
+  completed_at: string | null;
   total_items: number;
   processed_items: number;
   matches_count: number;
-  error_message?: string;
-  pipeline_stats?: PipelineStats;
+  error_message: string | null;
+  pipeline_stats: PipelineStats | null;
+  organization_id: string;
+  apify_run_id: string | null;
   created_at: string;
 }
 
@@ -304,7 +306,7 @@ export default function ScansPage() {
               </div>
               {batchScanMutation.isSuccess && batchScanMutation.data && (
                 <p className="text-xs text-success mt-2">
-                  {batchScanMutation.data.message}
+                  Started {Array.isArray(batchScanMutation.data) ? batchScanMutation.data.length : 0} scan(s)
                 </p>
               )}
             </CardContent>
@@ -357,7 +359,7 @@ export default function ScansPage() {
           </Card>
         ) : (
           <div className="space-y-3">
-            {scanJobs.map((job: ScanJob) => (
+            {scanJobs.map((job: any) => (
               <Card key={job.id}>
                 <CardContent className="p-6">
                   <div className="flex items-center justify-between">

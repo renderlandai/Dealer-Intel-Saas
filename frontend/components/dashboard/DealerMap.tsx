@@ -5,7 +5,7 @@ import React, { useState, useEffect, useRef, memo } from "react";
 interface Distributor {
   id: string;
   name: string;
-  region?: string;
+  region: string | null;
   status: string;
   match_count?: number;
   has_violation?: boolean;
@@ -15,7 +15,7 @@ interface Distributor {
     longitude?: number;
     lat?: number;
     lng?: number;
-  };
+  } | null;
 }
 
 interface DealerMapProps {

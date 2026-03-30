@@ -18,8 +18,8 @@ export const distributorUpdateSchema = distributorCreateSchema.partial();
 
 export const scheduleCreateSchema = z.object({
   campaign_id: z.string().uuid("Invalid campaign"),
-  source: z.enum(["google_ads", "facebook", "instagram", "website"], { errorMap: () => ({ message: "Invalid scan source" }) }),
-  frequency: z.enum(["daily", "weekly", "biweekly", "monthly"], { errorMap: () => ({ message: "Invalid frequency" }) }),
+  source: z.enum(["google_ads", "facebook", "instagram", "website"], { message: "Invalid scan source" }),
+  frequency: z.enum(["daily", "weekly", "biweekly", "monthly"], { message: "Invalid frequency" }),
   run_at_time: z.string().regex(/^\d{2}:\d{2}$/, "Must be HH:MM format").default("09:00"),
   run_on_day: z.number().min(0).max(6).optional().nullable(),
 });

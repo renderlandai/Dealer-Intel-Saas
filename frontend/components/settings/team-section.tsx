@@ -27,9 +27,12 @@ import {
 } from "@/lib/api";
 
 interface Member {
-  user_id: string;
+  id: string;
+  user_id?: string;
   email: string;
+  full_name?: string | null;
   role: string;
+  joined_at?: string;
   created_at?: string;
 }
 
@@ -37,7 +40,9 @@ interface Invite {
   id: string;
   email: string;
   role: string;
-  expires_at: string;
+  status?: string;
+  invited_by?: string;
+  expires_at: string | null;
   created_at?: string;
 }
 
@@ -175,7 +180,7 @@ export function TeamSection({ maxSeats }: TeamSectionProps) {
                   </div>
                   {isAdmin && m.role !== "owner" && (
                     <button
-                      onClick={() => handleRemoveMember(m.user_id)}
+                      onClick={() => handleRemoveMember(m.user_id || m.id)}
                       className="p-1 text-muted-foreground hover:text-destructive transition-colors"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
@@ -203,7 +208,7 @@ export function TeamSection({ maxSeats }: TeamSectionProps) {
                       <p className="text-sm truncate">{inv.email}</p>
                       <p className="text-2xs text-muted-foreground flex items-center gap-1 mt-0.5">
                         <Clock className="h-3 w-3" />
-                        Expires {new Date(inv.expires_at).toLocaleDateString()}
+                        Expires {inv.expires_at ? new Date(inv.expires_at).toLocaleDateString() : "N/A"}
                       </p>
                     </div>
                     <span className="text-xs text-muted-foreground capitalize">{inv.role}</span>

@@ -55,15 +55,21 @@ interface Asset {
   id: string;
   name: string;
   file_url: string;
-  file_type?: string;
-  file_size?: number;
+  file_type: string | null;
+  file_size: number | null;
+  thumbnail_url: string | null;
+  width: number | null;
+  height: number | null;
+  metadata: Record<string, unknown>;
+  campaign_id: string;
   created_at: string;
+  updated_at: string;
 }
 
 interface Campaign {
   id: string;
   name: string;
-  description?: string;
+  description: string | null;
   status: string;
   asset_count: number;
 }
@@ -72,39 +78,44 @@ interface ScanJob {
   id: string;
   status: string;
   source: string;
-  started_at?: string;
-  completed_at?: string;
+  started_at: string | null;
+  completed_at: string | null;
   total_items: number;
   processed_items: number;
-  error_message?: string;
+  matches_count: number;
+  error_message: string | null;
+  pipeline_stats: Record<string, unknown> | null;
+  organization_id: string;
+  campaign_id: string | null;
+  apify_run_id: string | null;
   created_at: string;
 }
 
 interface Match {
   id: string;
-  asset_name?: string;
-  asset_url?: string;
-  distributor_name?: string;
+  asset_name: string | null;
+  asset_url: string | null;
+  distributor_name: string | null;
   confidence_score: number;
   match_type: string;
   compliance_status: string;
-  previous_compliance_status?: string;
-  source_url?: string;
-  channel?: string;
+  previous_compliance_status: string | null;
+  source_url: string | null;
+  channel: string | null;
   created_at: string;
-  last_seen_at?: string;
-  scan_count?: number;
+  last_seen_at: string | null;
+  scan_count: number;
 }
 
 interface ScanStats {
   total_scans: number;
   completed_scans: number;
-  running_scans: number;
-  failed_scans: number;
+  running_scans?: number;
+  failed_scans?: number;
   total_matches: number;
-  violations: number;
-  compliant: number;
-  pending_review: number;
+  violations?: number;
+  compliant?: number;
+  pending_review?: number;
   last_scan?: ScanJob;
 }
 

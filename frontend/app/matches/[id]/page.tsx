@@ -28,23 +28,23 @@ import { getMatchTypeBadge, getComplianceStatusBadge, formatDateTime } from "@/l
 
 interface Match {
   id: string;
-  asset_name?: string;
-  asset_url?: string;
-  distributor_name?: string;
-  campaign_name?: string;
+  asset_name: string | null;
+  asset_url: string | null;
+  distributor_name: string | null;
+  campaign_name: string | null;
   confidence_score: number;
   match_type: string;
   compliance_status: string;
   compliance_issues: any[];
-  channel?: string;
-  source_url?: string;
-  screenshot_url?: string;
+  channel: string | null;
+  source_url: string | null;
+  screenshot_url: string | null;
   discovered_image_url?: string;
   is_modified: boolean;
   modifications: string[];
   ai_analysis?: any;
   created_at: string;
-  discovered_at?: string;
+  discovered_at: string | null;
 }
 
 export default function MatchDetailPage() {
@@ -260,7 +260,7 @@ export default function MatchDetailPage() {
               {/* Use discovered_image_url which falls back to discovered_images.image_url */}
               {(match.discovered_image_url || match.screenshot_url) ? (
                 <a 
-                  href={match.discovered_image_url || match.screenshot_url} 
+                  href={match.discovered_image_url || match.screenshot_url || ""} 
                   target="_blank" 
                   rel="noopener noreferrer"
                   className="block"

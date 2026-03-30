@@ -40,17 +40,17 @@ import {
 
 interface Match {
   id: string;
-  asset_name?: string;
-  asset_url?: string;
-  screenshot_url?: string;
+  asset_name: string | null;
+  asset_url: string | null;
+  screenshot_url: string | null;
   discovered_image_url?: string;
-  distributor_name?: string;
-  campaign_name?: string;
+  distributor_name: string | null;
+  campaign_name: string | null;
   confidence_score: number;
   match_type: string;
   compliance_status: string;
-  channel?: string;
-  source_url?: string;
+  channel: string | null;
+  source_url: string | null;
   created_at: string;
   is_modified: boolean;
 }
@@ -63,13 +63,14 @@ function MatchesContent() {
   const { data: matches = [], isLoading: loading } = useMatches(
     statusFilter ? { status: statusFilter } : undefined
   );
-  const { data: stats = {
+  const { data: rawStats } = useMatchStats();
+  const stats = (rawStats as any) || {
     total_matches: 0,
     compliant: 0,
     violations: 0,
     pending_review: 0,
     compliance_rate: 0,
-  } } = useMatchStats();
+  };
   const approveMutation = useApproveMatch();
   const flagMutation = useFlagMatch();
   const deleteMatchMutation = useDeleteMatch();

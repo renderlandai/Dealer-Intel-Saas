@@ -14,7 +14,7 @@ interface UsageRow {
 interface UsageCardProps {
   dealers: { current: number; max: number | null };
   campaigns: { current: number; max: number | null };
-  scans: { current: number; max: number | null; period: string };
+  scans: { current: number; max: number | null; period?: string };
   plan: string;
 }
 

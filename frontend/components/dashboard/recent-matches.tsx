@@ -11,13 +11,13 @@ import { getMatchTypeBadge, getComplianceStatusBadge } from "@/lib/utils";
 
 interface Match {
   id: string;
-  asset_name?: string;
-  asset_url?: string;
-  distributor_name?: string;
+  asset_name: string | null;
+  asset_url: string | null;
+  distributor_name: string | null;
   confidence_score: number;
   match_type: string;
   compliance_status: string;
-  channel?: string;
+  channel: string | null;
   created_at: string;
 }
 
