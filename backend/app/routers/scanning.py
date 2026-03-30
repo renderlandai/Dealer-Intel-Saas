@@ -27,6 +27,16 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _heartbeat(scan_job_id) -> None:
+    """Touch the scan job's updated_at so the cleanup job knows we're alive."""
+    try:
+        supabase.table("scan_jobs").update({
+            "updated_at": _utc_now(),
+        }).eq("id", str(scan_job_id)).execute()
+    except Exception:
+        pass
+
+
 def _send_scan_notifications(
     scan_job_id: UUID,
     scan_source: str = "",
@@ -118,7 +128,7 @@ def _send_scan_notifications(
 router = APIRouter(prefix="/scans", tags=["scanning"])
 
 
-@router.post("/start", response_model=ScanJob)
+@router.post("/start", response_model=ScanJob, summary="Start scan job")
 @limiter.limit("10/minute")
 async def start_scan(
     request: Request,
@@ -240,6 +250,11 @@ async def run_google_ads_scan(
 ):
     """Background task — fetch ad creatives via SerpApi, then analyse."""
     try:
+        supabase.table("scan_jobs").update({
+            "status": "running",
+            "started_at": _utc_now(),
+        }).eq("id", str(scan_job_id)).execute()
+
         campaign_assets = await _fetch_campaign_assets(campaign_id)
 
         from ..config import get_settings
@@ -285,6 +300,11 @@ async def run_facebook_scan(
 ):
     """Background task — extract ad images from Meta Ad Library pages."""
     try:
+        supabase.table("scan_jobs").update({
+            "status": "running",
+            "started_at": _utc_now(),
+        }).eq("id", str(scan_job_id)).execute()
+
         campaign_assets = await _fetch_campaign_assets(campaign_id)
 
         from ..config import get_settings
@@ -330,6 +350,11 @@ async def run_instagram_scan(
 ):
     """Background task — extract organic post images from Instagram profiles."""
     try:
+        supabase.table("scan_jobs").update({
+            "status": "running",
+            "started_at": _utc_now(),
+        }).eq("id", str(scan_job_id)).execute()
+
         campaign_assets = await _fetch_campaign_assets(campaign_id)
 
         discovered_count = await apify_instagram_service.scan_instagram_organic(
@@ -353,6 +378,49 @@ async def run_instagram_scan(
             "status": "failed",
             "error_message": str(e),
         }).eq("id", str(scan_job_id)).execute()
+
+
+async def _prune_duplicate_matches(scan_job_id: UUID) -> int:
+    """Keep only the highest-confidence match per (asset_id, distributor_id).
+
+    When scanning many pages, multiple images may match the same campaign
+    asset for the same distributor at different confidence levels.  Only
+    the best one should survive — the rest are noise.
+
+    Returns the number of pruned (deleted) match rows.
+    """
+    try:
+        all_matches = supabase.table("matches")\
+            .select("id, asset_id, distributor_id, confidence_score, discovered_image_id")\
+            .eq("discovered_images.scan_job_id", str(scan_job_id))\
+            .order("confidence_score", desc=True)\
+            .execute()
+
+        if not all_matches.data:
+            return 0
+
+        best: dict[tuple, str] = {}
+        to_delete: list[str] = []
+
+        for m in all_matches.data:
+            key = (m.get("asset_id"), m.get("distributor_id"))
+            if key not in best:
+                best[key] = m["id"]
+            else:
+                to_delete.append(m["id"])
+
+        if not to_delete:
+            return 0
+
+        for match_id in to_delete:
+            supabase.table("matches").delete().eq("id", match_id).execute()
+
+        log.info("Pruned %d duplicate matches for scan %s", len(to_delete), scan_job_id)
+        return len(to_delete)
+
+    except Exception as e:
+        log.warning("Match deduplication failed (non-fatal): %s", e)
+        return 0
 
 
 async def _analyze_single_image(
@@ -527,6 +595,13 @@ async def run_website_scan(
              scan_job_id, website_urls, campaign_id)
 
     try:
+        # Mark running IMMEDIATELY so the cleanup job doesn't kill us
+        # during the (potentially slow) prep phase.
+        supabase.table("scan_jobs").update({
+            "status": "running",
+            "started_at": _utc_now(),
+        }).eq("id", str(scan_job_id)).execute()
+
         from ..config import get_settings
         _settings = get_settings()
 
@@ -538,7 +613,6 @@ async def run_website_scan(
         all_asset_ids = {str(a["id"]) for a in campaign_assets} if can_early_stop else set()
         matched_asset_ids: set = set()
 
-        # Track which pages produce matches (for cache update at the end)
         page_match_tracker: Dict[str, set] = {}
 
         asset_hashes: Dict = {}
@@ -555,6 +629,7 @@ async def run_website_scan(
             asset_hashes = await ai_service._precompute_asset_hashes(campaign_assets)
             asset_embeddings = await ai_service._precompute_asset_embeddings(campaign_assets)
             log.info("Cached %d hash sets, %d CLIP embeddings", len(asset_hashes), len(asset_embeddings))
+            _heartbeat(scan_job_id)
 
             if org_id:
                 rules = supabase.table("compliance_rules")\
@@ -581,11 +656,6 @@ async def run_website_scan(
                         str(campaign_id) if campaign_id else None,
                     )
                     cached_pages.extend(cached)
-
-        supabase.table("scan_jobs").update({
-            "status": "running",
-            "started_at": _utc_now(),
-        }).eq("id", str(scan_job_id)).execute()
 
         total_discovered = 0
 
@@ -657,6 +727,7 @@ async def run_website_scan(
 
             log.info("Phase 2: %d additional page(s) from discovery (after %d cached)",
                      pages_from_discovery, len(cached_pages))
+            _heartbeat(scan_job_id)
 
         pipeline_stats: Dict[str, Any] = {
             "total_images": 0,
@@ -686,6 +757,7 @@ async def run_website_scan(
             for page_idx, page_url in enumerate(remaining_to_scan):
                 overall_idx = len(cached_pages) + page_idx
                 log.info("[Page %d/%d] Extracting: %s", overall_idx + 1, total_pages, page_url)
+                _heartbeat(scan_job_id)
 
                 distributor_id = extraction_service._match_distributor_by_domain(
                     page_url, distributor_mapping)
@@ -751,7 +823,15 @@ async def run_website_scan(
             log.info("Starting batch analysis for campaign %s", campaign_id)
             await auto_analyze_scan(scan_job_id, campaign_id)
 
-        total_matches = pipeline_stats["matched_new"] + pipeline_stats["matched_confirmed"]
+        # ---- Deduplicate: keep only the best match per asset per distributor ----
+        pruned = await _prune_duplicate_matches(scan_job_id)
+        pipeline_stats["matches_pruned"] = pruned
+
+        total_matches = (
+            pipeline_stats["matched_new"]
+            + pipeline_stats["matched_confirmed"]
+            - pruned
+        )
 
         cache_stats = ai_service.get_image_cache_stats()
         pipeline_stats["image_cache"] = cache_stats
@@ -929,7 +1009,7 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             log.error("Failed to update scan job status after analysis error: %s", db_err)
 
 
-@router.get("", response_model=List[ScanJob])
+@router.get("", response_model=List[ScanJob], summary="List scan jobs")
 async def list_scan_jobs(
     status: Optional[str] = None,
     limit: int = 20,
@@ -945,7 +1025,7 @@ async def list_scan_jobs(
     return result.data
 
 
-@router.get("/{job_id}", response_model=ScanJob)
+@router.get("/{job_id}", response_model=ScanJob, summary="Get scan job")
 async def get_scan_job(job_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get scan job details."""
     result = supabase.table("scan_jobs")\
@@ -961,7 +1041,7 @@ async def get_scan_job(job_id: UUID, user: AuthUser = Depends(get_current_user))
     return result.data
 
 
-@router.post("/{job_id}/retry", response_model=ScanJob)
+@router.post("/{job_id}/retry", response_model=ScanJob, summary="Retry failed scan")
 async def retry_scan_job(
     job_id: UUID,
     user: AuthUser = Depends(get_current_user),
@@ -1039,7 +1119,7 @@ async def retry_scan_job(
     return new_job.data[0]
 
 
-@router.delete("/{job_id}")
+@router.delete("/{job_id}", summary="Delete scan job")
 async def delete_scan_job(job_id: UUID, user: AuthUser = Depends(get_current_user)):
     """
     Delete a scan job and all its associated data.
@@ -1077,7 +1157,7 @@ async def delete_scan_job(job_id: UUID, user: AuthUser = Depends(get_current_use
     return {"status": "deleted", "job_id": str(job_id)}
 
 
-@router.delete("")
+@router.delete("", summary="Delete all scans")
 async def delete_all_scans(user: AuthUser = Depends(get_current_user)):
     """
     Delete all scan jobs and associated data for the current org.
@@ -1114,7 +1194,7 @@ async def delete_all_scans(user: AuthUser = Depends(get_current_user)):
     return {"status": "deleted", "count": len(job_ids)}
 
 
-@router.post("/{job_id}/analyze")
+@router.post("/{job_id}/analyze", summary="Analyze discovered images")
 async def analyze_discovered_images(
     job_id: UUID,
     campaign_id: Optional[UUID] = None,
@@ -1240,7 +1320,7 @@ async def run_image_analysis(
         }).eq("id", str(job_id)).execute()
 
 
-@router.post("/batch")
+@router.post("/batch", summary="Batch scan all channels")
 @limiter.limit("2/minute")
 async def batch_scan(
     request: Request,
@@ -1335,7 +1415,7 @@ async def batch_scan(
     }
 
 
-@router.post("/quick-scan")
+@router.post("/quick-scan", summary="Quick scan")
 async def quick_scan(
     source: ScanSource,
     user: AuthUser = Depends(get_current_user),
@@ -1358,7 +1438,7 @@ async def quick_scan(
     }
 
 
-@router.post("/reprocess-unprocessed")
+@router.post("/reprocess-unprocessed", summary="Reprocess unprocessed images")
 async def reprocess_unprocessed_images(
     campaign_id: UUID,
     limit: int = 100,
@@ -1423,7 +1503,7 @@ async def reprocess_unprocessed_images(
     }
 
 
-@router.get("/debug/{scan_id}")
+@router.get("/debug/{scan_id}", summary="Debug scan details")
 async def debug_scan(scan_id: UUID, user: AuthUser = Depends(get_current_user)):
     """
     Debug endpoint to inspect scan details and identify issues.

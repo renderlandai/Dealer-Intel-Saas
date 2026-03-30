@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from pydantic import BaseModel
 
 from ..auth import AuthUser, get_current_user
@@ -17,6 +19,7 @@ from ..plan_enforcement import (
 )
 
 log = logging.getLogger("dealer_intel.schedules")
+limiter = Limiter(key_func=get_remote_address)
 router = APIRouter(prefix="/schedules", tags=["schedules"])
 
 
@@ -72,8 +75,9 @@ def _validate_time(t: str) -> None:
         raise HTTPException(400, "run_at_time must be valid HH:MM (00:00 – 23:59)")
 
 
-@router.get("", response_model=List[ScheduleOut])
+@router.get("", response_model=List[ScheduleOut], summary="List scan schedules")
 async def list_schedules(campaign_id: Optional[UUID] = None, user: AuthUser = Depends(get_current_user)):
+    """List all scan schedules for the current organization."""
     try:
         query = supabase.table("scan_schedules").select("*").eq("organization_id", str(user.org_id)).order("created_at", desc=True)
         if campaign_id:
@@ -86,8 +90,10 @@ async def list_schedules(campaign_id: Optional[UUID] = None, user: AuthUser = De
         raise
 
 
-@router.post("", response_model=ScheduleOut, status_code=201)
-async def create_schedule(body: ScheduleCreate, op: OrgPlan = Depends(get_org_plan)):
+@router.post("", response_model=ScheduleOut, status_code=201, summary="Create scan schedule")
+@limiter.limit("10/minute")
+async def create_schedule(request: Request, body: ScheduleCreate, user: AuthUser = Depends(get_current_user), op: OrgPlan = Depends(get_org_plan)):
+    """Create a new scan schedule for a campaign."""
     if body.source not in VALID_SOURCES:
         raise HTTPException(400, f"source must be one of {VALID_SOURCES}")
     if body.frequency not in VALID_FREQS:
@@ -104,13 +110,14 @@ async def create_schedule(body: ScheduleCreate, op: OrgPlan = Depends(get_org_pl
         supabase.table("campaigns")
         .select("organization_id")
         .eq("id", str(body.campaign_id))
+        .eq("organization_id", str(user.org_id))
         .single()
         .execute()
     )
     if not campaign.data:
         raise HTTPException(404, "Campaign not found")
 
-    org_id = campaign.data["organization_id"]
+    org_id = str(user.org_id)
     next_run = scheduler_service.compute_next_run(body.frequency, body.run_at_time, body.run_on_day)
 
     row = {
@@ -137,8 +144,10 @@ async def create_schedule(body: ScheduleCreate, op: OrgPlan = Depends(get_org_pl
     return created
 
 
-@router.patch("/{schedule_id}", response_model=ScheduleOut)
-async def update_schedule(schedule_id: UUID, body: ScheduleUpdate):
+@router.patch("/{schedule_id}", response_model=ScheduleOut, summary="Update scan schedule")
+@limiter.limit("20/minute")
+async def update_schedule(request: Request, schedule_id: UUID, body: ScheduleUpdate, user: AuthUser = Depends(get_current_user)):
+    """Update an existing scan schedule."""
     updates: dict = {"updated_at": datetime.now(timezone.utc).isoformat()}
 
     if body.frequency is not None:
@@ -160,7 +169,7 @@ async def update_schedule(schedule_id: UUID, body: ScheduleUpdate):
 
     # Recompute next_run_at if timing changed
     if any(k in updates for k in ("frequency", "run_at_time", "run_on_day")):
-        existing = supabase.table("scan_schedules").select("*").eq("id", str(schedule_id)).single().execute()
+        existing = supabase.table("scan_schedules").select("*").eq("id", str(schedule_id)).eq("organization_id", str(user.org_id)).single().execute()
         if not existing.data:
             raise HTTPException(404, "Schedule not found")
         merged = {**existing.data, **updates}
@@ -174,6 +183,7 @@ async def update_schedule(schedule_id: UUID, body: ScheduleUpdate):
         supabase.table("scan_schedules")
         .update(updates)
         .eq("id", str(schedule_id))
+        .eq("organization_id", str(user.org_id))
         .execute()
     )
     if not result.data:
@@ -184,13 +194,16 @@ async def update_schedule(schedule_id: UUID, body: ScheduleUpdate):
     return updated
 
 
-@router.delete("/{schedule_id}", status_code=204)
-async def delete_schedule(schedule_id: UUID):
+@router.delete("/{schedule_id}", status_code=204, summary="Delete scan schedule")
+@limiter.limit("10/minute")
+async def delete_schedule(request: Request, schedule_id: UUID, user: AuthUser = Depends(get_current_user)):
+    """Delete a scan schedule."""
     scheduler_service.remove_job(str(schedule_id))
     result = (
         supabase.table("scan_schedules")
         .delete()
         .eq("id", str(schedule_id))
+        .eq("organization_id", str(user.org_id))
         .execute()
     )
     if not result.data:

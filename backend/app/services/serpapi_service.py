@@ -125,11 +125,10 @@ async def scan_google_ads(
         try:
             creatives = await _fetch_ad_creatives(adv_id)
         except httpx.HTTPStatusError as e:
-            body = e.response.text[:500]
-            log.error("SerpApi HTTP error for %s: %d — %s", adv_id, e.response.status_code, body)
+            log.error("SerpApi HTTP error for %s: %d", adv_id, e.response.status_code)
             continue
         except Exception as e:
-            log.error("SerpApi error for %s: %s", adv_id, e)
+            log.error("SerpApi error for %s: %s", adv_id, type(e).__name__)
             continue
 
         if not creatives:

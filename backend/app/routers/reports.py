@@ -16,7 +16,7 @@ log = logging.getLogger("dealer_intel.reports")
 router = APIRouter(prefix="/reports", tags=["reports"])
 
 
-@router.get("/compliance")
+@router.get("/compliance", summary="Download compliance report")
 async def download_compliance_report(
     format: str = Query("pdf", pattern="^(pdf|csv)$"),
     days: int = Query(30, ge=1, le=365),

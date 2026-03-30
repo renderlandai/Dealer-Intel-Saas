@@ -11,9 +11,12 @@ worker_class = "uvicorn.workers.UvicornWorker"
 # Playwright + CLIP model are memory-heavy, so 2 workers is safe.
 workers = int(os.getenv("WEB_CONCURRENCY", min(2, multiprocessing.cpu_count())))
 
-# Timeouts — scans can be long-running
-timeout = 300
-graceful_timeout = 120
+# Timeouts — scans are long-running background tasks (Playwright + Claude API
+# calls across 15+ pages).  The worker timeout must be high enough that heavy
+# async work (CLIP model loading, multi-page scans) never causes the
+# Gunicorn arbiter to kill a worker mid-scan.
+timeout = 1800
+graceful_timeout = 300
 keepalive = 5
 
 # Logging

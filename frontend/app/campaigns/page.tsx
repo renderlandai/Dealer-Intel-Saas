@@ -10,6 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { useCampaigns, useCreateCampaign } from "@/lib/hooks";
 import { formatDate } from "@/lib/utils";
+import { campaignCreateSchema } from "@/lib/schemas";
 
 interface Campaign {
   id: string;
@@ -29,14 +30,19 @@ export default function CampaignsPage() {
   const [newCampaign, setNewCampaign] = useState({ name: "", description: "" });
 
   const handleCreate = async () => {
-    if (!newCampaign.name) return;
-    
+    const parsed = campaignCreateSchema.safeParse(newCampaign);
+    if (!parsed.success) {
+      alert(parsed.error.errors[0].message);
+      return;
+    }
+
     try {
-      await createCampaignMutation.mutateAsync(newCampaign);
+      await createCampaignMutation.mutateAsync(parsed.data);
       setShowCreate(false);
       setNewCampaign({ name: "", description: "" });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to create campaign:", error);
+      alert(error?.response?.data?.detail || "Failed to create campaign. Please try again.");
     }
   };
 

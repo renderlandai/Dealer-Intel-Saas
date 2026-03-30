@@ -189,8 +189,9 @@ export default function CampaignDetailPage() {
     setDownloadingReport(format);
     try {
       await downloadComplianceReport(format, { campaign_id: campaignId });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Download failed:", error);
+      alert(error?.response?.data?.detail || "Report download failed. Please try again.");
     } finally {
       setDownloadingReport(null);
     }
@@ -330,8 +331,9 @@ export default function CampaignDetailPage() {
       await deleteAsset(assetId);
       // Refresh assets list
       loadCampaign();
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to delete asset:", error);
+      alert(error?.response?.data?.detail || "Failed to delete asset.");
     } finally {
       setDeletingAssetId(null);
     }
@@ -359,8 +361,9 @@ export default function CampaignDetailPage() {
     try {
       await deleteCampaign(campaignId);
       router.push("/campaigns");
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to delete campaign:", error);
+      alert(error?.response?.data?.detail || "Failed to delete campaign.");
       setDeleting(false);
       setShowDeleteConfirm(false);
     }

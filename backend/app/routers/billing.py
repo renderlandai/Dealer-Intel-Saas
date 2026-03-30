@@ -67,7 +67,7 @@ class CheckoutRequest(BaseModel):
     plan: str  # starter | professional | business
 
 
-@router.post("/checkout-session")
+@router.post("/checkout-session", summary="Create checkout session")
 @limiter.limit("10/minute")
 async def create_checkout_session(
     request: Request,
@@ -137,8 +137,9 @@ async def create_checkout_session(
 # Customer Portal (manage subscription, payment methods, invoices)
 # ------------------------------------------------------------------
 
-@router.post("/portal-session")
-async def create_portal_session(user: AuthUser = Depends(get_current_user)):
+@router.post("/portal-session", summary="Create portal session")
+@limiter.limit("10/minute")
+async def create_portal_session(request: Request, user: AuthUser = Depends(get_current_user)):
     """Create a Stripe Customer Portal session for self-serve billing management."""
     s = get_settings()
     if not s.stripe_secret_key:
@@ -163,7 +164,7 @@ async def create_portal_session(user: AuthUser = Depends(get_current_user)):
 # Usage
 # ------------------------------------------------------------------
 
-@router.get("/usage")
+@router.get("/usage", summary="Get billing usage")
 async def get_billing_usage(user: AuthUser = Depends(get_current_user)):
     """Return current plan, limits, and usage counters for the org."""
     org = supabase.table("organizations") \
@@ -260,7 +261,7 @@ async def get_billing_usage(user: AuthUser = Depends(get_current_user)):
 # Stripe Webhook
 # ------------------------------------------------------------------
 
-@router.post("/webhook")
+@router.post("/webhook", summary="Handle Stripe webhook")
 @limiter.limit("60/minute")
 async def stripe_webhook(request: Request):
     """Handle Stripe webhook events to sync subscription state."""

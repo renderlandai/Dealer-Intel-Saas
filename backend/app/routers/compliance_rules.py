@@ -36,7 +36,7 @@ class RuleUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-@router.get("")
+@router.get("", summary="List compliance rules")
 async def list_rules(
     active_only: bool = True,
     user: AuthUser = Depends(get_current_user),
@@ -54,7 +54,7 @@ async def list_rules(
     return result.data
 
 
-@router.get("/{rule_id}")
+@router.get("/{rule_id}", summary="Get compliance rule")
 async def get_rule(
     rule_id: UUID,
     user: AuthUser = Depends(get_current_user),
@@ -73,7 +73,7 @@ async def get_rule(
     return result.data
 
 
-@router.post("")
+@router.post("", summary="Create compliance rule")
 async def create_rule(
     body: RuleCreate,
     user: AuthUser = Depends(get_current_user),
@@ -103,7 +103,7 @@ async def create_rule(
     return result.data[0]
 
 
-@router.patch("/{rule_id}")
+@router.patch("/{rule_id}", summary="Update compliance rule")
 async def update_rule(
     rule_id: UUID,
     body: RuleUpdate,
@@ -135,7 +135,7 @@ async def update_rule(
     return result.data[0]
 
 
-@router.delete("/{rule_id}")
+@router.delete("/{rule_id}", summary="Delete compliance rule")
 async def delete_rule(
     rule_id: UUID,
     user: AuthUser = Depends(get_current_user),

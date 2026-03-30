@@ -304,24 +304,44 @@ async def _run_retention() -> None:
 
 
 async def _cleanup_stale_scans() -> None:
-    """Auto-fail scans stuck in 'pending' for more than 5 minutes."""
+    """Auto-fail scans stuck in 'pending' or 'running' too long.
+
+    Scans now update ``updated_at`` as a heartbeat while they make
+    progress.  The cleanup checks ``updated_at`` (not ``created_at``)
+    for running scans so a long-but-healthy scan is never killed.
+    """
     try:
-        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
-        stale = supabase.table("scan_jobs") \
+        # Pending scans that were never picked up by a worker.
+        # 15 minutes is generous — the status moves to "running" almost
+        # immediately now (before any heavy prep work).
+        pending_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+        stale_pending = supabase.table("scan_jobs") \
             .select("id") \
             .eq("status", "pending") \
-            .lt("created_at", cutoff) \
+            .lt("created_at", pending_cutoff) \
             .execute()
 
-        for job in (stale.data or []):
+        # Running/analyzing scans that haven't sent a heartbeat in 30 min.
+        # Healthy scans heartbeat every page, so 30 min of silence means
+        # the worker died.
+        running_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        stale_running = supabase.table("scan_jobs") \
+            .select("id") \
+            .in_("status", ["running", "analyzing"]) \
+            .lt("updated_at", running_cutoff) \
+            .execute()
+
+        all_stale = (stale_pending.data or []) + (stale_running.data or [])
+
+        for job in all_stale:
             supabase.table("scan_jobs").update({
                 "status": "failed",
-                "error_message": "Scan timed out in pending state",
+                "error_message": "Scan timed out — auto-failed by cleanup job",
             }).eq("id", job["id"]).execute()
-            log.warning("Auto-failed stale pending scan: %s", job["id"])
+            log.warning("Auto-failed stale scan: %s", job["id"])
 
-        if stale.data:
-            log.info("Cleaned up %d stale pending scan(s)", len(stale.data))
+        if all_stale:
+            log.info("Cleaned up %d stale scan(s)", len(all_stale))
     except Exception:
         log.exception("Error cleaning up stale scans")
 

@@ -69,7 +69,7 @@ async def get_current_user(
             audience="authenticated",
         )
     except Exception as jwks_err:
-        log.debug("JWKS verification failed, trying HS256 fallback: %s", jwks_err)
+        log.debug("JWKS verification failed, trying HS256 fallback: %s", type(jwks_err).__name__)
 
     # Fallback to legacy HS256 secret
     if payload is None and settings.supabase_jwt_secret:
@@ -163,7 +163,7 @@ async def _auto_provision_user(user_id: UUID, email: str) -> UUID:
         "role": "owner",
     }).execute()
 
-    log.info("Auto-provisioned org %s for user %s (%s)", org_id, user_id, email)
+    log.info("Auto-provisioned org %s for user %s (%s***)", org_id, user_id, email[:3] if email else "")
     return org_id
 
 

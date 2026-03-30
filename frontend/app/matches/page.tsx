@@ -101,16 +101,18 @@ function MatchesContent() {
   const handleApprove = async (id: string) => {
     try {
       await approveMutation.mutateAsync(id);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to approve:", error);
+      alert(error?.response?.data?.detail || "Failed to approve match.");
     }
   };
 
   const handleFlag = async (id: string) => {
     try {
       await flagMutation.mutateAsync({ id });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to flag:", error);
+      alert(error?.response?.data?.detail || "Failed to flag match.");
     }
   };
 
@@ -118,8 +120,9 @@ function MatchesContent() {
     if (confirm("Delete this match?")) {
       try {
         await deleteMatchMutation.mutateAsync(id);
-      } catch (error) {
+      } catch (error: any) {
         console.error("Failed to delete match:", error);
+        alert(error?.response?.data?.detail || "Failed to delete match.");
       }
     }
   };
@@ -128,8 +131,9 @@ function MatchesContent() {
     if (confirm("Delete ALL matches? This cannot be undone.")) {
       try {
         await deleteAllMatchesMutation.mutateAsync();
-      } catch (error) {
+      } catch (error: any) {
         console.error("Failed to delete all matches:", error);
+        alert(error?.response?.data?.detail || "Failed to delete matches.");
       }
     }
   };
@@ -144,8 +148,9 @@ function MatchesContent() {
         },
       });
       setFeedbackGiven((prev) => ({ ...prev, [id]: wasCorrect ? "correct" : "incorrect" }));
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to submit feedback:", error);
+      alert(error?.response?.data?.detail || "Failed to submit feedback.");
     }
   };
 

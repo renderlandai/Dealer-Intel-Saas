@@ -13,7 +13,7 @@ log = logging.getLogger("dealer_intel.alerts")
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
 
-@router.get("")
+@router.get("", summary="List alerts")
 async def list_alerts(
     unread_only: bool = False,
     limit: int = 50,
@@ -33,7 +33,7 @@ async def list_alerts(
     return result.data
 
 
-@router.get("/count")
+@router.get("/count", summary="Get unread alert count")
 async def get_unread_count(user: AuthUser = Depends(get_current_user)):
     """Return the unread alert count for the user's organization."""
     result = supabase.table("alerts") \
@@ -45,7 +45,7 @@ async def get_unread_count(user: AuthUser = Depends(get_current_user)):
     return {"unread_count": result.count or 0}
 
 
-@router.patch("/{alert_id}/read")
+@router.patch("/{alert_id}/read", summary="Mark alert as read")
 async def mark_alert_read(
     alert_id: UUID,
     user: AuthUser = Depends(get_current_user),
@@ -63,7 +63,7 @@ async def mark_alert_read(
     return {"status": "read", "alert_id": str(alert_id)}
 
 
-@router.post("/mark-all-read")
+@router.post("/mark-all-read", summary="Mark all alerts read")
 async def mark_all_read(user: AuthUser = Depends(get_current_user)):
     """Mark all alerts as read for the user's organization."""
     result = supabase.table("alerts") \
@@ -76,7 +76,7 @@ async def mark_all_read(user: AuthUser = Depends(get_current_user)):
     return {"status": "ok", "marked_read": count}
 
 
-@router.delete("/{alert_id}")
+@router.delete("/{alert_id}", summary="Delete alert")
 async def delete_alert(
     alert_id: UUID,
     user: AuthUser = Depends(get_current_user),

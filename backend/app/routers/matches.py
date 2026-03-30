@@ -54,7 +54,7 @@ def _verify_match_ownership(match_id: str, org_distributor_ids: List[str]) -> di
     return result.data
 
 
-@router.get("", response_model=List[Match])
+@router.get("", response_model=List[Match], summary="List matches")
 async def list_matches(
     distributor_id: Optional[UUID] = None,
     compliance_status: Optional[ComplianceStatus] = None,
@@ -85,7 +85,7 @@ async def list_matches(
     return result.data
 
 
-@router.get("/stats")
+@router.get("/stats", summary="Get match statistics")
 async def get_match_stats(user: AuthUser = Depends(get_current_user)):
     """Get match statistics scoped to the user's organization."""
     dist_ids = _org_distributor_ids(str(user.org_id))
@@ -137,7 +137,7 @@ async def get_match_stats(user: AuthUser = Depends(get_current_user)):
     }
 
 
-@router.get("/{match_id}", response_model=Match)
+@router.get("/{match_id}", response_model=Match, summary="Get match")
 async def get_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get a specific match scoped to the user's organization."""
     dist_ids = _org_distributor_ids(str(user.org_id))
@@ -157,7 +157,7 @@ async def get_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
     return result.data
 
 
-@router.patch("/{match_id}", response_model=Match)
+@router.patch("/{match_id}", response_model=Match, summary="Update match")
 async def update_match(
     match_id: UUID,
     match: MatchUpdate,
@@ -182,7 +182,7 @@ async def update_match(
     return result.data[0]
 
 
-@router.post("/{match_id}/approve")
+@router.post("/{match_id}/approve", summary="Approve match")
 async def approve_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Mark a match as compliant, scoped to the user's organization."""
     dist_ids = _org_distributor_ids(str(user.org_id))
@@ -202,7 +202,7 @@ async def approve_match(match_id: UUID, user: AuthUser = Depends(get_current_use
     return {"status": "approved", "match_id": str(match_id)}
 
 
-@router.post("/{match_id}/flag")
+@router.post("/{match_id}/flag", summary="Flag match as violation")
 async def flag_match(
     match_id: UUID,
     reason: Optional[str] = None,
@@ -238,7 +238,7 @@ async def flag_match(
     return {"status": "flagged", "match_id": str(match_id)}
 
 
-@router.delete("/{match_id}")
+@router.delete("/{match_id}", summary="Delete match")
 async def delete_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Delete a specific match, scoped to the user's organization."""
     dist_ids = _org_distributor_ids(str(user.org_id))
@@ -252,7 +252,7 @@ async def delete_match(match_id: UUID, user: AuthUser = Depends(get_current_user
     return {"status": "deleted", "match_id": str(match_id)}
 
 
-@router.delete("")
+@router.delete("", summary="Delete all matches")
 async def delete_all_matches(user: AuthUser = Depends(get_current_user)):
     """Delete all matches for the user's organization."""
     from ..config import get_settings
@@ -272,7 +272,7 @@ async def delete_all_matches(user: AuthUser = Depends(get_current_user)):
     return {"status": "deleted", "count": deleted_count}
 
 
-@router.post("/link-google-ads-distributors")
+@router.post("/link-google-ads-distributors", summary="Link Google Ads distributors")
 async def link_google_ads_distributors(user: AuthUser = Depends(get_current_user)):
     """Link orphaned Google Ads matches to distributors, scoped to the user's org."""
     org_id = str(user.org_id)
@@ -363,7 +363,7 @@ async def link_google_ads_distributors(user: AuthUser = Depends(get_current_user
 # ============================================
 
 
-@router.post("/{match_id}/feedback", response_model=MatchFeedback)
+@router.post("/{match_id}/feedback", response_model=MatchFeedback, summary="Submit match feedback")
 async def submit_match_feedback(
     match_id: UUID,
     feedback: MatchFeedbackCreate,
@@ -416,7 +416,7 @@ async def submit_match_feedback(
     return result.data[0]
 
 
-@router.get("/feedback/stats", response_model=List[FeedbackAccuracyStats])
+@router.get("/feedback/stats", response_model=List[FeedbackAccuracyStats], summary="Get feedback accuracy stats")
 async def get_feedback_accuracy_stats(user: AuthUser = Depends(get_current_user)):
     """Get accuracy statistics scoped to the user's organization."""
     dist_ids = _org_distributor_ids(str(user.org_id))
@@ -485,7 +485,7 @@ async def get_feedback_accuracy_stats(user: AuthUser = Depends(get_current_user)
     return sorted(stats, key=lambda s: s.total_reviews, reverse=True)
 
 
-@router.get("/feedback/thresholds")
+@router.get("/feedback/thresholds", summary="Get threshold recommendations")
 async def get_threshold_recommendations(user: AuthUser = Depends(get_current_user)):
     """Get adaptive threshold recommendations based on accumulated feedback."""
     thresholds = await get_all_adaptive_thresholds()

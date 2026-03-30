@@ -75,8 +75,9 @@ export default function MatchDetailPage() {
     try {
       await approveMatch(matchId);
       loadMatch();
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to approve:", error);
+      alert(error?.response?.data?.detail || "Failed to approve match.");
     }
   };
 
@@ -84,8 +85,9 @@ export default function MatchDetailPage() {
     try {
       await flagMatch(matchId);
       loadMatch();
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to flag:", error);
+      alert(error?.response?.data?.detail || "Failed to flag match.");
     }
   };
 
@@ -99,8 +101,9 @@ export default function MatchDetailPage() {
         },
       });
       setFeedbackSent(wasCorrect ? "correct" : "incorrect");
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to submit feedback:", error);
+      alert(error?.response?.data?.detail || "Failed to submit feedback.");
     }
   };
 

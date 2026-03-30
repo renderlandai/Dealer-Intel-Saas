@@ -127,6 +127,36 @@ async def _dismiss_overlays(page: Page) -> None:
             continue
 
 
+async def _advance_carousels(page: Page, max_clicks: int = 5) -> None:
+    """Click carousel/slider 'next' buttons to reveal hidden slides.
+
+    Many dealer sites use carousels for promotional banners.  The creative
+    might only be visible after clicking forward.  We advance a few times
+    and pause briefly to let lazy images load.
+    """
+    next_selectors = [
+        "button[class*='next']", "button[class*='slick-next']",
+        "button[aria-label*='next' i]", "button[aria-label*='Next' i]",
+        "[class*='carousel'] [class*='next']",
+        "[class*='slider'] [class*='next']",
+        "[class*='swiper-button-next']",
+        ".owl-next", ".carousel-control-next",
+        "button[data-slide='next']",
+        "[class*='arrow-right']", "[class*='arrow_right']",
+    ]
+    for sel in next_selectors:
+        try:
+            btn = page.locator(sel).first
+            if not await btn.is_visible(timeout=500):
+                continue
+            for _ in range(max_clicks):
+                await btn.click(timeout=1000)
+                await asyncio.sleep(0.6)
+            break
+        except Exception:
+            continue
+
+
 async def _upload_screenshot(
     image_bytes: bytes,
     scan_job_id: UUID,
@@ -202,12 +232,47 @@ async def _extract_images_from_page(page: Page) -> List[Dict[str, Any]]:
             if (results.length >= {max_imgs}) return results;
         }}
 
-        // 2) CSS background-image on common ad containers
+        // 2) <picture> / <source> elements (responsive images)
+        for (const pic of document.querySelectorAll('picture')) {{
+            const sources = pic.querySelectorAll('source');
+            for (const s of sources) {{
+                const srcset = s.srcset || '';
+                const firstUrl = srcset.split(',')[0]?.trim().split(/\\s+/)[0];
+                if (!firstUrl || seen.has(firstUrl)) continue;
+                const img = pic.querySelector('img');
+                const w = img ? (img.naturalWidth || img.width) : 0;
+                const h = img ? (img.naturalHeight || img.height) : 0;
+                if (w < {min_w} || h < {min_h}) continue;
+                seen.add(firstUrl);
+                const rect = pic.getBoundingClientRect();
+                results.push({{
+                    src: firstUrl,
+                    width: w,
+                    height: h,
+                    alt: img ? (img.alt || '') : '',
+                    classes: pic.className || '',
+                    tag: 'picture-source',
+                    x: Math.round(rect.x),
+                    y: Math.round(rect.y + window.scrollY),
+                }});
+                if (results.length >= {max_imgs}) return results;
+                break;
+            }}
+        }}
+
+        // 3) CSS background-image on common ad/promo containers
         const bgSelectors = [
             '[class*="hero"]', '[class*="banner"]', '[class*="promo"]',
             '[class*="ad-"]', '[class*="ad_"]', '[class*="campaign"]',
             '[class*="slide"]', '[class*="carousel"]',
+            '[class*="special"]', '[class*="deal"]', '[class*="offer"]',
+            '[class*="feature"]', '[class*="incentive"]', '[class*="rebate"]',
+            '[class*="savings"]', '[class*="coupon"]',
             '[role="banner"]', 'header', '.jumbotron',
+            'section[id*="special"]', 'section[id*="promo"]',
+            'section[id*="deal"]', 'section[id*="offer"]',
+            'div[id*="special"]', 'div[id*="promo"]',
+            'div[id*="deal"]', 'div[id*="offer"]',
         ];
         for (const sel of bgSelectors) {{
             for (const el of document.querySelectorAll(sel)) {{
@@ -378,6 +443,15 @@ async def _extract_from_viewport(
         await asyncio.sleep(2)
         await _dismiss_overlays(page)
         await _scroll_to_bottom(page)
+
+        # Wait for lazy images to finish loading after scroll
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+
+        # Click through carousel/slider controls to reveal hidden slides
+        await _advance_carousels(page)
 
         page_height = await page.evaluate("document.body.scrollHeight")
 

@@ -20,6 +20,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { useDistributors, useCreateDistributor, useUpdateDistributor } from "@/lib/hooks";
+import { distributorCreateSchema, distributorUpdateSchema } from "@/lib/schemas";
 
 interface Distributor {
   id: string;
@@ -60,14 +61,19 @@ export default function DistributorsPage() {
   });
 
   const handleCreate = async () => {
-    if (!newDistributor.name) return;
-    
+    const parsed = distributorCreateSchema.safeParse(newDistributor);
+    if (!parsed.success) {
+      alert(parsed.error.errors[0].message);
+      return;
+    }
+
     try {
-      await createDistributorMutation.mutateAsync(newDistributor);
+      await createDistributorMutation.mutateAsync(parsed.data);
       setShowCreate(false);
       setNewDistributor({ name: "", website_url: "", facebook_url: "", google_ads_advertiser_id: "", region: "" });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to create distributor:", error);
+      alert(error?.response?.data?.detail || "Failed to create distributor. Please try again.");
     }
   };
 
@@ -88,16 +94,23 @@ export default function DistributorsPage() {
   };
 
   const handleSaveEdit = async () => {
-    if (!editingDistributor || !editForm.name) return;
-    
+    if (!editingDistributor) return;
+
+    const parsed = distributorUpdateSchema.safeParse(editForm);
+    if (!parsed.success) {
+      alert(parsed.error.errors[0].message);
+      return;
+    }
+
     try {
       await updateDistributorMutation.mutateAsync({
         id: editingDistributor.id,
-        updates: editForm,
+        updates: parsed.data,
       });
       setEditingDistributor(null);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to update distributor:", error);
+      alert(error?.response?.data?.detail || "Failed to update distributor. Please try again.");
     }
   };
 

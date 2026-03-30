@@ -6,10 +6,13 @@ This module provides endpoints for:
 - Retrieving accuracy statistics
 - Getting threshold recommendations based on feedback data
 """
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from typing import List, Optional
 from uuid import UUID
 
+from ..auth import AuthUser, get_current_user
 from ..database import supabase
 from ..models import (
     MatchFeedback, 
@@ -21,13 +24,15 @@ from ..models import (
 from ..config import get_settings
 from ..services import adaptive_threshold_service
 
+limiter = Limiter(key_func=get_remote_address)
+
 router = APIRouter(prefix="/feedback", tags=["feedback"])
 
 settings = get_settings()
 
 
-@router.get("/adaptive-thresholds")
-async def get_adaptive_thresholds():
+@router.get("/adaptive-thresholds", summary="Get adaptive thresholds")
+async def get_adaptive_thresholds(user: AuthUser = Depends(get_current_user)):
     """
     Get all adaptive thresholds calculated from feedback data.
     
@@ -43,8 +48,9 @@ async def get_adaptive_thresholds():
     }
 
 
-@router.post("/invalidate-cache")
-async def invalidate_threshold_cache():
+@router.post("/invalidate-cache", summary="Invalidate threshold cache")
+@limiter.limit("5/minute")
+async def invalidate_threshold_cache(request: Request, user: AuthUser = Depends(get_current_user)):
     """
     Invalidate the adaptive threshold cache.
     
@@ -54,8 +60,9 @@ async def invalidate_threshold_cache():
     return {"status": "cache_invalidated"}
 
 
-@router.post("", response_model=MatchFeedback)
-async def submit_feedback(feedback: MatchFeedbackCreate):
+@router.post("", response_model=MatchFeedback, summary="Submit match feedback")
+@limiter.limit("30/minute")
+async def submit_feedback(request: Request, feedback: MatchFeedbackCreate, user: AuthUser = Depends(get_current_user)):
     """
     Submit feedback on a match's accuracy.
     
@@ -105,10 +112,11 @@ async def submit_feedback(feedback: MatchFeedbackCreate):
     return feedback_record
 
 
-@router.get("/stats", response_model=List[FeedbackAccuracyStats])
+@router.get("/stats", response_model=List[FeedbackAccuracyStats], summary="Get accuracy statistics")
 async def get_accuracy_stats(
     source_type: Optional[str] = None,
-    channel: Optional[str] = None
+    channel: Optional[str] = None,
+    user: AuthUser = Depends(get_current_user),
 ):
     """
     Get accuracy statistics aggregated by source type, channel, and match type.
@@ -130,8 +138,8 @@ async def get_accuracy_stats(
     return result.data or []
 
 
-@router.get("/threshold-recommendations", response_model=List[ThresholdRecommendation])
-async def get_threshold_recommendations():
+@router.get("/threshold-recommendations", response_model=List[ThresholdRecommendation], summary="Get threshold recommendations")
+async def get_threshold_recommendations(user: AuthUser = Depends(get_current_user)):
     """
     Get recommended thresholds based on feedback data.
     
@@ -223,8 +231,8 @@ async def get_threshold_recommendations():
     return recommendations
 
 
-@router.get("/pending-reviews")
-async def get_pending_reviews(limit: int = 50):
+@router.get("/pending-reviews", summary="Get pending reviews")
+async def get_pending_reviews(limit: int = 50, user: AuthUser = Depends(get_current_user)):
     """
     Get matches that haven't been reviewed yet.
     
@@ -233,9 +241,18 @@ async def get_pending_reviews(limit: int = 50):
     2. Recent matches
     3. Matches with modifications detected
     """
+    org_distributors = supabase.table("distributors")\
+        .select("id")\
+        .eq("organization_id", str(user.org_id))\
+        .execute()
+    dist_ids = [d["id"] for d in (org_distributors.data or [])]
+    if not dist_ids:
+        return []
+
     result = supabase.table("matches")\
         .select("*, assets(name, file_url), distributors(name)")\
         .eq("feedback_status", "pending")\
+        .in_("distributor_id", dist_ids)\
         .order("created_at", desc=True)\
         .limit(limit)\
         .execute()
@@ -258,8 +275,8 @@ async def get_pending_reviews(limit: int = 50):
     return matches
 
 
-@router.get("/settings", response_model=AnalysisSettingsResponse)
-async def get_analysis_settings():
+@router.get("/settings", response_model=AnalysisSettingsResponse, summary="Get analysis settings")
+async def get_analysis_settings(user: AuthUser = Depends(get_current_user)):
     """
     Get current AI analysis threshold settings.
     
@@ -294,8 +311,8 @@ async def get_analysis_settings():
     )
 
 
-@router.get("/accuracy-trend")
-async def get_accuracy_trend(days: int = 30):
+@router.get("/accuracy-trend", summary="Get accuracy trend")
+async def get_accuracy_trend(days: int = 30, user: AuthUser = Depends(get_current_user)):
     """
     Get accuracy trend over time.
     

@@ -11,6 +11,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import UUID
 
+SCAN_TIMEOUT_SECONDS = 7200
+
 log = logging.getLogger("dealer_intel.tasks")
 
 # Keep a reference to running tasks so they aren't garbage-collected
@@ -101,10 +103,16 @@ async def _run_website_scan(urls, scan_job_id, distributor_mapping, campaign_id=
     from .routers.scanning import run_website_scan
     log.info("RUNNING website scan job=%s urls=%d", scan_job_id, len(urls))
     try:
-        await run_website_scan(
-            urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-            UUID(campaign_id) if campaign_id else None,
+        await asyncio.wait_for(
+            run_website_scan(
+                urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+                UUID(campaign_id) if campaign_id else None,
+            ),
+            timeout=SCAN_TIMEOUT_SECONDS,
         )
+    except asyncio.TimeoutError:
+        log.error("Website scan timed out after %ds: %s", SCAN_TIMEOUT_SECONDS, scan_job_id)
+        _mark_job_failed(scan_job_id, f"Scan timed out after {SCAN_TIMEOUT_SECONDS}s")
     except Exception as e:
         log.error("Website scan failed for %s: %s", scan_job_id, e, exc_info=True)
         _mark_job_failed(scan_job_id, str(e))
@@ -114,10 +122,16 @@ async def _run_google_ads_scan(advertiser_ids, scan_job_id, distributor_mapping,
     from .routers.scanning import run_google_ads_scan
     log.info("RUNNING Google Ads scan job=%s advertisers=%d", scan_job_id, len(advertiser_ids))
     try:
-        await run_google_ads_scan(
-            advertiser_ids, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-            UUID(campaign_id) if campaign_id else None,
+        await asyncio.wait_for(
+            run_google_ads_scan(
+                advertiser_ids, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+                UUID(campaign_id) if campaign_id else None,
+            ),
+            timeout=SCAN_TIMEOUT_SECONDS,
         )
+    except asyncio.TimeoutError:
+        log.error("Google Ads scan timed out after %ds: %s", SCAN_TIMEOUT_SECONDS, scan_job_id)
+        _mark_job_failed(scan_job_id, f"Scan timed out after {SCAN_TIMEOUT_SECONDS}s")
     except Exception as e:
         log.error("Google Ads scan failed for %s: %s", scan_job_id, e, exc_info=True)
         _mark_job_failed(scan_job_id, str(e))
@@ -127,10 +141,16 @@ async def _run_facebook_scan(page_urls, scan_job_id, distributor_mapping, campai
     from .routers.scanning import run_facebook_scan
     log.info("RUNNING Facebook scan job=%s pages=%d", scan_job_id, len(page_urls))
     try:
-        await run_facebook_scan(
-            page_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-            UUID(campaign_id) if campaign_id else None, channel,
+        await asyncio.wait_for(
+            run_facebook_scan(
+                page_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+                UUID(campaign_id) if campaign_id else None, channel,
+            ),
+            timeout=SCAN_TIMEOUT_SECONDS,
         )
+    except asyncio.TimeoutError:
+        log.error("Facebook scan timed out after %ds: %s", SCAN_TIMEOUT_SECONDS, scan_job_id)
+        _mark_job_failed(scan_job_id, f"Scan timed out after {SCAN_TIMEOUT_SECONDS}s")
     except Exception as e:
         log.error("Facebook scan failed for %s: %s", scan_job_id, e, exc_info=True)
         _mark_job_failed(scan_job_id, str(e))
@@ -140,10 +160,16 @@ async def _run_instagram_scan(profile_urls, scan_job_id, distributor_mapping, ca
     from .routers.scanning import run_instagram_scan
     log.info("RUNNING Instagram scan job=%s profiles=%d", scan_job_id, len(profile_urls))
     try:
-        await run_instagram_scan(
-            profile_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-            UUID(campaign_id) if campaign_id else None,
+        await asyncio.wait_for(
+            run_instagram_scan(
+                profile_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+                UUID(campaign_id) if campaign_id else None,
+            ),
+            timeout=SCAN_TIMEOUT_SECONDS,
         )
+    except asyncio.TimeoutError:
+        log.error("Instagram scan timed out after %ds: %s", SCAN_TIMEOUT_SECONDS, scan_job_id)
+        _mark_job_failed(scan_job_id, f"Scan timed out after {SCAN_TIMEOUT_SECONDS}s")
     except Exception as e:
         log.error("Instagram scan failed for %s: %s", scan_job_id, e, exc_info=True)
         _mark_job_failed(scan_job_id, str(e))

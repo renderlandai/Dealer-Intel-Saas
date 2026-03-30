@@ -30,15 +30,3 @@ services:
       timeout: 10s
       retries: 3
 
-  worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
-    env_file:
-      - backend/.env
-    environment:
-      - REDIS_URL=redis://redis:6379/0
-    depends_on:
-      redis:
-        condition: service_healthy

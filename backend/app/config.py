@@ -54,22 +54,22 @@ class Settings(BaseSettings):
     # AI Analysis Thresholds (Fine-Tuning) - STRICT MODE
     # ===========================================
     
-    # Match type thresholds (0-100 scale) - RAISED for accuracy
+    # Match type thresholds (0-100 scale)
     exact_match_threshold: int = Field(default=90, description="Score for exact match classification")
     strong_match_threshold: int = Field(default=75, description="Score for strong match classification")
-    partial_match_threshold: int = Field(default=55, description="Score for partial match classification")
-    weak_match_threshold: int = Field(default=40, description="Score for weak match classification")
+    partial_match_threshold: int = Field(default=65, description="Score for partial match classification")
+    weak_match_threshold: int = Field(default=50, description="Score for weak match classification")
     
-    # Minimum thresholds to create a match - ONLY Partial+ matches shown
-    regular_image_match_threshold: int = Field(default=55, description="Min score for regular images")
-    screenshot_match_threshold: int = Field(default=55, description="Min score for screenshots")
+    # Minimum thresholds to create a match — reject ambiguous scores
+    regular_image_match_threshold: int = Field(default=70, description="Min score for regular images")
+    screenshot_match_threshold: int = Field(default=65, description="Min score for screenshots")
     
     # Filtering thresholds
-    filter_relevance_threshold: float = Field(default=0.7, description="Min relevance score to pass filter")
+    filter_relevance_threshold: float = Field(default=0.75, description="Min relevance score to pass filter")
     
-    # Verification thresholds - wider range for more verification
-    borderline_match_lower: int = Field(default=50, description="Lower bound for borderline verification")
-    borderline_match_upper: int = Field(default=75, description="Upper bound for borderline verification")
+    # Verification thresholds — wider range catches more borderline false positives
+    borderline_match_lower: int = Field(default=60, description="Lower bound for borderline verification")
+    borderline_match_upper: int = Field(default=80, description="Upper bound for borderline verification")
     
     # Confidence calibration factors — neutral until adaptive thresholds have
     # enough feedback data to calibrate automatically.  Previous values
@@ -114,10 +114,10 @@ class Settings(BaseSettings):
     # ===========================================
     
     # Stage 1: Perceptual hash gate — skip images with no hash resemblance to any asset
-    hash_prefilter_max_diff: int = Field(default=30, description="Max avg hash diff to pass pre-filter (0-64 scale)")
+    hash_prefilter_max_diff: int = Field(default=20, description="Max avg hash diff to pass pre-filter (0-64 scale)")
     
     # Stage 2: CLIP embedding gate — skip images with no semantic similarity to any asset
-    clip_similarity_threshold: float = Field(default=0.25, description="Min CLIP cosine similarity to proceed to Claude")
+    clip_similarity_threshold: float = Field(default=0.40, description="Min CLIP cosine similarity to proceed to Claude")
     clip_model_name: str = Field(default="clip-ViT-B-32", description="SentenceTransformers CLIP model")
     
     # Filter model — use a fast/cheap model for the relevance yes/no check

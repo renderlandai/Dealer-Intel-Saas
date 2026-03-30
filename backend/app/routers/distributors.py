@@ -1,5 +1,7 @@
 """Distributor routes."""
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from typing import List, Optional
 from uuid import UUID
 
@@ -10,10 +12,24 @@ from ..models import (
 )
 from ..plan_enforcement import OrgPlan, get_org_plan, check_dealer_limit, check_dealer_limit_bulk
 
+limiter = Limiter(key_func=get_remote_address)
+
 router = APIRouter(prefix="/distributors", tags=["distributors"])
 
 
-@router.get("", response_model=List[Distributor])
+def _verify_distributor_ownership(distributor_id: UUID, org_id: UUID) -> None:
+    """Raise 404 if the distributor doesn't belong to the given org."""
+    check = supabase.table("distributors")\
+        .select("id")\
+        .eq("id", str(distributor_id))\
+        .eq("organization_id", str(org_id))\
+        .maybe_single()\
+        .execute()
+    if not check.data:
+        raise HTTPException(status_code=404, detail="Distributor not found")
+
+
+@router.get("", response_model=List[Distributor], summary="List distributors")
 async def list_distributors(
     status: Optional[str] = None,
     region: Optional[str] = None,
@@ -57,10 +73,10 @@ async def list_distributors(
     return distributors
 
 
-@router.get("/{distributor_id}", response_model=Distributor)
-async def get_distributor(distributor_id: UUID):
+@router.get("/{distributor_id}", response_model=Distributor, summary="Get distributor")
+async def get_distributor(distributor_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get a specific distributor."""
-    result = supabase.table("distributors").select("*").eq("id", str(distributor_id)).execute()
+    result = supabase.table("distributors").select("*").eq("id", str(distributor_id)).eq("organization_id", str(user.org_id)).execute()
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Distributor not found")
@@ -73,8 +89,10 @@ async def get_distributor(distributor_id: UUID):
     return distributor_data
 
 
-@router.post("", response_model=Distributor)
+@router.post("", response_model=Distributor, summary="Create distributor")
+@limiter.limit("10/minute")
 async def create_distributor(
+    request: Request,
     distributor: DistributorCreate,
     user: AuthUser = Depends(get_current_user),
     op: OrgPlan = Depends(get_org_plan),
@@ -89,14 +107,16 @@ async def create_distributor(
     return result.data[0]
 
 
-@router.patch("/{distributor_id}", response_model=Distributor)
-async def update_distributor(distributor_id: UUID, distributor: DistributorUpdate):
+@router.patch("/{distributor_id}", response_model=Distributor, summary="Update distributor")
+@limiter.limit("20/minute")
+async def update_distributor(request: Request, distributor_id: UUID, distributor: DistributorUpdate, user: AuthUser = Depends(get_current_user)):
     """Update a distributor."""
     data = distributor.model_dump(exclude_unset=True)
 
     result = supabase.table("distributors")\
         .update(data)\
         .eq("id", str(distributor_id))\
+        .eq("organization_id", str(user.org_id))\
         .execute()
 
     if not result.data:
@@ -105,24 +125,28 @@ async def update_distributor(distributor_id: UUID, distributor: DistributorUpdat
     return result.data[0]
 
 
-@router.delete("/{distributor_id}")
-async def delete_distributor(distributor_id: UUID):
+@router.delete("/{distributor_id}", summary="Delete distributor")
+@limiter.limit("10/minute")
+async def delete_distributor(request: Request, distributor_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Delete a distributor."""
     supabase.table("distributors")\
         .delete()\
         .eq("id", str(distributor_id))\
+        .eq("organization_id", str(user.org_id))\
         .execute()
 
     return {"status": "deleted"}
 
 
-@router.get("/{distributor_id}/matches")
+@router.get("/{distributor_id}/matches", summary="Get distributor matches")
 async def get_distributor_matches(
     distributor_id: UUID,
     limit: int = 50,
-    offset: int = 0
+    offset: int = 0,
+    user: AuthUser = Depends(get_current_user),
 ):
     """Get all matches for a distributor."""
+    _verify_distributor_ownership(distributor_id, user.org_id)
     result = supabase.table("matches")\
         .select("*, assets(name, file_url), campaigns:assets(campaign_id)")\
         .eq("distributor_id", str(distributor_id))\
@@ -132,8 +156,10 @@ async def get_distributor_matches(
     return result.data
 
 
-@router.post("/bulk", response_model=List[Distributor])
+@router.post("/bulk", response_model=List[Distributor], summary="Bulk create distributors")
+@limiter.limit("5/minute")
 async def bulk_create_distributors(
+    request: Request,
     distributors: List[DistributorCreate],
     user: AuthUser = Depends(get_current_user),
     op: OrgPlan = Depends(get_org_plan),
@@ -149,8 +175,8 @@ async def bulk_create_distributors(
     return result.data
 
 
-@router.post("/{distributor_id}/lookup-google-ads-id")
-async def lookup_google_ads_id(distributor_id: UUID):
+@router.post("/{distributor_id}/lookup-google-ads-id", summary="Lookup Google Ads ID")
+async def lookup_google_ads_id(distributor_id: UUID, user: AuthUser = Depends(get_current_user)):
     """
     Generate a Google Ads Transparency Center search URL for a distributor.
     """
@@ -159,6 +185,7 @@ async def lookup_google_ads_id(distributor_id: UUID):
     result = supabase.table("distributors")\
         .select("*")\
         .eq("id", str(distributor_id))\
+        .eq("organization_id", str(user.org_id))\
         .single()\
         .execute()
 
@@ -184,8 +211,9 @@ async def lookup_google_ads_id(distributor_id: UUID):
     }
 
 
-@router.patch("/{distributor_id}/google-ads-id")
-async def set_google_ads_id(distributor_id: UUID, advertiser_id: str):
+@router.patch("/{distributor_id}/google-ads-id", summary="Set Google Ads ID")
+@limiter.limit("20/minute")
+async def set_google_ads_id(request: Request, distributor_id: UUID, advertiser_id: str, user: AuthUser = Depends(get_current_user)):
     """Manually set the Google Ads Advertiser ID for a distributor."""
     if not advertiser_id.startswith("AR") or not advertiser_id[2:].isdigit():
         raise HTTPException(
@@ -195,7 +223,7 @@ async def set_google_ads_id(distributor_id: UUID, advertiser_id: str):
 
     result = supabase.table("distributors").update({
         "google_ads_advertiser_id": advertiser_id
-    }).eq("id", str(distributor_id)).execute()
+    }).eq("id", str(distributor_id)).eq("organization_id", str(user.org_id)).execute()
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Distributor not found")
@@ -207,8 +235,8 @@ async def set_google_ads_id(distributor_id: UUID, advertiser_id: str):
     }
 
 
-@router.post("/lookup-google-ads-id-by-name")
-async def lookup_google_ads_id_by_name(company_name: str):
+@router.post("/lookup-google-ads-id-by-name", summary="Lookup Ads ID by name")
+async def lookup_google_ads_id_by_name(company_name: str, user: AuthUser = Depends(get_current_user)):
     """Generate a Google Ads Transparency Center search URL by company name."""
     if not company_name or not company_name.strip():
         raise HTTPException(status_code=400, detail="Company name is required")

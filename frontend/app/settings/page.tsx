@@ -25,6 +25,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession } from "@/lib/api";
+import { orgSettingsSchema } from "@/lib/schemas";
 import { useBillingUsage } from "@/lib/hooks";
 import { useAuth } from "@/lib/auth-context";
 import { TeamSection } from "@/components/settings/team-section";
@@ -84,6 +85,13 @@ export default function SettingsPage() {
   const handleSaveName = async () => {
     const trimmed = companyName.trim();
     if (!trimmed || trimmed === savedName) return;
+
+    const parsed = orgSettingsSchema.safeParse({ name: trimmed });
+    if (!parsed.success) {
+      alert(parsed.error.errors[0].message);
+      return;
+    }
+
     setSavingName(true);
     setNameSuccess(false);
     try {
@@ -91,8 +99,9 @@ export default function SettingsPage() {
       setSavedName(trimmed);
       setNameSuccess(true);
       setTimeout(() => setNameSuccess(false), 3000);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to update company name:", error);
+      alert(error?.response?.data?.detail || "Failed to update company name.");
     } finally {
       setSavingName(false);
     }
@@ -107,9 +116,10 @@ export default function SettingsPage() {
       setSavedColor(hex);
       setColorSuccess(true);
       setTimeout(() => setColorSuccess(false), 3000);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to update brand color:", error);
       setBrandColor(savedColor);
+      alert(error?.response?.data?.detail || "Failed to update brand color.");
     } finally {
       setSavingColor(false);
     }
@@ -118,6 +128,15 @@ export default function SettingsPage() {
   const nameChanged = companyName.trim() !== savedName;
 
   const handleSaveNotify = async () => {
+    const parsed = orgSettingsSchema.safeParse({
+      notify_email: notifyEmail.trim(),
+      notify_on_violation: notifyOn,
+    });
+    if (!parsed.success) {
+      alert(parsed.error.errors[0].message);
+      return;
+    }
+
     setSavingNotify(true);
     setNotifySuccess(false);
     setTestResult(null);
@@ -129,8 +148,9 @@ export default function SettingsPage() {
       setSavedEmail(notifyEmail.trim());
       setNotifySuccess(true);
       setTimeout(() => setNotifySuccess(false), 3000);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to save notification settings:", error);
+      alert(error?.response?.data?.detail || "Failed to save notification settings.");
     } finally {
       setSavingNotify(false);
     }
@@ -140,9 +160,10 @@ export default function SettingsPage() {
     setNotifyOn(enabled);
     try {
       await updateOrgSettings({ notify_on_violation: enabled });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to toggle notifications:", error);
       setNotifyOn(!enabled);
+      alert(error?.response?.data?.detail || "Failed to update notification preference.");
     }
   };
 
@@ -170,8 +191,9 @@ export default function SettingsPage() {
       setLogoUrl(result.logo_url);
       setUploadSuccess(true);
       setTimeout(() => setUploadSuccess(false), 3000);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Logo upload failed:", error);
+      alert(error?.response?.data?.detail || "Logo upload failed. Please try again.");
     } finally {
       setUploading(false);
     }
@@ -181,8 +203,9 @@ export default function SettingsPage() {
     try {
       await deleteOrgLogo();
       setLogoUrl(null);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Logo remove failed:", error);
+      alert(error?.response?.data?.detail || "Failed to remove logo.");
     }
   };
 

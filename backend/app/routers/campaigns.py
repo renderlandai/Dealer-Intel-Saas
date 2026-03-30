@@ -1,7 +1,9 @@
 """Campaign and Asset routes."""
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from typing import List, Optional
 from uuid import UUID
 
@@ -20,6 +22,8 @@ from ..plan_enforcement import (
 
 log = logging.getLogger("dealer_intel.campaigns")
 
+limiter = Limiter(key_func=get_remote_address)
+
 log = logging.getLogger("dealer_intel.campaigns")
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
@@ -29,7 +33,7 @@ router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 # CAMPAIGNS
 # ============================================
 
-@router.get("", response_model=List[Campaign])
+@router.get("", response_model=List[Campaign], summary="List campaigns")
 async def list_campaigns(
     status: Optional[str] = None,
     user: AuthUser = Depends(get_current_user),
@@ -41,7 +45,8 @@ async def list_campaigns(
         query = query.eq("status", status)
     campaigns_result = query.order("created_at", desc=True).execute()
 
-    assets_result = supabase.table("assets").select("campaign_id").execute()
+    campaign_ids = [c["id"] for c in campaigns_result.data]
+    assets_result = supabase.table("assets").select("campaign_id").in_("campaign_id", campaign_ids).execute() if campaign_ids else type("R", (), {"data": []})()
 
     # Count assets per campaign
     asset_counts = {}
@@ -59,10 +64,10 @@ async def list_campaigns(
     return campaigns
 
 
-@router.get("/{campaign_id}", response_model=Campaign)
-async def get_campaign(campaign_id: UUID):
+@router.get("/{campaign_id}", response_model=Campaign, summary="Get campaign")
+async def get_campaign(campaign_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get a specific campaign."""
-    result = supabase.table("campaigns").select("*").eq("id", str(campaign_id)).execute()
+    result = supabase.table("campaigns").select("*").eq("id", str(campaign_id)).eq("organization_id", str(user.org_id)).execute()
 
     if not result.data:
         raise HTTPException(status_code=404, detail="Campaign not found")
@@ -75,8 +80,10 @@ async def get_campaign(campaign_id: UUID):
     return campaign_data
 
 
-@router.post("", response_model=Campaign)
+@router.post("", response_model=Campaign, summary="Create campaign")
+@limiter.limit("10/minute")
 async def create_campaign(
+    request: Request,
     campaign: CampaignCreate,
     user: AuthUser = Depends(get_current_user),
     op: OrgPlan = Depends(get_org_plan),
@@ -96,8 +103,9 @@ async def create_campaign(
     return result.data[0]
 
 
-@router.patch("/{campaign_id}", response_model=Campaign)
-async def update_campaign(campaign_id: UUID, campaign: CampaignUpdate):
+@router.patch("/{campaign_id}", response_model=Campaign, summary="Update campaign")
+@limiter.limit("20/minute")
+async def update_campaign(request: Request, campaign_id: UUID, campaign: CampaignUpdate, user: AuthUser = Depends(get_current_user)):
     """Update a campaign."""
     data = campaign.model_dump(exclude_unset=True)
     
@@ -109,6 +117,7 @@ async def update_campaign(campaign_id: UUID, campaign: CampaignUpdate):
     result = supabase.table("campaigns")\
         .update(data)\
         .eq("id", str(campaign_id))\
+        .eq("organization_id", str(user.org_id))\
         .execute()
     
     if not result.data:
@@ -117,12 +126,14 @@ async def update_campaign(campaign_id: UUID, campaign: CampaignUpdate):
     return result.data[0]
 
 
-@router.delete("/{campaign_id}")
-async def delete_campaign(campaign_id: UUID):
+@router.delete("/{campaign_id}", summary="Delete campaign")
+@limiter.limit("10/minute")
+async def delete_campaign(request: Request, campaign_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Delete a campaign."""
-    result = supabase.table("campaigns")\
+    supabase.table("campaigns")\
         .delete()\
         .eq("id", str(campaign_id))\
+        .eq("organization_id", str(user.org_id))\
         .execute()
     
     return {"status": "deleted"}
@@ -132,9 +143,22 @@ async def delete_campaign(campaign_id: UUID):
 # ASSETS
 # ============================================
 
-@router.get("/{campaign_id}/assets", response_model=List[Asset])
-async def list_campaign_assets(campaign_id: UUID):
+def _verify_campaign_ownership(campaign_id: UUID, org_id: UUID) -> None:
+    """Raise 404 if the campaign doesn't belong to the given org."""
+    check = supabase.table("campaigns")\
+        .select("id")\
+        .eq("id", str(campaign_id))\
+        .eq("organization_id", str(org_id))\
+        .maybe_single()\
+        .execute()
+    if not check.data:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+
+@router.get("/{campaign_id}/assets", response_model=List[Asset], summary="List campaign assets")
+async def list_campaign_assets(campaign_id: UUID, user: AuthUser = Depends(get_current_user)):
     """List all assets for a campaign."""
+    _verify_campaign_ownership(campaign_id, user.org_id)
     result = supabase.table("assets")\
         .select("*")\
         .eq("campaign_id", str(campaign_id))\
@@ -144,9 +168,11 @@ async def list_campaign_assets(campaign_id: UUID):
     return result.data
 
 
-@router.post("/{campaign_id}/assets", response_model=Asset)
-async def create_asset(campaign_id: UUID, asset: AssetCreate):
+@router.post("/{campaign_id}/assets", response_model=Asset, summary="Create asset")
+@limiter.limit("10/minute")
+async def create_asset(request: Request, campaign_id: UUID, asset: AssetCreate, user: AuthUser = Depends(get_current_user)):
     """Create a new asset."""
+    _verify_campaign_ownership(campaign_id, user.org_id)
     data = asset.model_dump()
     data["campaign_id"] = str(campaign_id)
     
@@ -154,13 +180,17 @@ async def create_asset(campaign_id: UUID, asset: AssetCreate):
     return result.data[0]
 
 
-@router.post("/{campaign_id}/assets/upload", response_model=Asset)
+@router.post("/{campaign_id}/assets/upload", response_model=Asset, summary="Upload asset file")
+@limiter.limit("10/minute")
 async def upload_asset(
+    request: Request,
     campaign_id: UUID,
     file: UploadFile = File(...),
-    name: Optional[str] = Form(None)
+    name: Optional[str] = Form(None),
+    user: AuthUser = Depends(get_current_user),
 ):
     """Upload an asset file."""
+    _verify_campaign_ownership(campaign_id, user.org_id)
     import uuid as uuid_lib
     import time
     import base64
@@ -235,25 +265,37 @@ async def upload_asset(
         raise HTTPException(status_code=500, detail="Failed to save asset. Please try again.")
 
 
-@router.get("/assets/{asset_id}", response_model=Asset)
-async def get_asset(asset_id: UUID):
+@router.get("/assets/{asset_id}", response_model=Asset, summary="Get asset")
+async def get_asset(asset_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get a specific asset."""
     result = supabase.table("assets")\
-        .select("*")\
+        .select("*, campaigns!inner(organization_id)")\
         .eq("id", str(asset_id))\
+        .eq("campaigns.organization_id", str(user.org_id))\
         .single()\
         .execute()
     
     if not result.data:
         raise HTTPException(status_code=404, detail="Asset not found")
     
+    result.data.pop("campaigns", None)
     return result.data
 
 
-@router.delete("/assets/{asset_id}")
-async def delete_asset(asset_id: UUID):
+@router.delete("/assets/{asset_id}", summary="Delete asset")
+@limiter.limit("20/minute")
+async def delete_asset(request: Request, asset_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Delete an asset."""
-    result = supabase.table("assets")\
+    asset = supabase.table("assets")\
+        .select("id, campaigns!inner(organization_id)")\
+        .eq("id", str(asset_id))\
+        .eq("campaigns.organization_id", str(user.org_id))\
+        .maybe_single()\
+        .execute()
+    if not asset.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    supabase.table("assets")\
         .delete()\
         .eq("id", str(asset_id))\
         .execute()
@@ -265,7 +307,7 @@ async def delete_asset(asset_id: UUID):
 # CAMPAIGN SCANS
 # ============================================
 
-@router.post("/{campaign_id}/scans/start", response_model=ScanJob)
+@router.post("/{campaign_id}/scans/start", response_model=ScanJob, summary="Start campaign scan")
 async def start_campaign_scan(
     campaign_id: UUID,
     source: ScanSource,
@@ -374,7 +416,7 @@ async def start_campaign_scan(
     return scan_job
 
 
-@router.get("/{campaign_id}/scans", response_model=List[ScanJob])
+@router.get("/{campaign_id}/scans", response_model=List[ScanJob], summary="List campaign scans")
 async def list_campaign_scans(
     campaign_id: UUID,
     status: Optional[str] = None,
@@ -382,6 +424,7 @@ async def list_campaign_scans(
     user: AuthUser = Depends(get_current_user),
 ):
     """List all scan jobs for a specific campaign."""
+    _verify_campaign_ownership(campaign_id, user.org_id)
     query = supabase.table("scan_jobs")\
         .select("*")\
         .eq("campaign_id", str(campaign_id))
@@ -393,9 +436,10 @@ async def list_campaign_scans(
     return result.data
 
 
-@router.get("/{campaign_id}/scans/{scan_id}", response_model=ScanJob)
+@router.get("/{campaign_id}/scans/{scan_id}", response_model=ScanJob, summary="Get campaign scan")
 async def get_campaign_scan(campaign_id: UUID, scan_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get details of a specific scan job for a campaign."""
+    _verify_campaign_ownership(campaign_id, user.org_id)
     result = supabase.table("scan_jobs")\
         .select("*")\
         .eq("id", str(scan_id))\
@@ -409,7 +453,7 @@ async def get_campaign_scan(campaign_id: UUID, scan_id: UUID, user: AuthUser = D
     return result.data
 
 
-@router.post("/{campaign_id}/scans/{scan_id}/analyze")
+@router.post("/{campaign_id}/scans/{scan_id}/analyze", summary="Analyze campaign scan")
 async def analyze_campaign_scan(
     campaign_id: UUID,
     scan_id: UUID,
@@ -419,6 +463,7 @@ async def analyze_campaign_scan(
     Analyze discovered images from a campaign scan.
     Runs as a background task.
     """
+    _verify_campaign_ownership(campaign_id, user.org_id)
     from ..tasks import dispatch_task
 
     job = supabase.table("scan_jobs")\
@@ -460,7 +505,7 @@ async def analyze_campaign_scan(
     }
 
 
-@router.get("/{campaign_id}/matches")
+@router.get("/{campaign_id}/matches", summary="Get campaign matches")
 async def get_campaign_matches(
     campaign_id: UUID,
     compliance_status: Optional[str] = None,
@@ -468,6 +513,7 @@ async def get_campaign_matches(
     user: AuthUser = Depends(get_current_user),
 ):
     """Get all matches found for this campaign's assets."""
+    _verify_campaign_ownership(campaign_id, user.org_id)
     query = supabase.table("matches")\
         .select("*, assets!inner(campaign_id, name, file_url), distributors(name)")\
         .eq("assets.campaign_id", str(campaign_id))
@@ -494,9 +540,10 @@ async def get_campaign_matches(
     return matches
 
 
-@router.get("/{campaign_id}/scan-stats")
+@router.get("/{campaign_id}/scan-stats", summary="Get campaign scan stats")
 async def get_campaign_scan_stats(campaign_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get scan statistics for a campaign."""
+    _verify_campaign_ownership(campaign_id, user.org_id)
     cid = str(campaign_id)
 
     scans_result = supabase.table("scan_jobs").select("status").eq("campaign_id", cid).execute()

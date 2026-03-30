@@ -1,10 +1,14 @@
 """
 Page discovery service — finds promotional pages on dealer websites.
 
-Three strategies, tried in order:
-  1. Sitemap parsing — fetch /sitemap.xml, filter for promotional URLs
-  2. Link crawling — extract internal links from the homepage
-  3. Common path heuristics — try well-known promotional paths
+Three strategies, in priority order:
+  1. Common promotional paths — probe /specials, /deals, /offers, etc.
+     These get guaranteed slots because they are the most likely
+     locations for campaign creatives.
+  2. Sitemap parsing — fetch /sitemap.xml, fill remaining slots with
+     promotional URLs first, then other pages.
+  3. Link crawling — extract internal links from the homepage to fill
+     any remaining slots.
 
 The result is a deduplicated list of page URLs most likely to contain
 campaign creatives, capped at a configurable maximum.
@@ -27,41 +31,38 @@ settings = get_settings()
 PROMO_KEYWORDS = {
     "promo", "promotion", "promotions", "deal", "deals", "offer", "offers",
     "special", "specials", "sale", "sales", "shop", "store", "buy",
-    "campaign", "samsung", "galaxy", "iphone", "apple", "pixel", "motorola",
-    "device", "devices", "phone", "phones", "smartphone", "trade-in",
-    "tradein", "upgrade", "plan", "plans", "wireless", "5g", "unlimited",
-    "accessories", "tablet", "watch", "fios", "internet", "bundle",
-    "featured", "new", "latest", "hot", "best", "top",
+    "campaign", "featured", "new", "latest", "clearance",
+    "rebate", "rebates", "incentive", "incentives", "savings",
+    "financing", "coupon", "coupons", "discount", "discounts",
+    "inventory", "products", "services", "catalog",
+    "events", "seasonal", "limited", "exclusive",
 }
 
 COMMON_PROMO_PATHS = [
     "/",
+    "/specials",
+    "/specials/",
     "/promotions",
     "/promotions/",
     "/deals",
     "/deals/",
     "/offers",
     "/offers/",
-    "/specials",
-    "/specials/",
+    "/sale",
+    "/sales",
     "/shop",
     "/shop/",
-    "/devices",
-    "/devices/",
-    "/phones",
-    "/phones/",
-    "/plans",
-    "/plans/",
-    "/samsung",
-    "/samsung/",
-    "/apple",
-    "/apple/",
-    "/smartphones",
-    "/smartphones/",
-    "/trade-in",
-    "/accessories",
-    "/new",
     "/featured",
+    "/new",
+    "/inventory",
+    "/products",
+    "/services",
+    "/events",
+    "/rebates",
+    "/incentives",
+    "/financing",
+    "/clearance",
+    "/catalog",
 ]
 
 _http_client: Optional[httpx.AsyncClient] = None
@@ -124,6 +125,7 @@ def _is_scannable_page(url: str) -> bool:
         "/cart", "/checkout", "/login", "/signin", "/account",
         "/privacy", "/terms", "/sitemap", "/feed", "/rss",
         "/tag/", "/author/", "/page/", "#",
+        "/blog",
     ]
     for pattern in skip_patterns:
         if pattern in path.lower():
@@ -294,8 +296,10 @@ async def discover_pages(
     Discover pages on a dealer website that are likely to contain
     campaign creatives.
 
-    Tries sitemap first, then homepage link crawling, then common
-    path heuristics. Returns a deduplicated list capped at max_pages.
+    Common promotional paths (``/specials/``, ``/deals/``, etc.) are
+    probed first and given guaranteed priority slots because they are
+    the most likely locations for campaign creatives.  Remaining slots
+    are filled from the sitemap and homepage link crawl.
     """
     parsed = urlparse(base_url)
     base_domain = parsed.netloc.lower().replace("www.", "")
@@ -314,33 +318,39 @@ async def discover_pages(
 
     log.info("Starting page discovery for %s (max %d pages)", base_url, max_pages)
 
-    # Strategy 1: Sitemap
-    sitemap_urls = await _fetch_sitemap_urls(base_url)
-    if sitemap_urls:
-        filtered = _filter_sitemap_urls(sitemap_urls, base_domain, max_pages * 2)
-        for url in filtered:
-            _add(url)
-        log.debug("After sitemap: %d pages", len(result))
+    # Priority: common promotional paths get slots first — these are
+    # the pages most likely to contain campaign creatives.
+    probed = await _probe_common_paths(base_url)
+    for url in probed:
+        _add(url)
+    log.debug("After common promo paths: %d pages", len(result))
 
-    # Strategy 2: Homepage link crawl
+    # Fill remaining slots from sitemap (promo URLs first)
+    if len(result) < max_pages:
+        sitemap_urls = await _fetch_sitemap_urls(base_url)
+        if sitemap_urls:
+            remaining = max_pages - len(result)
+            filtered = _filter_sitemap_urls(sitemap_urls, base_domain, remaining * 2)
+            for url in filtered:
+                if len(result) >= max_pages:
+                    break
+                _add(url)
+            log.debug("After sitemap: %d pages", len(result))
+
+    # Fill remaining slots from homepage link crawl (promo URLs first)
     if len(result) < max_pages:
         crawled = await _crawl_homepage_links(base_url, base_domain)
         promo_links = [u for u in crawled if _url_looks_promotional(u)]
         other_links = [u for u in crawled if not _url_looks_promotional(u)]
         for url in promo_links:
+            if len(result) >= max_pages:
+                break
             _add(url)
         for url in other_links:
             if len(result) >= max_pages:
                 break
             _add(url)
         log.debug("After link crawl: %d pages", len(result))
-
-    # Strategy 3: Common paths (only if we still have very few)
-    if len(result) < 5:
-        probed = await _probe_common_paths(base_url)
-        for url in probed:
-            _add(url)
-        log.debug("After common paths: %d pages", len(result))
 
     final = result[:max_pages]
     log.info("Final: %d pages to scan for %s", len(final), base_domain)

@@ -37,6 +37,11 @@ import {
   getFeedbackStats,
   getBillingUsage,
 } from "./api";
+import type {
+  MatchFilters,
+  DistributorUpdate,
+  FeedbackSubmission,
+} from "./api";
 
 // Query keys for cache management
 export const queryKeys = {
@@ -60,7 +65,7 @@ export const queryKeys = {
     matches: (id: string) => ["distributors", id, "matches"] as const,
   },
   matches: {
-    all: (filters?: any) => ["matches", filters] as const,
+    all: (filters?: MatchFilters) => ["matches", filters] as const,
     detail: (id: string) => ["matches", id] as const,
     stats: ["matches", "stats"] as const,
   },
@@ -240,7 +245,7 @@ export function useCreateDistributor() {
 export function useUpdateDistributor() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ id, updates }: { id: string; updates: any }) => updateDistributor(id, updates),
+    mutationFn: ({ id, updates }: { id: string; updates: DistributorUpdate }) => updateDistributor(id, updates),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.distributors.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });
@@ -260,7 +265,7 @@ export function useDeleteDistributor() {
 }
 
 // Match hooks
-export function useMatches(filters?: any) {
+export function useMatches(filters?: MatchFilters) {
   return useQuery({
     queryKey: queryKeys.matches.all(filters),
     queryFn: () => getMatches(filters),
@@ -396,11 +401,7 @@ export function useSubmitFeedback() {
       feedback,
     }: {
       matchId: string;
-      feedback: {
-        was_correct: boolean;
-        actual_verdict: "true_positive" | "false_positive" | "true_negative" | "false_negative";
-        review_notes?: string;
-      };
+      feedback: FeedbackSubmission;
     }) => submitMatchFeedback(matchId, feedback),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["matches"] });

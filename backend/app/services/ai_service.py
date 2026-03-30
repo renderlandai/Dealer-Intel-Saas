@@ -428,9 +428,40 @@ def extract_json_from_response(response_text: str) -> dict:
         raise ValueError(f"Could not extract JSON from response: {text[:200]}...")
 
 
-def get_filter_prompt() -> str:
-    """Get domain-specific filtering prompt for dealer/distributor monitoring."""
-    return """Analyze this image for a DEALER/DISTRIBUTOR MARKETING MONITORING system.
+def get_filter_prompt(asset_aware: bool = False) -> str:
+    """Get filtering prompt. When asset_aware=True, expects two images (asset + candidate)."""
+    if asset_aware:
+        return """You are a QUICK CAMPAIGN MATCHER for a dealer/distributor marketing monitoring system.
+
+IMAGE 1 (FIRST IMAGE): The APPROVED CAMPAIGN CREATIVE — the reference marketing asset.
+IMAGE 2 (SECOND IMAGE): An image discovered on a dealer's website.
+
+YOUR TASK: Quickly determine if Image 2 COULD BE the same campaign as Image 1.
+This is a fast pre-screen, not a final verdict. When in doubt, say yes.
+
+LIKELY SAME CAMPAIGN (is_relevant: true, confidence > 0.8):
+- Same product/equipment prominently featured
+- Same promotional offer, headline, or pricing visible
+- Same visual design, layout, or color scheme as the creative
+- Same brand + same campaign message
+
+POSSIBLY RELATED (is_relevant: true, confidence 0.5-0.8):
+- Same brand but unclear if same specific campaign
+- Similar product category with overlapping visual elements
+
+CLEARLY DIFFERENT (is_relevant: false):
+- Different brand entirely
+- Different product category (e.g. creative shows excavators, image shows trucks)
+- UI elements, navigation icons, logos only, maps, avatars
+- Generic stock photos with no campaign resemblance
+- A completely different promotional campaign for the same brand
+
+Return JSON:
+- is_relevant: true/false
+- confidence: 0.0-1.0
+- reason: brief explanation"""
+    else:
+        return """Analyze this image for a DEALER/DISTRIBUTOR MARKETING MONITORING system.
 
 CONTEXT: We're monitoring if authorized dealers are using approved campaign creatives correctly.
 
@@ -501,16 +532,21 @@ SCORING RUBRIC:
           (includes template creatives with expected dealer-name customization)
 - 75-89:  Same campaign — clearly the same creative with minor rendering differences
           (different resolution, slight cropping, font rendering differences)
-- 60-74:  Same campaign — recognizably the same creative but with modifications
+- 65-74:  Same campaign — recognizably the same creative but with modifications
           (text overlays, watermarks, resizing, color shifts)
-- 40-59:  Ambiguous — shares significant elements but may be a different version
+- 40-64:  Ambiguous — shares significant elements but may be a different campaign version.
+          DO NOT mark as a match unless you are confident it is the same campaign.
 - 0-39:   Different campaign — different product, different offer, or different design
+
+BE STRICT: If the images share the same brand but show a DIFFERENT promotional campaign,
+DIFFERENT product model, or DIFFERENT offer, score 0-39. Same brand does NOT mean same campaign.
 
 AUTOMATIC SCORE 0 (different campaign entirely):
 - Different brand (e.g. iPhone creative vs Samsung creative)
 - Different product model (e.g. Galaxy S25 vs Galaxy S26)
 - Same product but completely different creative design/photo
 - Competitor's campaign material
+- Same brand but a DIFFERENT promotion or marketing campaign
 
 Modifications to identify:
 - cropping, resizing, color_changes, text_added, text_removed, overlay_added, quality_degraded, watermark_added
@@ -518,7 +554,7 @@ Modifications to identify:
 
 Return JSON with:
 - similarity_score: 0-100
-- is_match: true if similarity_score >= 55
+- is_match: true ONLY if similarity_score >= 70 (you are confident this is the same campaign)
 - match_type: "exact"/"strong"/"partial"/"weak"/"none"
 - modifications: array of detected modifications (exclude expected template customizations)
 - modification_severity: "none"/"minor"/"moderate"/"major"
@@ -569,14 +605,18 @@ CONFIDENCE SCORING:
 - 55-69:  Probable match — significant shared elements but notable differences
 - 0-39:   Not a match — different product, different campaign, or different brand
 
+BE STRICT: If the webpage shows the same BRAND but a DIFFERENT promotional campaign,
+different product model, or different offer, that is NOT a match. Score 0-39.
+
 AUTOMATIC asset_found: false:
 - Different brand entirely (e.g. searching for Samsung, found Apple)
 - Different product model (e.g. searching for Galaxy S26, found Galaxy S25)
 - Same product but a completely different campaign design
+- Same brand but a DIFFERENT promotion or marketing campaign
 - No promotional content visible in the screenshot
 
 Return JSON with:
-- asset_found: true if confidence >= 55
+- asset_found: true ONLY if confidence >= 65
 - confidence: 0-100
 - location: where found (header/sidebar/main_content/footer/banner/hero/carousel/popup/unknown)
 - appearance: how it appears (exact/resized/cropped/modified/none)
@@ -814,21 +854,34 @@ async def localize_assets_in_screenshot(
     return all_locations
 
 
-async def filter_image(image_url: str) -> ImageFilterResult:
+async def filter_image(
+    image_url: str,
+    asset_urls: Optional[List[str]] = None,
+) -> ImageFilterResult:
     """
     Use Claude Haiku to quickly filter irrelevant images.
-    Haiku is ~30x cheaper than Opus and fast enough for a yes/no relevance check.
+
+    When *asset_urls* are provided the filter becomes **asset-aware**: it
+    sends the first campaign asset alongside the discovered image and asks
+    "could this be the same campaign?" instead of "is this a marketing
+    image?".  This dramatically reduces false positives on multi-page scans.
     """
     try:
         image_bytes = await download_image(image_url)
         image_bytes = optimize_image_for_api(image_bytes, "default")
-        
-        prompt = get_filter_prompt()
-        
-        response_text = await call_anthropic_with_retry(prompt, [image_bytes], model=FILTER_MODEL)
+
+        if asset_urls:
+            asset_bytes = await download_image(asset_urls[0])
+            asset_bytes = optimize_image_for_api(asset_bytes, "asset")
+            prompt = get_filter_prompt(asset_aware=True)
+            images = [asset_bytes, image_bytes]
+        else:
+            prompt = get_filter_prompt(asset_aware=False)
+            images = [image_bytes]
+
+        response_text = await call_anthropic_with_retry(prompt, images, model=FILTER_MODEL)
         result = extract_json_from_response(response_text)
         
-        # Apply relevance threshold
         is_relevant = result.get("is_relevant", False)
         confidence = result.get("confidence", 0.5)
         
@@ -844,7 +897,6 @@ async def filter_image(image_url: str) -> ImageFilterResult:
         
     except Exception as e:
         log.error("Filter error: %s", e)
-        # On error, mark as relevant to avoid missing content
         return ImageFilterResult(
             is_relevant=True,
             confidence=0.5,
@@ -1225,9 +1277,9 @@ async def ensemble_match(
     else:
         match_type = "none"
     
-    # STRICT: Require score to meet threshold - don't just trust asset_found
+    # STRICT: Score alone decides match — never let asset_found override a low score
     threshold = settings.screenshot_match_threshold if is_screenshot else settings.regular_image_match_threshold
-    is_match = final_score >= threshold and (asset_found or final_score >= settings.partial_match_threshold)
+    is_match = final_score >= threshold
     
     log.debug("Ensemble scores - Visual: %d, Detection: %d, Hash: %d", visual_score, detection_score, hash_score)
     log.debug("Ensemble final: %.1f, Match: %s, Type: %s", final_score, is_match, match_type)
@@ -1354,7 +1406,7 @@ async def _passes_hash_prefilter(
     return False
 
 
-def _passes_clip_prefilter(
+async def _passes_clip_prefilter(
     image_bytes: bytes,
     asset_embeddings: list,
 ) -> bool:
@@ -1363,14 +1415,14 @@ def _passes_clip_prefilter(
     discovered image and campaign assets.
 
     Returns True if the image should continue to Claude.
-    Runs locally on CPU (~20ms per image).
+    Runs locally on CPU (~20ms per image) in a thread executor.
     """
     if not asset_embeddings:
-        return True  # no embeddings → skip gate
+        return True
 
-    img_emb = embedding_service.compute_embedding(image_bytes)
+    img_emb = await embedding_service.compute_embedding_async(image_bytes)
     if img_emb is None:
-        return True  # model unavailable → don't discard
+        return True
 
     best_sim = embedding_service.best_asset_similarity(img_emb, asset_embeddings)
     passes = best_sim >= settings.clip_similarity_threshold
@@ -1398,7 +1450,11 @@ async def _precompute_asset_hashes(
 async def _precompute_asset_embeddings(
     campaign_assets: List[Dict[str, Any]],
 ) -> list:
-    """Download each campaign asset and compute CLIP embeddings once."""
+    """Download each campaign asset and compute CLIP embeddings once.
+
+    Uses the async embedding path so the event loop stays responsive
+    during the (potentially heavy) model load + encode.
+    """
     bytes_list = []
     for asset in campaign_assets:
         try:
@@ -1408,7 +1464,7 @@ async def _precompute_asset_embeddings(
                         asset.get("name", asset["id"]), e)
     if not bytes_list:
         return []
-    embeddings = embedding_service.compute_embeddings_batch(bytes_list)
+    embeddings = await embedding_service.compute_embeddings_batch_async(bytes_list)
     return [e for e in embeddings if e is not None]
 
 
@@ -1435,13 +1491,10 @@ async def process_discovered_image(
     log.info("Processing image: %s", image_url[:80])
     log.debug("Source type: %s", source_type or "not specified")
     
-    # Determine if this is a screenshot
-    is_screenshot = (
-        source_type == "page_screenshot" or
-        "screenshot" in image_url.lower() or
-        "screenshotUrl" in image_url or
-        "/screenshots/" in image_url
-    )
+    # Determine if this is a screenshot — ONLY trust the explicit source_type flag.
+    # URL-based checks matched the Supabase bucket name ("scan-screenshots")
+    # and caused every stored image to bypass all pre-filters.
+    is_screenshot = source_type == "page_screenshot"
 
     # --- Stage 1 & 2: local pre-filters (skip for screenshots) ---
     if not is_screenshot:
@@ -1460,7 +1513,7 @@ async def process_discovered_image(
 
         # Stage 2: CLIP embedding pre-filter
         if asset_embeddings_cache:
-            passes_clip = _passes_clip_prefilter(image_bytes_for_prefilter, asset_embeddings_cache)
+            passes_clip = await _passes_clip_prefilter(image_bytes_for_prefilter, asset_embeddings_cache)
             if not passes_clip:
                 log.debug("REJECTED by CLIP pre-filter (low semantic similarity)")
                 return None, "clip_rejected"
@@ -1484,8 +1537,9 @@ async def process_discovered_image(
             reason="Screenshot - checking for contained assets"
         )
     else:
-        log.debug("Stage 3: Haiku relevance filter")
-        filter_result = await filter_image(image_url)
+        log.debug("Stage 3: Haiku relevance filter (asset-aware)")
+        asset_urls = [a["file_url"] for a in campaign_assets if a.get("file_url")] or None
+        filter_result = await filter_image(image_url, asset_urls=asset_urls)
         log.debug("Filter: is_relevant=%s, confidence=%.2f", filter_result.is_relevant, filter_result.confidence)
         
         if not filter_result.is_relevant:
@@ -1507,17 +1561,12 @@ async def process_discovered_image(
         )
         
         score = comparison.get("similarity_score", 0)
-        is_found = comparison.get("asset_found", False) or comparison.get("is_match", False)
         
-        log.debug("Ensemble score: %d, Found/Match: %s", score, is_found)
+        log.debug("Ensemble score: %d", score)
         
-        if is_found or score > best_score:
-            if is_found:
-                best_score = max(score, best_score)
-                best_match = {"asset": asset, "comparison": comparison}
-            elif score > best_score:
-                best_score = score
-                best_match = {"asset": asset, "comparison": comparison}
+        if score > best_score:
+            best_score = score
+            best_match = {"asset": asset, "comparison": comparison}
     
     threshold = adaptive_threshold
     
@@ -1525,11 +1574,8 @@ async def process_discovered_image(
         log.info("No match found")
         return None, "below_threshold"
     
-    asset_found = best_match["comparison"].get("asset_found", False)
-    is_match = best_match["comparison"].get("is_match", False)
-    
-    if not asset_found and not is_match and best_score < threshold:
-        log.debug("Best score %d below threshold %d", best_score, threshold)
+    if best_score < threshold:
+        log.debug("Best score %d below threshold %d — rejected", best_score, threshold)
         return None, "below_threshold"
     
     # Verify borderline matches

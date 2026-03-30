@@ -5,10 +5,16 @@ Computes image embeddings locally using a lightweight CLIP model, then
 uses cosine similarity to discard images that have no visual relationship
 to any campaign asset — before making expensive Claude API calls.
 
+All heavy work (model loading, encoding) runs in a thread executor so the
+async event loop is never blocked — preventing Gunicorn heartbeat timeouts.
+
 Typical latency: ~20ms per image on CPU (clip-ViT-B-32).
 """
+import asyncio
 import io
 import logging
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import List, Optional
 
 import numpy as np
@@ -22,6 +28,7 @@ settings = get_settings()
 
 _model = None
 _model_load_attempted = False
+_executor = ThreadPoolExecutor(max_workers=1)
 
 
 def _get_model():
@@ -43,8 +50,16 @@ def _get_model():
         return None
 
 
-def compute_embedding(image_bytes: bytes) -> Optional[np.ndarray]:
-    """Compute a CLIP embedding vector for a single image."""
+def warmup() -> bool:
+    """Pre-load the CLIP model. Call at startup to avoid first-scan delays.
+
+    Returns True if the model loaded successfully.
+    """
+    return _get_model() is not None
+
+
+def _compute_embedding_sync(image_bytes: bytes) -> Optional[np.ndarray]:
+    """Synchronous single-image embedding (runs in executor)."""
     model = _get_model()
     if model is None:
         return None
@@ -60,8 +75,25 @@ def compute_embedding(image_bytes: bytes) -> Optional[np.ndarray]:
         return None
 
 
-def compute_embeddings_batch(images_bytes: List[bytes]) -> List[Optional[np.ndarray]]:
-    """Compute CLIP embeddings for a batch of images."""
+def compute_embedding(image_bytes: bytes) -> Optional[np.ndarray]:
+    """Compute a CLIP embedding vector for a single image.
+
+    Kept synchronous for backward compatibility with callers that already
+    run inside an executor or don't need async.
+    """
+    return _compute_embedding_sync(image_bytes)
+
+
+async def compute_embedding_async(image_bytes: bytes) -> Optional[np.ndarray]:
+    """Async wrapper — offloads heavy CPU work to a thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _executor, partial(_compute_embedding_sync, image_bytes)
+    )
+
+
+def _compute_embeddings_batch_sync(images_bytes: List[bytes]) -> List[Optional[np.ndarray]]:
+    """Synchronous batch embedding (runs in executor)."""
     model = _get_model()
     if model is None:
         return [None] * len(images_bytes)
@@ -91,6 +123,19 @@ def compute_embeddings_batch(images_bytes: List[bytes]) -> List[Optional[np.ndar
     for j, idx in enumerate(valid_indices):
         results[idx] = normalised[j]
     return results
+
+
+def compute_embeddings_batch(images_bytes: List[bytes]) -> List[Optional[np.ndarray]]:
+    """Compute CLIP embeddings for a batch of images (synchronous)."""
+    return _compute_embeddings_batch_sync(images_bytes)
+
+
+async def compute_embeddings_batch_async(images_bytes: List[bytes]) -> List[Optional[np.ndarray]]:
+    """Async wrapper — offloads batch encoding to a thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _executor, partial(_compute_embeddings_batch_sync, images_bytes)
+    )
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:

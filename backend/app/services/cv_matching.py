@@ -48,13 +48,16 @@ def _bytes_to_gray(img_bytes: bytes) -> np.ndarray:
 def template_match(
     screenshot_bytes: bytes,
     asset_bytes: bytes,
-    scale_range: Tuple[float, float] = (0.15, 1.5),
-    scale_steps: int = 30,
-    threshold: float = 0.45,
+    scale_range: Tuple[float, float] = (0.10, 1.8),
+    scale_steps: int = 50,
+    threshold: float = 0.40,
 ) -> List[Dict[str, Any]]:
     """
     Find the asset in the screenshot using multi-scale normalised
     cross-correlation.
+
+    Uses denser sampling at smaller scales (0.10–0.5) where web renders
+    most commonly resize creatives, and coarser steps at larger scales.
 
     Returns a list of match dicts sorted by confidence (highest first).
     Each dict: {x, y, width, height, confidence, method}.
@@ -70,7 +73,15 @@ def template_match(
     best: Optional[Dict[str, Any]] = None
 
     lo, hi = scale_range
-    for scale in np.linspace(lo, hi, scale_steps):
+    mid = 0.5
+    small_steps = int(scale_steps * 0.6)
+    large_steps = scale_steps - small_steps
+    scales = np.concatenate([
+        np.linspace(lo, mid, small_steps),
+        np.linspace(mid, hi, large_steps + 1)[1:],
+    ])
+
+    for scale in scales:
         new_w = int(a_w * scale)
         new_h = int(a_h * scale)
         if new_w < 30 or new_h < 30:
@@ -109,8 +120,8 @@ def template_match(
 def feature_match(
     screenshot_bytes: bytes,
     asset_bytes: bytes,
-    min_good_matches: int = 12,
-    ratio_thresh: float = 0.75,
+    min_good_matches: int = 8,
+    ratio_thresh: float = 0.78,
 ) -> List[Dict[str, Any]]:
     """
     Find the asset in the screenshot using ORB keypoint detection
@@ -203,8 +214,8 @@ def feature_match(
 def find_asset_on_page(
     screenshot_bytes: bytes,
     asset_bytes: bytes,
-    template_threshold: float = 0.45,
-    feature_min_matches: int = 12,
+    template_threshold: float = 0.40,
+    feature_min_matches: int = 8,
 ) -> List[Dict[str, Any]]:
     """
     Combined matching: try template matching first (faster, more precise

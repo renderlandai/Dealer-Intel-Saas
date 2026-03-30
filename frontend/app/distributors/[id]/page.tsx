@@ -98,8 +98,9 @@ export default function DistributorDetailPage() {
     try {
       await deleteDistributor(distributorId);
       router.push("/distributors");
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to delete distributor:", error);
+      alert(error?.response?.data?.detail || "Failed to delete distributor.");
       setDeleting(false);
       setShowDeleteConfirm(false);
     }

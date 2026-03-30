@@ -45,7 +45,7 @@ def _require_admin(user: AuthUser) -> None:
         raise HTTPException(403, "Only org owners and admins can manage the team")
 
 
-@router.get("/members")
+@router.get("/members", summary="List team members")
 async def list_members(user: AuthUser = Depends(get_current_user)):
     """List all members of the current organization."""
     profiles = supabase.table("user_profiles") \
@@ -91,7 +91,7 @@ async def list_members(user: AuthUser = Depends(get_current_user)):
     return members
 
 
-@router.get("/invites")
+@router.get("/invites", summary="List pending invites")
 async def list_invites(user: AuthUser = Depends(get_current_user)):
     """List pending invitations for the current organization."""
     _require_admin(user)
@@ -107,8 +107,10 @@ async def list_invites(user: AuthUser = Depends(get_current_user)):
     return result.data or []
 
 
-@router.post("/invites")
+@router.post("/invites", summary="Invite team member")
+@limiter.limit("10/minute")
 async def invite_member(
+    request: Request,
     body: InviteRequest,
     user: AuthUser = Depends(get_current_user),
 ):
@@ -175,11 +177,11 @@ async def invite_member(
         "invited_by": str(user.user_id),
     }).execute()
 
-    log.info("Invite sent to %s for org %s by %s", body.email, user.org_id, user.user_id)
+    log.info("Invite sent to %s*** for org %s by user %s", body.email[:3], user.org_id, user.user_id)
     return result.data[0]
 
 
-@router.delete("/invites/{invite_id}")
+@router.delete("/invites/{invite_id}", summary="Cancel invitation")
 async def cancel_invite(
     invite_id: UUID,
     user: AuthUser = Depends(get_current_user),
@@ -196,8 +198,10 @@ async def cancel_invite(
     return {"status": "canceled"}
 
 
-@router.delete("/members/{member_user_id}")
+@router.delete("/members/{member_user_id}", summary="Remove team member")
+@limiter.limit("10/minute")
 async def remove_member(
+    request: Request,
     member_user_id: UUID,
     user: AuthUser = Depends(get_current_user),
 ):
@@ -229,7 +233,7 @@ async def remove_member(
     return {"status": "removed"}
 
 
-@router.post("/invites/{token}/accept")
+@router.post("/invites/{token}/accept", summary="Accept invitation")
 @limiter.limit("10/minute")
 async def accept_invite(request: Request, token: UUID, user: AuthUser = Depends(get_current_user)):
     """Accept an invitation. The authenticated user's email must match the invite."""

@@ -162,8 +162,9 @@ export default function ScansPage() {
     if (confirm("Delete this scan and all its results?")) {
       try {
         await deleteScanMutation.mutateAsync(id);
-      } catch (error) {
+      } catch (error: any) {
         console.error("Failed to delete scan:", error);
+        alert(error?.response?.data?.detail || "Failed to delete scan.");
       }
     }
   };
@@ -172,8 +173,9 @@ export default function ScansPage() {
     if (confirm("Delete ALL scans and results? This cannot be undone.")) {
       try {
         await deleteAllScansMutation.mutateAsync();
-      } catch (error) {
+      } catch (error: any) {
         console.error("Failed to delete all scans:", error);
+        alert(error?.response?.data?.detail || "Failed to delete scans.");
       }
     }
   };

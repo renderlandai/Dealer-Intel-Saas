@@ -82,8 +82,9 @@ export default function DashboardPage() {
     setDownloading(format);
     try {
       await downloadComplianceReport(format);
-    } catch (error) {
+    } catch (error: any) {
       console.error("Download failed:", error);
+      alert(error?.response?.data?.detail || "Report download failed. Please try again.");
     } finally {
       setDownloading(null);
     }

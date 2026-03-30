@@ -67,12 +67,12 @@ def _send_via_resend(*, to: str, subject: str, html: str) -> bool:
             timeout=15,
         )
         if resp.status_code in (200, 201):
-            log.info("Email sent to %s — %s", to, subject)
+            log.info("Email sent to %s*** — %s", to[:3], subject)
             return True
-        log.error("Resend API error %d: %s", resp.status_code, resp.text)
+        log.error("Resend API error %d: %s", resp.status_code, resp.text[:200])
         return False
     except Exception as e:
-        log.error("Failed to send email to %s: %s", to, e)
+        log.error("Failed to send email to %s***: %s", to[:3], e)
         return False
 
 
@@ -250,5 +250,6 @@ def send_test_email(organization_id: UUID) -> dict:
     )
 
     if success:
-        return {"success": True, "message": f"Test email sent to {to_email}"}
+        masked = to_email[:3] + "***" + to_email[to_email.index("@"):] if "@" in to_email else to_email[:3] + "***"
+        return {"success": True, "message": f"Test email sent to {masked}"}
     return {"success": False, "error": "Failed to send email. Check the server logs for details."}

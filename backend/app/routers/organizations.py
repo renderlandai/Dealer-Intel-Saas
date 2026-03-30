@@ -45,7 +45,7 @@ def _assert_own_org(org_id: UUID, user: AuthUser) -> None:
         raise HTTPException(status_code=403, detail="Access denied")
 
 
-@router.get("/{org_id}/settings")
+@router.get("/{org_id}/settings", summary="Get organization settings")
 async def get_org_settings(org_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get organization settings."""
     _assert_own_org(org_id, user)
@@ -77,8 +77,10 @@ async def get_org_settings(org_id: UUID, user: AuthUser = Depends(get_current_us
     }
 
 
-@router.patch("/{org_id}/settings")
+@router.patch("/{org_id}/settings", summary="Update organization settings")
+@limiter.limit("10/minute")
 async def update_org_settings(
+    request: Request,
     org_id: UUID,
     updates: OrgSettingsUpdate,
     user: AuthUser = Depends(get_current_user),
@@ -107,7 +109,7 @@ async def update_org_settings(
     return {"organization_id": str(org_id), "status": "updated"}
 
 
-@router.post("/{org_id}/test-email")
+@router.post("/{org_id}/test-email", summary="Send test email")
 @limiter.limit("5/minute")
 async def test_email(
     request: Request,
@@ -126,7 +128,7 @@ async def test_email(
     return result
 
 
-@router.get("/{org_id}/logo")
+@router.get("/{org_id}/logo", summary="Get organization logo")
 async def get_org_logo(org_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get the current logo URL for an organization."""
     _assert_own_org(org_id, user)
@@ -152,8 +154,10 @@ async def get_org_logo(org_id: UUID, user: AuthUser = Depends(get_current_user))
     }
 
 
-@router.post("/{org_id}/logo")
+@router.post("/{org_id}/logo", summary="Upload organization logo")
+@limiter.limit("5/minute")
 async def upload_org_logo(
+    request: Request,
     org_id: UUID,
     file: UploadFile = File(...),
     user: AuthUser = Depends(get_current_user),
@@ -223,7 +227,7 @@ async def upload_org_logo(
     }
 
 
-@router.delete("/{org_id}/logo")
+@router.delete("/{org_id}/logo", summary="Delete organization logo")
 async def delete_org_logo(org_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Remove the organization logo — reports will fall back to the default."""
     _assert_own_org(org_id, user)

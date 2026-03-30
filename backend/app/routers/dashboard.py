@@ -33,7 +33,7 @@ def _org_campaign_ids(org_id: str) -> List[str]:
     return [c["id"] for c in (result.data or [])]
 
 
-@router.get("/stats", response_model=DashboardStats)
+@router.get("/stats", response_model=DashboardStats, summary="Get dashboard stats")
 async def get_dashboard_stats(user: AuthUser = Depends(get_current_user)):
     """Get dashboard statistics via single Postgres RPC (falls back to sequential queries)."""
     org_id = str(user.org_id)
@@ -126,7 +126,7 @@ async def _get_dashboard_stats_fallback(org_id: str) -> DashboardStats:
     )
 
 
-@router.get("/recent-matches")
+@router.get("/recent-matches", summary="Get recent matches")
 async def get_recent_matches(
     limit: int = 10,
     user: AuthUser = Depends(get_current_user),
@@ -145,7 +145,7 @@ async def get_recent_matches(
     return result.data
 
 
-@router.get("/recent-alerts")
+@router.get("/recent-alerts", summary="Get recent alerts")
 async def get_recent_alerts(
     limit: int = 10,
     unread_only: bool = True,
@@ -163,7 +163,7 @@ async def get_recent_alerts(
     return result.data
 
 
-@router.get("/coverage-by-channel")
+@router.get("/coverage-by-channel", summary="Get coverage by channel")
 async def get_coverage_by_channel(user: AuthUser = Depends(get_current_user)):
     """Get match coverage by channel scoped to the user's organization."""
     distributor_ids = _org_distributor_ids(str(user.org_id))
@@ -186,7 +186,7 @@ async def get_coverage_by_channel(user: AuthUser = Depends(get_current_user)):
     ]
 
 
-@router.get("/coverage-by-distributor")
+@router.get("/coverage-by-distributor", summary="Get coverage by distributor")
 async def get_coverage_by_distributor(
     limit: int = 10,
     user: AuthUser = Depends(get_current_user),
@@ -222,7 +222,7 @@ async def get_coverage_by_distributor(
     ]
 
 
-@router.get("/compliance-trend")
+@router.get("/compliance-trend", summary="Get compliance trend")
 async def get_compliance_trend(
     days: int = 30,
     user: AuthUser = Depends(get_current_user),
