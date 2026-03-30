@@ -1493,3 +1493,19 @@ In `page_discovery.py`, Strategy 3 (common path probing) only executed when `len
 
 - **Reversed strategy priority** — Common promotional paths (`/specials/`, `/deals/`, `/offers/`, `/promotions/`, etc.) are now probed **first** and given guaranteed priority slots. Sitemap and homepage link crawl fill the remaining slots afterward.
 - **Removed the `< 5` guard** — Common path probing always runs, regardless of how many pages were already found from other strategies.
+
+---
+
+## 2026-03-30 — Fix Ensemble Scoring (Regular Images Capped at 65%)
+
+### Summary
+Regular image matches were always classified as "Below Threshold" in production — even for exact matches — because the ensemble scoring formula wasted 35% of the weight on a detection score that is always zero for non-screenshot images.
+
+### Root Cause
+In `ensemble_match()`, the `detection_score` component (weighted at `0.35`) is only populated for screenshots. For regular images it is hardcoded to `0`. With `visual_weight = 0.5` and `hash_weight = 0.15` summing to only `0.65`, the theoretical maximum score was 65 (+5 agreement bonus = 70). This equals the `regular_image_match_threshold` of 70, making it nearly impossible for legitimate matches to pass.
+
+### Changes (`backend/app/services/ai_service.py`)
+
+1. **Normalised ensemble weights for regular images** — When detection is not used, the visual and hash weights are divided by their sum so they total 1.0. With the default config (0.5 visual, 0.15 hash), effective weights become ~0.77 visual + ~0.23 hash, giving a true 0–100 scoring range.
+
+2. **Fixed agreement bonus counting** — The bonus previously counted `detection_score` even when it was always zero for regular images. Now only scores from methods that were actually run are counted.

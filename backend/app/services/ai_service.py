@@ -1248,15 +1248,19 @@ async def ensemble_match(
         # For screenshots, detection carries 100% weight — hash is skipped
         final_score = detection_score * 1.0
     else:
-        # For regular images, visual comparison is primary
+        # For regular images, only visual + hash are available (detection is
+        # not run).  Normalise their weights so they sum to 1.0.
+        vw = settings.ensemble_visual_weight
+        hw = settings.ensemble_hash_weight
+        total = vw + hw or 1.0
         final_score = (
-            visual_score * settings.ensemble_visual_weight +
-            detection_score * settings.ensemble_detection_weight +
-            hash_score * settings.ensemble_hash_weight
+            visual_score * (vw / total) +
+            hash_score * (hw / total)
         )
     
-    # Agreement bonus - ONLY if multiple methods agree on STRONG match (>60)
-    agreement_count = sum(1 for s in [visual_score, detection_score, hash_score] if s > 60)
+    # Agreement bonus — only count methods that were actually run
+    active_scores = [visual_score, hash_score] if not is_screenshot else [detection_score]
+    agreement_count = sum(1 for s in active_scores if s > 60)
     if agreement_count >= 2:
         final_score = min(100, final_score + settings.ensemble_agreement_bonus)
     
