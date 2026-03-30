@@ -84,7 +84,7 @@ services:
         value: "https://dealer-intel-saas.vercel.app"
       - key: WEB_CONCURRENCY
         scope: RUN_TIME
-        value: "2"
+        value: "1"
       - key: LOG_LEVEL
         scope: RUN_TIME
         value: "info"
