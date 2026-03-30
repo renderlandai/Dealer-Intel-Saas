@@ -58,22 +58,26 @@ def _send_scan_notifications(
         if not total_matches:
             total_matches = job_data.get("matches_count", 0)
 
-        all_matches = supabase.table("matches")\
-            .select("compliance_status")\
-            .eq("discovered_images.scan_job_id", str(scan_job_id))\
+        img_rows = supabase.table("discovered_images")\
+            .select("id")\
+            .eq("scan_job_id", str(scan_job_id))\
             .execute()
+        img_ids = [r["id"] for r in (img_rows.data or [])]
 
         compliant = 0
         violation_count = 0
-        if all_matches.data:
-            for m in all_matches.data:
+        if img_ids:
+            all_matches = supabase.table("matches")\
+                .select("compliance_status")\
+                .in_("discovered_image_id", img_ids)\
+                .execute()
+            for m in (all_matches.data or []):
                 if m.get("compliance_status") == "compliant":
                     compliant += 1
                 elif m.get("compliance_status") == "violation":
                     violation_count += 1
-        else:
+        if compliant == 0 and violation_count == 0:
             compliant = total_matches
-            violation_count = 0
 
         total_images = stats.get("total_images", job_data.get("processed_items", 0))
         total_all = compliant + violation_count

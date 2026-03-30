@@ -1509,3 +1509,19 @@ In `ensemble_match()`, the `detection_score` component (weighted at `0.35`) is o
 1. **Normalised ensemble weights for regular images** — When detection is not used, the visual and hash weights are divided by their sum so they total 1.0. With the default config (0.5 visual, 0.15 hash), effective weights become ~0.77 visual + ~0.23 hash, giving a true 0–100 scoring range.
 
 2. **Fixed agreement bonus counting** — The bonus previously counted `detection_score` even when it was always zero for regular images. Now only scores from methods that were actually run are counted.
+
+---
+
+## 2026-03-30 — Fix Production Deployment (OOM + Missing Gunicorn)
+
+### Summary
+Multiple deployment failures on DigitalOcean App Platform. The container was terminated at startup due to exceeding memory limits, and once that was resolved, the `gunicorn` executable was missing.
+
+### Root Cause
+1. **OOM** — The `professional-xs` instance (1 GB RAM) could not fit Playwright/Chromium + OpenCV + the full Python stack in memory. The container was killed by the platform before the health check could pass.
+2. **Missing gunicorn** — `gunicorn` was never listed as an explicit dependency in `requirements.txt`. It had been pulled in transitively by `langchain`, which was removed in a prior OOM fix. The Dockerfile's `CMD` calls `gunicorn` directly, so the container crashed immediately on startup.
+
+### Changes
+
+- **`.do/app.yaml`** — Upgraded `instance_size_slug` from `professional-xs` (1 GB) to `professional-s` (2 GB), giving sufficient headroom for the full runtime stack.
+- **`backend/requirements.txt`** — Added `gunicorn==23.0.0` as an explicit dependency.

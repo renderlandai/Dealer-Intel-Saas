@@ -304,12 +304,7 @@ async def _run_retention() -> None:
 
 
 async def _cleanup_stale_scans() -> None:
-    """Auto-fail scans stuck in 'pending' or 'running' too long.
-
-    Scans now update ``updated_at`` as a heartbeat while they make
-    progress.  The cleanup checks ``updated_at`` (not ``created_at``)
-    for running scans so a long-but-healthy scan is never killed.
-    """
+    """Auto-fail scans stuck in 'pending' or 'running' too long."""
     try:
         # Pending scans that were never picked up by a worker.
         # 15 minutes is generous — the status moves to "running" almost
@@ -321,14 +316,12 @@ async def _cleanup_stale_scans() -> None:
             .lt("created_at", pending_cutoff) \
             .execute()
 
-        # Running/analyzing scans that haven't sent a heartbeat in 30 min.
-        # Healthy scans heartbeat every page, so 30 min of silence means
-        # the worker died.
+        # Running/analyzing scans older than 30 min are presumed dead.
         running_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
         stale_running = supabase.table("scan_jobs") \
             .select("id") \
             .in_("status", ["running", "analyzing"]) \
-            .lt("updated_at", running_cutoff) \
+            .lt("created_at", running_cutoff) \
             .execute()
 
         all_stale = (stale_pending.data or []) + (stale_running.data or [])
