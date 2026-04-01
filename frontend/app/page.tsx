@@ -1,6 +1,7 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import {
   Megaphone,
@@ -41,8 +42,9 @@ import {
   useCampaigns,
   useDistributors,
   useBillingUsage,
+  queryKeys,
 } from "@/lib/hooks";
-import { downloadComplianceReport, Campaign } from "@/lib/api";
+import { downloadComplianceReport, Campaign, getMatches, getMatchStats, getScanJobs, getAlerts } from "@/lib/api";
 import { TrialBanner } from "@/components/dashboard/trial-banner";
 import { UsageCard } from "@/components/dashboard/usage-card";
 import { OnboardingChecklist } from "@/components/dashboard/onboarding-checklist";
@@ -67,6 +69,15 @@ export default function DashboardPage() {
   const { data: distributors = [], isError: distributorsError } = useDistributors();
   const { data: billing } = useBillingUsage();
   
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    queryClient.prefetchQuery({ queryKey: queryKeys.matches.all(), queryFn: () => getMatches() });
+    queryClient.prefetchQuery({ queryKey: queryKeys.matches.stats, queryFn: getMatchStats });
+    queryClient.prefetchQuery({ queryKey: queryKeys.scans.all, queryFn: getScanJobs });
+    queryClient.prefetchQuery({ queryKey: ["alerts", { unreadOnly: false }], queryFn: () => getAlerts() });
+  }, [queryClient]);
+
   const campaigns = allCampaigns.filter((c: Campaign) => c.status === "active");
   const loading = statsLoading;
   const [downloading, setDownloading] = useState<string | null>(null);
@@ -128,25 +139,25 @@ export default function DashboardPage() {
 
         {/* Top Key Metrics */}
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-          <Link href="/matches?status=compliant" className="stat-card opacity-0 animate-fade-up delay-150 hover:border-success/40 transition-colors cursor-pointer">
-            <div className="flex items-center gap-4">
-              <div className="flex h-12 w-12 items-center justify-center bg-success/10 border border-success/20">
-                <CheckCircle className="h-6 w-6 text-success" />
+          <Link href="/matches?status=compliant" className="stat-card group hover-lift opacity-0 animate-fade-up delay-150 hover:border-success/40 transition-colors cursor-pointer">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground mb-3">Compliance Rate</p>
+                <p className="data-value text-foreground">{stats.compliance_rate}%</p>
               </div>
-              <div>
-                <p className="text-2xs uppercase tracking-wider text-muted-foreground">Compliance Rate</p>
-                <p className="data-value mt-1">{stats.compliance_rate}%</p>
+              <div className="flex h-10 w-10 items-center justify-center bg-success/10 border border-success/20 text-success">
+                <CheckCircle className="h-5 w-5" />
               </div>
             </div>
           </Link>
-          <Link href="/matches?status=violation" className="stat-card opacity-0 animate-fade-up delay-225 hover:border-destructive/40 transition-colors cursor-pointer">
-            <div className="flex items-center gap-4">
-              <div className="flex h-12 w-12 items-center justify-center bg-destructive/10 border border-destructive/20">
-                <AlertTriangle className="h-6 w-6 text-destructive" />
+          <Link href="/matches?status=violation" className="stat-card group hover-lift opacity-0 animate-fade-up delay-225 hover:border-destructive/40 transition-colors cursor-pointer">
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground mb-3">Violations</p>
+                <p className="data-value text-foreground">{stats.violations_count}</p>
               </div>
-              <div>
-                <p className="text-2xs uppercase tracking-wider text-muted-foreground">Violations</p>
-                <p className="data-value mt-1">{stats.violations_count}</p>
+              <div className="flex h-10 w-10 items-center justify-center bg-destructive/10 border border-destructive/20 text-destructive">
+                <AlertTriangle className="h-5 w-5" />
               </div>
             </div>
           </Link>

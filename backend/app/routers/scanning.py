@@ -394,9 +394,17 @@ async def _prune_duplicate_matches(scan_job_id: UUID) -> int:
     Returns the number of pruned (deleted) match rows.
     """
     try:
+        img_rows = supabase.table("discovered_images")\
+            .select("id")\
+            .eq("scan_job_id", str(scan_job_id))\
+            .execute()
+        img_ids = [r["id"] for r in (img_rows.data or [])]
+        if not img_ids:
+            return 0
+
         all_matches = supabase.table("matches")\
-            .select("id, asset_id, distributor_id, confidence_score, discovered_image_id")\
-            .eq("discovered_images.scan_job_id", str(scan_job_id))\
+            .select("id, asset_id, distributor_id, confidence_score")\
+            .in_("discovered_image_id", img_ids)\
             .order("confidence_score", desc=True)\
             .execute()
 

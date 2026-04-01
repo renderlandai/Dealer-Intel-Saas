@@ -127,12 +127,20 @@ async def _dismiss_overlays(page: Page) -> None:
             continue
 
 
-async def _advance_carousels(page: Page, max_clicks: int = 5) -> None:
+async def _advance_carousels(
+    page: Page,
+    max_clicks: int = 5,
+    extract_per_step: bool = True,
+) -> List[Dict[str, Any]]:
     """Click carousel/slider 'next' buttons to reveal hidden slides.
 
     Many dealer sites use carousels for promotional banners.  The creative
-    might only be visible after clicking forward.  We advance a few times
-    and pause briefly to let lazy images load.
+    might only be visible after clicking forward.  We extract images after
+    each click so that every slide's content is captured, not just the
+    final state.
+
+    Returns a list of image dicts collected across all carousel steps
+    (deduplicated by src).
     """
     next_selectors = [
         "button[class*='next']", "button[class*='slick-next']",
@@ -144,6 +152,9 @@ async def _advance_carousels(page: Page, max_clicks: int = 5) -> None:
         "button[data-slide='next']",
         "[class*='arrow-right']", "[class*='arrow_right']",
     ]
+    collected: List[Dict[str, Any]] = []
+    seen_srcs: set = set()
+
     for sel in next_selectors:
         try:
             btn = page.locator(sel).first
@@ -152,9 +163,17 @@ async def _advance_carousels(page: Page, max_clicks: int = 5) -> None:
             for _ in range(max_clicks):
                 await btn.click(timeout=1000)
                 await asyncio.sleep(0.6)
+                if extract_per_step:
+                    step_images = await _extract_images_from_page(page)
+                    for img in step_images:
+                        if img["src"] not in seen_srcs:
+                            seen_srcs.add(img["src"])
+                            collected.append(img)
             break
         except Exception:
             continue
+
+    return collected
 
 
 async def _upload_screenshot(
@@ -450,17 +469,21 @@ async def _extract_from_viewport(
         except Exception:
             pass
 
-        # Click through carousel/slider controls to reveal hidden slides
-        await _advance_carousels(page)
+        # Extract images before carousel advancement (captures initial slide)
+        images = await _extract_images_from_page(page)
+        pre_carousel_srcs = {img["src"] for img in images}
+
+        # Click through carousel/slider controls, extracting after each step
+        carousel_images = await _advance_carousels(page)
+        for img in carousel_images:
+            if img["src"] not in pre_carousel_srcs:
+                images.append(img)
 
         page_height = await page.evaluate("document.body.scrollHeight")
 
         # Take full-page screenshot (used for evidence AND localization)
         screenshot_bytes = await page.screenshot(full_page=True, type="png")
         evidence_url = await _upload_screenshot(screenshot_bytes, scan_job_id, f"{url}#_{viewport_label}")
-
-        # Extract individual <img> elements
-        images = await _extract_images_from_page(page)
 
         # OpenCV localization: find and crop composed creatives
         if campaign_assets:

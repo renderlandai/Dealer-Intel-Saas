@@ -1,4 +1,4 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient, keepPreviousData } from "@tanstack/react-query";
 import {
   getDashboardStats,
   getRecentMatches,
@@ -119,6 +119,7 @@ export function useAlerts(unreadOnly = false) {
   return useQuery({
     queryKey: ["alerts", { unreadOnly }] as const,
     queryFn: () => getAlerts(unreadOnly),
+    placeholderData: keepPreviousData,
   });
 }
 
@@ -278,6 +279,7 @@ export function useMatches(filters?: MatchFilters) {
   return useQuery({
     queryKey: queryKeys.matches.all(filters),
     queryFn: () => getMatches(filters),
+    placeholderData: keepPreviousData,
   });
 }
 

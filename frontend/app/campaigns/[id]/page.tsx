@@ -120,10 +120,10 @@ interface ScanStats {
 }
 
 const SCAN_SOURCES = [
-  { value: "google_ads", label: "Google Ads", icon: "🔍", desc: "Paid display ads" },
-  { value: "facebook", label: "Facebook Ads", icon: "📘", desc: "Meta Ad Library" },
-  { value: "instagram", label: "Instagram", icon: "📷", desc: "Organic posts" },
-  { value: "website", label: "Websites", icon: "🌐", desc: "Dealer sites" },
+  { value: "google_ads", label: "Google Ads", logo: "/logos/google.svg", desc: "Paid display ads" },
+  { value: "facebook", label: "Facebook Ads", logo: "/logos/meta.png", desc: "Meta Ad Library" },
+  { value: "instagram", label: "Instagram", logo: "/logos/instagram.svg", desc: "Organic posts" },
+  { value: "website", label: "Websites", logo: "/logos/www.svg?v=2", desc: "Dealer sites" },
 ];
 
 export default function CampaignDetailPage() {
@@ -704,7 +704,7 @@ export default function CampaignDetailPage() {
                         onClick={() => handleStartScan(source.value)}
                         disabled={scanning}
                       >
-                        <span className="text-2xl">{source.icon}</span>
+                        <img src={source.logo} alt={source.label} className="h-8 w-8 object-contain" />
                         <span className="font-medium">{source.label}</span>
                         <span className="text-2xs text-muted-foreground">{source.desc}</span>
                         {scanning && selectedSource === source.value && (

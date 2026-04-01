@@ -332,11 +332,30 @@ export const api = axios.create({
   timeout: 15000,
 });
 
-// Attach Supabase JWT to every request
+// Cache the Supabase session to avoid redundant getSession() calls on parallel requests
+let _sessionPromise: Promise<string | null> | null = null;
+const SESSION_TTL = 30_000;
+let _sessionCachedAt = 0;
+
+async function getAccessToken(): Promise<string | null> {
+  const now = Date.now();
+  if (!_sessionPromise || now - _sessionCachedAt > SESSION_TTL) {
+    _sessionCachedAt = now;
+    _sessionPromise = supabase.auth
+      .getSession()
+      .then(({ data: { session } }) => session?.access_token ?? null)
+      .catch(() => {
+        _sessionPromise = null;
+        return null;
+      });
+  }
+  return _sessionPromise;
+}
+
 api.interceptors.request.use(async (config) => {
-  const { data: { session } } = await supabase.auth.getSession();
-  if (session?.access_token) {
-    config.headers.Authorization = `Bearer ${session.access_token}`;
+  const token = await getAccessToken();
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
   }
   return config;
 });

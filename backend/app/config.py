@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     weak_match_threshold: int = Field(default=50, description="Score for weak match classification")
     
     # Minimum thresholds to create a match — reject ambiguous scores
-    regular_image_match_threshold: int = Field(default=70, description="Min score for regular images")
+    regular_image_match_threshold: int = Field(default=60, description="Min score for regular images")
     screenshot_match_threshold: int = Field(default=65, description="Min score for screenshots")
     
     # Filtering thresholds
@@ -114,7 +114,7 @@ class Settings(BaseSettings):
     # ===========================================
     
     # Stage 1: Perceptual hash gate — skip images with no hash resemblance to any asset
-    hash_prefilter_max_diff: int = Field(default=20, description="Max avg hash diff to pass pre-filter (0-64 scale)")
+    hash_prefilter_max_diff: int = Field(default=28, description="Max avg hash diff to pass pre-filter (0-64 scale)")
     
     # Stage 2: CLIP embedding gate — skip images with no semantic similarity to any asset
     clip_similarity_threshold: float = Field(default=0.40, description="Min CLIP cosine similarity to proceed to Claude")

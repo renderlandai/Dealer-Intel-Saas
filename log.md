@@ -862,7 +862,7 @@ All external services and significant libraries used across the application.
 - [x] Add email/Slack notifications for violations
 
 ### Priority 3 — Performance & Polish
-- [ ] Re-enable match deduplication (disabled for testing)
+- [x] Re-enable match deduplication (disabled for testing)
 - [x] ~~Batch scanning mode for large distributor networks (40+ distributors)~~
 
 ### Completed (Previous Sessions)
@@ -927,7 +927,7 @@ Items 1–4 block revenue. Items 5–9 block a good first-customer experience. I
 - [x] **2. Plan enforcement middleware** — `plan_limits` config mapping tier → caps, enforced at every create endpoint
 - [x] **3. Monthly scan quota + concurrent scan limiter** — Per-org per-period scan counting + concurrent scan gating
 - [x] **4. Landing page + pricing page** — Public-facing marketing pages with "Book a Demo" CTAs
-- [ ] **5. Re-enable match deduplication** — Already built, disabled for testing *(deferred to pre-launch testing)*
+- [x] **5. Re-enable match deduplication** — Fixed backend pruning (broken PostgREST query) and added DB-level deduplication in `recent_matches` view
 - [x] **6. Scan usage UI** — Trial banner, usage meters, billing settings, upgrade modals
 - [x] **7. Onboarding flow** — Dashboard checklist for first-time setup
 - [x] **8. Error handling + user-facing scan status** — Error messages with contextual suggestions + retry mechanism
@@ -1525,3 +1525,95 @@ Multiple deployment failures on DigitalOcean App Platform. The container was ter
 
 - **`.do/app.yaml`** — Upgraded `instance_size_slug` from `professional-xs` (1 GB) to `professional-s` (2 GB), giving sufficient headroom for the full runtime stack.
 - **`backend/requirements.txt`** — Added `gunicorn==23.0.0` as an explicit dependency.
+
+---
+
+## 2026-03-30 — Re-enable Match Deduplication
+
+### Summary
+Match deduplication was disabled during early testing and never re-enabled. The backend pruning function was also silently broken due to a PostgREST foreign-table filter bug (same pattern as the email notification fix). Both layers are now fixed and active.
+
+### Root Cause
+1. **Backend `_prune_duplicate_matches`** — Used `discovered_images.scan_job_id` as a foreign-table filter on the `matches` table, which PostgREST doesn't support (PGRST108). The query silently returned no results, so no duplicates were ever pruned.
+2. **Database `recent_matches` view** — Was a simple join with no deduplication, showing every match row regardless of whether a higher-confidence match existed for the same asset+distributor.
+
+### Changes
+
+- **`backend/app/routers/scanning.py`** — Replaced the broken foreign-table filter in `_prune_duplicate_matches` with a two-step lookup: first fetch `discovered_image.id`s by `scan_job_id`, then query matches by those IDs using `.in_()`.
+- **`supabase/migrations/019_reenable_dedup_view.sql`** — New migration that replaces the `recent_matches` view with a CTE using `ROW_NUMBER() OVER (PARTITION BY asset_id, distributor_id ORDER BY confidence_score DESC, last_seen_at DESC)` to return only the best match per asset+distributor pair.
+- **`supabase/schema.sql`** — Updated to reflect the deduplicated view definition.
+
+---
+
+## 2026-03-31 — Frontend Performance, Scan Pipeline Accuracy & Compliance Hardening
+
+### Summary
+Addressed slow page transitions in the frontend by adding query caching, prefetching, and session deduplication. Fixed multiple scan pipeline issues that caused missed creatives: carousel images not being captured, hash pre-filter too aggressive, Haiku relevance filter only comparing against the first asset, and the Opus comparison prompt conflating "same promotion" with "same visual creative." Also hardened the compliance prompt to explicitly treat color alterations as violations.
+
+### Frontend — Data Loading Performance
+
+**Problem:** Navigating between pages showed loading spinners because every page fetched data fresh on mount, and the Supabase auth session was looked up redundantly on every API request.
+
+**Changes:**
+
+- **`frontend/lib/api.ts`** — Added an auth session cache with 30s TTL so parallel API requests share a single `getSession()` call instead of each making their own.
+- **`frontend/lib/query-provider.tsx`** — Increased React Query `staleTime` from 30s to 3 minutes and `gcTime` from 5 to 10 minutes. Pages visited within 3 minutes now load instantly from cache.
+- **`frontend/app/page.tsx`** — Added `prefetchQuery` calls on the dashboard for matches, match stats, scans, and alerts. These fire in the background so data is cached before the user navigates.
+- **`frontend/lib/hooks.ts`** — Added `keepPreviousData` as `placeholderData` on `useMatches` and `useAlerts` so filtering doesn't flash a loading state.
+
+### Frontend — Dashboard Stat Card Alignment
+
+**Problem:** The four top-level stat cards used two different layouts — Compliance Rate and Violations had icon-left with centered alignment, while Active Campaigns and Distributors used the `StatCard` component with icon-right and top alignment.
+
+**Changes:**
+
+- **`frontend/app/page.tsx`** — Refactored the inline Compliance Rate and Violations cards to match the `StatCard` layout: icon top-right (`h-10 w-10`), text top-left with `mb-3` spacing, `flex items-start justify-between`.
+
+### Backend — Carousel Image Extraction
+
+**Problem:** Website scans missed creatives inside carousels. `_advance_carousels` clicked through slides but images were only extracted once at the end — whatever slide happened to be showing. Images on earlier slides were lost because carousels replace visible content rather than appending to the DOM.
+
+**Changes:**
+
+- **`backend/app/services/extraction_service.py`** — Rewrote `_advance_carousels` to extract images after each click and return them as a deduplicated list. Updated `_extract_from_viewport` to extract images before carousel advancement (captures initial slide), then merge in carousel-collected images before proceeding.
+
+### Backend — Hash Pre-filter Threshold
+
+**Problem:** The perceptual hash pre-filter (`hash_prefilter_max_diff = 20`) was too aggressive, rejecting 269/276 images including legitimate matches. Screenshot-based assets have enough compression and resolution differences to push hash distances above 20.
+
+**Changes:**
+
+- **`backend/app/config.py`** — Raised `hash_prefilter_max_diff` from 20 to 28. This lets more candidates through to the CLIP and Claude stages while still filtering the vast majority of irrelevant images.
+
+### Backend — Haiku Filter Multi-Asset Comparison
+
+**Problem:** The Haiku relevance filter only sent the **first** campaign asset (`asset_urls[0]`) for comparison. Images matching asset #2 or #3 were rejected because Haiku only saw asset #1.
+
+**Changes:**
+
+- **`backend/app/services/ai_service.py`** — Updated `filter_image` to download and send **all** campaign assets to the Haiku model. Updated `get_filter_prompt` to accept an `asset_count` parameter and dynamically describe each asset image in the prompt.
+
+### Backend — Comparison Prompt: Visual Creative vs Promotion
+
+**Problem:** The Opus comparison prompt asked whether images showed the "same campaign/promotion." This caused false positives: a dealer-created banner advertising the same offer (same promo code PCC10, same 10% discount) scored 85% even though it had a completely different visual design, layout, and imagery.
+
+**Changes:**
+
+- **`backend/app/services/ai_service.py`** — Rewrote `get_comparison_prompt` to check for the same **visual creative/artwork** rather than the same promotion. Added explicit guidance: "Two images can advertise the SAME offer but be COMPLETELY DIFFERENT CREATIVES — that is NOT a match." Same promotion with different visual design now scores 0-20.
+- Also updated `get_detection_prompt` with the same visual-creative distinction for screenshot-based detection.
+
+### Backend — Match Threshold
+
+**Problem:** After tightening the comparison prompt, legitimate matches (especially screenshot-based assets) scored slightly lower, causing them to fall below the `regular_image_match_threshold` of 70. The "Below Threshold: 1" in the pipeline funnel confirmed one creative was being dropped at this stage.
+
+**Changes:**
+
+- **`backend/app/config.py`** — Lowered `regular_image_match_threshold` from 70 to 60. Safe because four upstream filters (hash, CLIP, Haiku, and the stricter Opus prompt) already eliminate false positives before the threshold check.
+
+### Backend — Compliance: Color Changes as Violations
+
+**Problem:** The compliance prompt detected color changes but treated them as minor/cosmetic modifications that passed compliance. A black-and-white approved creative displayed in yellow/gold was marked "COMPLIANT — All Checks Passed" despite the obvious color alteration.
+
+**Changes:**
+
+- **`backend/app/services/ai_service.py`** — Updated `get_compliance_prompt` to explicitly state that ANY color change (colorized, desaturated, tinted, scheme changed) is a compliance violation. Added color changes to the `is_compliant: false` conditions list. Added rule: "Color changes are ALWAYS a violation."

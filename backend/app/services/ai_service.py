@@ -428,21 +428,29 @@ def extract_json_from_response(response_text: str) -> dict:
         raise ValueError(f"Could not extract JSON from response: {text[:200]}...")
 
 
-def get_filter_prompt(asset_aware: bool = False) -> str:
-    """Get filtering prompt. When asset_aware=True, expects two images (asset + candidate)."""
+def get_filter_prompt(asset_aware: bool = False, asset_count: int = 1) -> str:
+    """Get filtering prompt. When asset_aware=True, expects asset image(s) + candidate."""
     if asset_aware:
-        return """You are a QUICK CAMPAIGN MATCHER for a dealer/distributor marketing monitoring system.
+        if asset_count == 1:
+            asset_desc = "IMAGE 1 (FIRST IMAGE): The APPROVED CAMPAIGN CREATIVE — the reference marketing asset."
+            candidate_desc = "IMAGE 2 (SECOND IMAGE): An image discovered on a dealer's website."
+        else:
+            asset_lines = [f"IMAGE {i+1}: Approved campaign creative #{i+1}." for i in range(asset_count)]
+            asset_desc = "\n".join(asset_lines)
+            candidate_desc = f"IMAGE {asset_count+1} (LAST IMAGE): An image discovered on a dealer's website."
 
-IMAGE 1 (FIRST IMAGE): The APPROVED CAMPAIGN CREATIVE — the reference marketing asset.
-IMAGE 2 (SECOND IMAGE): An image discovered on a dealer's website.
+        return f"""You are a QUICK CAMPAIGN MATCHER for a dealer/distributor marketing monitoring system.
 
-YOUR TASK: Quickly determine if Image 2 COULD BE the same campaign as Image 1.
+{asset_desc}
+{candidate_desc}
+
+YOUR TASK: Quickly determine if the discovered image COULD BE the same as ANY of the campaign creatives.
 This is a fast pre-screen, not a final verdict. When in doubt, say yes.
 
 LIKELY SAME CAMPAIGN (is_relevant: true, confidence > 0.8):
-- Same product/equipment prominently featured
+- Same product/equipment prominently featured as any creative
 - Same promotional offer, headline, or pricing visible
-- Same visual design, layout, or color scheme as the creative
+- Same visual design, layout, or color scheme as any creative
 - Same brand + same campaign message
 
 POSSIBLY RELATED (is_relevant: true, confidence 0.5-0.8):
@@ -450,8 +458,8 @@ POSSIBLY RELATED (is_relevant: true, confidence 0.5-0.8):
 - Similar product category with overlapping visual elements
 
 CLEARLY DIFFERENT (is_relevant: false):
-- Different brand entirely
-- Different product category (e.g. creative shows excavators, image shows trucks)
+- Different brand entirely from all creatives
+- Different product category from all creatives
 - UI elements, navigation icons, logos only, maps, avatars
 - Generic stock photos with no campaign resemblance
 - A completely different promotional campaign for the same brand
@@ -496,95 +504,103 @@ Return your analysis as JSON with these fields:
 
 def get_comparison_prompt() -> str:
     """Get prompt for campaign-aware visual comparison."""
-    return """You are a CAMPAIGN COMPLIANCE AUDITOR for a dealer/distributor marketing monitoring platform.
+    return """You are a CAMPAIGN CREATIVE AUDITOR for a dealer/distributor marketing monitoring platform.
 
-IMAGE 1 (FIRST IMAGE): The APPROVED campaign creative — the official marketing asset.
+IMAGE 1 (FIRST IMAGE): The APPROVED campaign creative — the specific visual asset provided to dealers.
 IMAGE 2 (SECOND IMAGE): An image discovered on a dealer's website or ad platform.
 
-YOUR TASK: Determine if Image 2 is running the SAME marketing campaign as Image 1.
+YOUR TASK: Determine if Image 2 is the SAME VISUAL CREATIVE as Image 1.
 
-WHAT "SAME CAMPAIGN" MEANS:
-A match means the dealer is displaying this specific campaign — the same promotional message,
-the same visual design, the same offer. The image does NOT need to be a pixel-perfect copy.
-Websites render creatives through HTML/CSS, so the same campaign will often appear with slight
-differences in font rendering, spacing, resolution, or aspect ratio. These rendering differences
-do NOT disqualify a match.
+CRITICAL DISTINCTION — SAME CREATIVE vs SAME PROMOTION:
+You are checking whether the dealer used this SPECIFIC VISUAL ASSET, not whether they are
+running the same promotion. Two images can advertise the SAME offer (same discount, same
+promo code, same product) but be COMPLETELY DIFFERENT CREATIVES with different layouts,
+photos, typography, and visual design. That is NOT a match.
+
+A MATCH requires the discovered image to be visually derived from the approved creative —
+the same layout, the same imagery/photos, the same design composition. It must be
+recognizably the SAME VISUAL ARTWORK, not merely the same marketing message.
+
+SAME CREATIVE (is a match):
+- Same visual layout and composition
+- Same product photo/render in the same arrangement
+- Same background, graphic elements, and design structure
+- Acceptable differences: resolution, slight cropping, font rendering, aspect ratio,
+  dealer name/logo inserted into template placeholders
+
+NOT THE SAME CREATIVE (NOT a match, even if same promotion):
+- Different layout or composition (e.g. horizontal vs vertical, different arrangement)
+- Different product photo or imagery (even if same product category)
+- Different background, color scheme, or graphic design
+- Dealer-created banner that advertises the same offer but with their own design
+- Same promo code, same discount percentage, but different visual artwork
 
 TEMPLATE CREATIVES — EXPECTED DEALER CUSTOMIZATION:
-The approved asset is often a TEMPLATE that contains placeholder fields dealers are expected
-to fill in with their own information. The following substitutions are NORMAL, EXPECTED, and
-should NOT be treated as unauthorized modifications:
-- "Dealer Name", "Your Dealer", "Dealer Logo" or similar placeholders replaced with the
-  dealer's actual name, branding, or logo
-- Placeholder phone numbers, addresses, or URLs replaced with dealer-specific contact info
+The approved asset may be a TEMPLATE with placeholder fields. The following substitutions
+are normal and should NOT reduce the score:
+- "Dealer Name" / "Your Dealer" replaced with actual dealer name/branding/logo
+- Placeholder phone numbers, addresses, or URLs replaced with dealer-specific info
 - Generic CTA buttons customized with dealer-specific destinations
-These template customizations mean the dealer is CORRECTLY using the creative as intended.
-They should NOT lower the similarity score or be flagged as modifications.
-
-EVALUATION FRAMEWORK — analyze in order:
-1. PRODUCT IDENTITY: Is the same specific product featured? (same model, same photo/render)
-2. CAMPAIGN MESSAGE: Is the same promotional offer/headline/CTA present?
-3. VISUAL DESIGN: Does the layout, color scheme, and composition match the campaign?
-4. BRAND ELEMENTS: Are the same logos, brand colors, and trade dress present?
 
 SCORING RUBRIC:
-- 90-100: Same campaign — identical or near-identical rendering of the creative
+- 90-100: Same creative — identical or near-identical rendering of the visual asset
           (includes template creatives with expected dealer-name customization)
-- 75-89:  Same campaign — clearly the same creative with minor rendering differences
+- 75-89:  Same creative — clearly the same artwork with minor rendering differences
           (different resolution, slight cropping, font rendering differences)
-- 65-74:  Same campaign — recognizably the same creative but with modifications
+- 65-74:  Same creative — recognizably the same artwork but with modifications
           (text overlays, watermarks, resizing, color shifts)
-- 40-64:  Ambiguous — shares significant elements but may be a different campaign version.
-          DO NOT mark as a match unless you are confident it is the same campaign.
-- 0-39:   Different campaign — different product, different offer, or different design
+- 40-64:  Ambiguous — shares significant visual elements but may be a different creative.
+          DO NOT mark as a match unless you are confident it is the same artwork.
+- 0-39:   Different creative — different visual design, layout, or imagery
 
-BE STRICT: If the images share the same brand but show a DIFFERENT promotional campaign,
-DIFFERENT product model, or DIFFERENT offer, score 0-39. Same brand does NOT mean same campaign.
+AUTOMATIC SCORE 0-20:
+- Different brand entirely
+- Same promotion/offer but DIFFERENT visual design (dealer made their own banner)
+- Same product but different photo, layout, or graphic design
+- Different product or offer entirely
 
-AUTOMATIC SCORE 0 (different campaign entirely):
-- Different brand (e.g. iPhone creative vs Samsung creative)
-- Different product model (e.g. Galaxy S25 vs Galaxy S26)
-- Same product but completely different creative design/photo
-- Competitor's campaign material
-- Same brand but a DIFFERENT promotion or marketing campaign
-
-Modifications to identify:
+Modifications to identify (only when it IS the same creative):
 - cropping, resizing, color_changes, text_added, text_removed, overlay_added, quality_degraded, watermark_added
 - Do NOT list dealer-name placeholder substitution as a modification
 
 Return JSON with:
 - similarity_score: 0-100
-- is_match: true ONLY if similarity_score >= 70 (you are confident this is the same campaign)
+- is_match: true ONLY if similarity_score >= 70 (you are confident this is the same visual creative)
 - match_type: "exact"/"strong"/"partial"/"weak"/"none"
 - modifications: array of detected modifications (exclude expected template customizations)
 - modification_severity: "none"/"minor"/"moderate"/"major"
-- analysis: explain what campaign elements match and what differs"""
+- analysis: explain what visual elements match and what differs"""
 
 
 def get_detection_prompt() -> str:
     """Get prompt for detecting a campaign creative within a screenshot or page section."""
-    return """You are a CAMPAIGN COMPLIANCE AUDITOR scanning a webpage for a specific marketing campaign.
+    return """You are a CAMPAIGN CREATIVE AUDITOR scanning a webpage for a specific visual asset.
 
-IMAGE 1 (FIRST IMAGE): The APPROVED CAMPAIGN CREATIVE — the official marketing asset we are looking for.
+IMAGE 1 (FIRST IMAGE): The APPROVED CAMPAIGN CREATIVE — the specific visual asset we are looking for.
 IMAGE 2 (SECOND IMAGE): A screenshot from a dealer's website (may be a full page, a page section, or an extracted element).
 
-YOUR TASK: Determine if Image 2 contains the SAME marketing campaign shown in Image 1.
+YOUR TASK: Determine if Image 2 contains the SAME VISUAL CREATIVE shown in Image 1.
 
-WHAT "SAME CAMPAIGN" MEANS:
-The dealer's website may render the same campaign creative through HTML/CSS rather than embedding
-the original image file. This means the same campaign can appear with different font rendering,
-slightly different spacing, different resolution, or different aspect ratio. These rendering
-differences are EXPECTED and do NOT disqualify a match.
+CRITICAL DISTINCTION — SAME CREATIVE vs SAME PROMOTION:
+You are looking for this SPECIFIC VISUAL ASSET on the page, not just the same promotion.
+Two banners can advertise the SAME offer (same discount, same promo code) but use completely
+different visual designs, photos, and layouts. That is NOT a match. The page must contain
+the actual approved creative artwork — the same layout, same imagery, same visual composition.
 
 A match requires:
-- The same product being promoted (same model, same visual)
-- The same campaign message or offer
-- Recognizably the same visual design/layout
+- The same visual layout and composition as the approved creative
+- The same product photo/render in the same arrangement
+- Recognizably the same visual artwork/design
 
 A match does NOT require:
 - Pixel-identical rendering
 - Exact same resolution or dimensions
 - Identical font rendering or text spacing
+
+NOT a match (even if same promotion):
+- A dealer-created banner advertising the same offer with different visual design
+- Same promo code or discount but different layout, photos, or artwork
+- Same brand/product but different creative composition
 
 TEMPLATE CREATIVES:
 The approved asset may be a template with placeholders like "Dealer Name" that dealers
@@ -600,19 +616,16 @@ SCAN ALL AREAS of Image 2:
 - Floating or overlay promotions
 
 CONFIDENCE SCORING:
-- 85-100: Same campaign clearly visible — same product, same design, same message
-- 70-84:  Same campaign very likely — recognizable design with rendering differences
-- 55-69:  Probable match — significant shared elements but notable differences
-- 0-39:   Not a match — different product, different campaign, or different brand
-
-BE STRICT: If the webpage shows the same BRAND but a DIFFERENT promotional campaign,
-different product model, or different offer, that is NOT a match. Score 0-39.
+- 85-100: Same creative clearly visible — same artwork, same design, same visual composition
+- 70-84:  Same creative very likely — recognizable artwork with rendering differences
+- 55-69:  Probable match — significant shared visual elements but notable differences
+- 0-39:   Not a match — different visual design, different creative, or not found
 
 AUTOMATIC asset_found: false:
-- Different brand entirely (e.g. searching for Samsung, found Apple)
-- Different product model (e.g. searching for Galaxy S26, found Galaxy S25)
-- Same product but a completely different campaign design
-- Same brand but a DIFFERENT promotion or marketing campaign
+- Different brand entirely
+- Same promotion/offer but DIFFERENT visual design (dealer made their own banner)
+- Same product but different photo, layout, or graphic design
+- Different product or offer entirely
 - No promotional content visible in the screenshot
 
 Return JSON with:
@@ -621,7 +634,7 @@ Return JSON with:
 - location: where found (header/sidebar/main_content/footer/banner/hero/carousel/popup/unknown)
 - appearance: how it appears (exact/resized/cropped/modified/none)
 - modifications: array of modifications detected
-- reasoning: explain which campaign elements match — product, message, design, brand elements"""
+- reasoning: explain which VISUAL DESIGN elements match — layout, imagery, composition"""
 
 
 def get_compliance_prompt(rules_text: str, zombie_check: str) -> str:
@@ -670,7 +683,8 @@ These are NOT violations. Do NOT list them as modifications or compliance issues
    - Has the creative been cropped so that key content is missing?
    - Has it been stretched, distorted, or significantly resized?
    - Have elements been overlaid ON TOP of the creative?
-   - Are the creative's colors significantly altered?
+   - Have the creative's colors been altered? (e.g. colorized, desaturated, tinted,
+     color scheme changed, converted to/from grayscale). ANY color change is a VIOLATION.
 
 2. UNAUTHORIZED MODIFICATIONS (not template customization, not surrounding page elements):
    - Has the core campaign imagery been changed or replaced?
@@ -682,15 +696,23 @@ These are NOT violations. Do NOT list them as modifications or compliance issues
 3. BRAND COMPLIANCE:
    - Are all required brand elements from the original creative still visible?
    - Have forbidden elements been added ON the creative itself?
+   - Do the colors match the approved creative exactly?
 
 COMPLIANCE RULES:
-- is_compliant: true if the creative is visible AND its core content has not been materially modified
-  (template placeholder substitution with dealer info is NOT a material modification)
-- is_compliant: false if the creative's core imagery, brand elements, or offer terms have been
-  altered, or the creative is not present
+- is_compliant: true if the creative is visible AND its visual presentation has not been modified
+  (template placeholder substitution with dealer info is NOT a modification)
+- is_compliant: false if ANY of the following are true:
+  * The creative's colors have been changed (colorized, tinted, desaturated, or otherwise altered)
+  * The core campaign imagery has been changed or replaced
+  * Brand elements have been removed or obscured
+  * The promotional offer, pricing, or terms have been altered
+  * The creative is not present
+- Color changes are ALWAYS a violation — the dealer must use the creative with the exact
+  color scheme provided in the approved asset
 - Surrounding webpage UI (dealer nav, headers, site logos) is NOT a violation
 - Dealer-name/logo placeholder substitution is NOT a violation — it is expected template usage
-- When the creative is clearly present with only expected template customizations, it IS compliant
+- When the creative is clearly present with only expected template customizations AND no
+  color changes, it IS compliant
 
 Return JSON with:
 - is_compliant: true if the creative is present and unmodified
@@ -862,19 +884,28 @@ async def filter_image(
     Use Claude Haiku to quickly filter irrelevant images.
 
     When *asset_urls* are provided the filter becomes **asset-aware**: it
-    sends the first campaign asset alongside the discovered image and asks
-    "could this be the same campaign?" instead of "is this a marketing
-    image?".  This dramatically reduces false positives on multi-page scans.
+    sends all campaign assets alongside the discovered image and asks
+    "could this be the same as ANY of these campaigns?".  This ensures
+    images matching any asset pass through, not just the first one.
     """
     try:
         image_bytes = await download_image(image_url)
         image_bytes = optimize_image_for_api(image_bytes, "default")
 
         if asset_urls:
-            asset_bytes = await download_image(asset_urls[0])
-            asset_bytes = optimize_image_for_api(asset_bytes, "asset")
-            prompt = get_filter_prompt(asset_aware=True)
-            images = [asset_bytes, image_bytes]
+            asset_images = []
+            for url in asset_urls:
+                try:
+                    ab = await download_image(url)
+                    asset_images.append(optimize_image_for_api(ab, "asset"))
+                except Exception as e:
+                    log.warning("Could not download asset for filter: %s", e)
+            if asset_images:
+                prompt = get_filter_prompt(asset_aware=True, asset_count=len(asset_images))
+                images = asset_images + [image_bytes]
+            else:
+                prompt = get_filter_prompt(asset_aware=False)
+                images = [image_bytes]
         else:
             prompt = get_filter_prompt(asset_aware=False)
             images = [image_bytes]
