@@ -12,12 +12,12 @@ import {
   Settings,
   Bell,
   CreditCard,
-  Zap,
   ChevronLeft,
   ChevronRight,
   LogOut,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { BrandWordmark, BrandMark } from "@/components/ui/brand-wordmark";
 import { useSidebar } from "./sidebar-context";
 import { useAuth } from "@/lib/auth-context";
 import { useUnreadAlertCount } from "@/lib/hooks";
@@ -55,18 +55,12 @@ export function Sidebar() {
         {/* Logo */}
         <div className={cn(
           "flex h-18 items-center border-b border-border transition-all duration-300",
-          isCollapsed ? "justify-center px-2" : "gap-3 px-6"
+          isCollapsed ? "justify-center px-2" : "px-6"
         )}>
-          <div className="flex h-10 w-10 items-center justify-center bg-primary flex-shrink-0">
-            <Zap className="h-5 w-5 text-primary-foreground" />
-          </div>
-          {!isCollapsed && (
-            <div className="overflow-hidden">
-              <h1 className="text-base font-semibold tracking-tight whitespace-nowrap">DEALER INTEL</h1>
-              <p className="text-2xs uppercase tracking-widest text-muted-foreground whitespace-nowrap">
-                Asset Intelligence
-              </p>
-            </div>
+          {isCollapsed ? (
+            <BrandMark className="text-2xl" />
+          ) : (
+            <BrandWordmark className="text-base whitespace-nowrap" showSubtitle />
           )}
         </div>
 
@@ -141,7 +135,7 @@ export function Sidebar() {
                     "opacity-0 animate-fade-up",
                     isCollapsed ? "justify-center px-2 relative" : "px-3",
                     isActive
-                      ? "bg-secondary text-foreground border-l-2 border-primary -ml-px"
+                      ? "bg-secondary text-foreground border-l-2 border-info -ml-px"
                       : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
                   )}
                   style={{ animationDelay: `${(navigation.length + index) * 50}ms`, animationFillMode: 'forwards' }}

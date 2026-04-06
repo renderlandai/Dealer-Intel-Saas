@@ -2,7 +2,9 @@
 
 import { useState } from "react";
 import { useParams, useRouter } from "next/navigation";
-import { Zap, CheckCircle, XCircle, Loader2, Users } from "lucide-react";
+import Link from "next/link";
+import { CheckCircle, XCircle, Loader2, Users, LogIn } from "lucide-react";
+import { BrandWordmark } from "@/components/ui/brand-wordmark";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { acceptInvite } from "@/lib/api";
@@ -13,7 +15,7 @@ type Status = "idle" | "accepting" | "accepted" | "error";
 export default function AcceptInvitePage() {
   const params = useParams();
   const router = useRouter();
-  const { user } = useAuth();
+  const { user, loading } = useAuth();
   const token = params.token as string;
 
   const [status, setStatus] = useState<Status>("idle");
@@ -43,25 +45,50 @@ export default function AcceptInvitePage() {
     }
   };
 
+  const isAuthenticated = !loading && !!user;
+
   return (
     <div className="min-h-screen flex items-center justify-center p-4 bg-background">
       <Card className="w-full max-w-md">
         <CardContent className="pt-8 pb-8 px-8">
           <div className="flex flex-col items-center text-center space-y-6">
-            {/* Logo */}
-            <div className="flex h-12 w-12 items-center justify-center bg-primary">
-              <Zap className="h-6 w-6 text-primary-foreground" />
-            </div>
+            <BrandWordmark className="text-xl" />
 
-            {status === "accepted" ? (
+            {loading ? (
+              <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+            ) : !isAuthenticated ? (
+              <>
+                <div className="flex h-16 w-16 items-center justify-center bg-primary/10 border border-primary/20 rounded-full">
+                  <LogIn className="h-8 w-8 text-primary" />
+                </div>
+                <div>
+                  <h1 className="text-xl font-semibold">Sign In Required</h1>
+                  <p className="text-sm text-muted-foreground mt-2">
+                    You need to sign in or create an account before you can accept this team invitation.
+                  </p>
+                </div>
+                <div className="flex gap-3 w-full">
+                  <Button asChild variant="outline" className="flex-1">
+                    <Link href={`/login?redirect=/invite/${token}`}>
+                      Sign In
+                    </Link>
+                  </Button>
+                  <Button asChild className="flex-1">
+                    <Link href={`/login?redirect=/invite/${token}&tab=signup`}>
+                      Create Account
+                    </Link>
+                  </Button>
+                </div>
+              </>
+            ) : status === "accepted" ? (
               <>
                 <div className="flex h-16 w-16 items-center justify-center bg-success/10 border border-success/20 rounded-full">
                   <CheckCircle className="h-8 w-8 text-success" />
                 </div>
                 <div>
-                  <h1 className="text-xl font-semibold">You're In</h1>
+                  <h1 className="text-xl font-semibold">You&apos;re In</h1>
                   <p className="text-sm text-muted-foreground mt-2">
-                    You've joined the organization. Redirecting to your dashboard...
+                    You&apos;ve joined the organization. Redirecting to your dashboard...
                   </p>
                 </div>
               </>
@@ -97,7 +124,7 @@ export default function AcceptInvitePage() {
                 <div>
                   <h1 className="text-xl font-semibold">Team Invitation</h1>
                   <p className="text-sm text-muted-foreground mt-2">
-                    You've been invited to join an organization on Dealer Intel.
+                    You&apos;ve been invited to join an organization on Dealer Intel.
                     {user?.email && (
                       <span className="block mt-1 font-mono text-xs">
                         Signed in as {user.email}

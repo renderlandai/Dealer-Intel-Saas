@@ -12,6 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from ..database import supabase
+from ..config import get_plan_limits
 
 log = logging.getLogger("dealer_intel.scheduler")
 
@@ -108,6 +109,56 @@ async def _trigger_scan(schedule_id: str) -> None:
         org_id = sched["organization_id"]
         campaign_id = sched["campaign_id"]
         source = sched["source"]
+
+        # ── Plan enforcement ────────────────────────────────────────
+        org_row = (
+            supabase.table("organizations")
+            .select("plan, plan_status, trial_expires_at")
+            .eq("id", org_id)
+            .single()
+            .execute()
+        )
+        org_data = org_row.data or {}
+        plan = org_data.get("plan", "free")
+        plan_status = org_data.get("plan_status", "active")
+        limits = get_plan_limits(plan)
+
+        trial_expired = False
+        if plan == "free":
+            trial_ts = org_data.get("trial_expires_at")
+            if trial_ts:
+                try:
+                    from datetime import datetime as _dt
+                    exp = _dt.fromisoformat(str(trial_ts).replace("Z", "+00:00"))
+                    trial_expired = exp < datetime.now(timezone.utc)
+                except Exception:
+                    pass
+
+        if trial_expired:
+            log.info("Trial expired for org %s — skipping schedule %s", org_id, schedule_id)
+            _update_schedule_timestamps(sched)
+            return
+
+        allowed_channels = limits.get("allowed_channels", [])
+        if source not in allowed_channels:
+            log.info("Channel '%s' not allowed on %s plan for org %s — skipping schedule %s",
+                      source, plan, org_id, schedule_id)
+            _update_schedule_timestamps(sched)
+            return
+
+        max_scans = limits.get("max_scans_per_month")
+        if max_scans is not None:
+            month_start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+            scan_count = supabase.table("scan_jobs") \
+                .select("id", count="exact") \
+                .eq("organization_id", org_id) \
+                .gte("created_at", month_start).execute()
+            if (scan_count.count or 0) >= max_scans:
+                log.info("Monthly scan quota (%d) reached for org %s — skipping schedule %s",
+                          max_scans, org_id, schedule_id)
+                _update_schedule_timestamps(sched)
+                return
+        # ── End plan enforcement ────────────────────────────────────
 
         campaign = (
             supabase.table("campaigns")
@@ -316,12 +367,12 @@ async def _cleanup_stale_scans() -> None:
             .lt("created_at", pending_cutoff) \
             .execute()
 
-        # Running/analyzing scans older than 30 min are presumed dead.
+        # Running/analyzing scans with no heartbeat for 30 min are presumed dead.
         running_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
         stale_running = supabase.table("scan_jobs") \
             .select("id") \
             .in_("status", ["running", "analyzing"]) \
-            .lt("created_at", running_cutoff) \
+            .lt("updated_at", running_cutoff) \
             .execute()
 
         all_stale = (stale_pending.data or []) + (stale_running.data or [])

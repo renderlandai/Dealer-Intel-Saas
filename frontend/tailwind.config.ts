@@ -47,6 +47,10 @@ const config: Config = {
           DEFAULT: "hsl(var(--success))",
           foreground: "hsl(var(--success-foreground))",
         },
+        info: {
+          DEFAULT: "hsl(var(--info))",
+          foreground: "hsl(var(--info-foreground))",
+        },
       },
       borderRadius: {
         lg: "var(--radius)",
@@ -55,8 +59,9 @@ const config: Config = {
         sharp: "2px",
       },
       fontFamily: {
-        sans: ["Geist", "system-ui", "sans-serif"],
-        mono: ["Geist Mono", "monospace"],
+        sans: ["var(--font-sans)", "system-ui", "sans-serif"],
+        display: ["var(--font-display)", "var(--font-sans)", "system-ui", "sans-serif"],
+        mono: ["var(--font-mono)", "monospace"],
       },
       fontSize: {
         "2xs": ["0.625rem", { lineHeight: "1rem" }],
@@ -97,6 +102,7 @@ const config: Config = {
       boxShadow: {
         "glow": "0 0 20px hsl(38 92% 55% / 0.15)",
         "glow-lg": "0 0 40px hsl(38 92% 55% / 0.2)",
+        "glow-info": "0 0 20px hsl(225 65% 58% / 0.15)",
         "inner-glow": "inset 0 1px 0 hsl(45 15% 92% / 0.05)",
       },
       backgroundImage: {

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { AlertTriangle, CheckCircle, XCircle, Clock, Shield } from "lucide-react";
+import { AlertTriangle, CheckCircle, Clock, Shield } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn, timeAgo } from "@/lib/utils";
 
@@ -21,7 +21,8 @@ interface AlertsPanelProps {
 }
 
 const alertIcons = {
-  compliance_violation: XCircle,
+  compliance_violation: AlertTriangle,
+  compliance_drift: AlertTriangle,
   zombie_ad: Clock,
   modified_asset: AlertTriangle,
   default: AlertTriangle,
@@ -29,8 +30,9 @@ const alertIcons = {
 
 const severityStyles = {
   critical: "text-red-400 bg-red-500/10 border-red-500/20",
+  high: "text-red-400 bg-red-500/10 border-red-500/20",
   warning: "text-amber-400 bg-amber-500/10 border-amber-500/20",
-  info: "text-blue-400 bg-blue-500/10 border-blue-500/20",
+  info: "text-info bg-info/10 border-info/20",
   default: "text-muted-foreground bg-secondary border-border",
 };
 

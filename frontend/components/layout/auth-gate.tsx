@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname } from "next/navigation";
-import { AuthProvider, useAuth, PUBLIC_PATHS } from "@/lib/auth-context";
+import { AuthProvider, useAuth, isPublicPath } from "@/lib/auth-context";
 import { SidebarProvider } from "@/components/layout/sidebar-context";
 import { Sidebar } from "@/components/layout/sidebar";
 import { MainContent } from "@/components/layout/main-content";
@@ -12,7 +12,7 @@ function AuthenticatedShell({ children }: { children: React.ReactNode }) {
   const { loading, session } = useAuth();
   const pathname = usePathname();
 
-  if (PUBLIC_PATHS.includes(pathname)) {
+  if (isPublicPath(pathname)) {
     return <>{children}</>;
   }
 

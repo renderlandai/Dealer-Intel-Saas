@@ -3,7 +3,8 @@
 import { useState, useEffect } from "react";
 import { useAuth } from "@/lib/auth-context";
 import { supabase } from "@/lib/supabase";
-import { Zap, Loader2, CheckCircle } from "lucide-react";
+import { Loader2, CheckCircle } from "lucide-react";
+import { BrandWordmark } from "@/components/ui/brand-wordmark";
 import { useRouter } from "next/navigation";
 
 export default function ResetPasswordPage() {
@@ -50,8 +51,8 @@ export default function ResetPasswordPage() {
     return (
       <div className="flex min-h-screen items-center justify-center bg-background p-4">
         <div className="w-full max-w-sm space-y-8 text-center">
-          <div className="mx-auto flex h-14 w-14 items-center justify-center bg-primary">
-            <Zap className="h-7 w-7 text-primary-foreground" />
+          <div className="flex justify-center">
+            <BrandWordmark className="text-2xl" />
           </div>
           <div className="space-y-2">
             <Loader2 className="h-6 w-6 animate-spin mx-auto text-muted-foreground" />
@@ -71,12 +72,11 @@ export default function ResetPasswordPage() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background p-4">
       <div className="w-full max-w-sm space-y-8">
-        <div className="text-center">
-          <div className="mx-auto flex h-14 w-14 items-center justify-center bg-primary">
-            <Zap className="h-7 w-7 text-primary-foreground" />
+        <div className="text-center space-y-2">
+          <div className="flex justify-center">
+            <BrandWordmark className="text-2xl" />
           </div>
-          <h1 className="mt-4 text-2xl font-semibold tracking-tight">DEALER INTEL</h1>
-          <p className="mt-1 text-sm text-muted-foreground">Set your new password</p>
+          <p className="text-sm text-muted-foreground">Set your new password</p>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4">

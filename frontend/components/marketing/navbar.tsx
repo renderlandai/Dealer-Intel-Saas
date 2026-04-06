@@ -2,7 +2,8 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { Zap, Menu, X } from "lucide-react";
+import { Menu, X } from "lucide-react";
+import { BrandWordmark } from "@/components/ui/brand-wordmark";
 
 const NAV_LINKS = [
   { label: "Features", href: "/landing#features" },
@@ -14,15 +15,10 @@ export function MarketingNav() {
   const [mobileOpen, setMobileOpen] = useState(false);
 
   return (
-    <nav className="fixed top-0 left-0 right-0 z-50 border-b border-border/50 bg-background/80 backdrop-blur-xl">
+    <nav className="fixed top-0 left-0 right-0 z-50 border-b border-border/60 bg-background/80 backdrop-blur-xl">
       <div className="mx-auto max-w-7xl flex items-center justify-between h-16 px-6">
-        <Link href="/landing" className="flex items-center gap-3">
-          <div className="flex h-8 w-8 items-center justify-center bg-primary">
-            <Zap className="h-4 w-4 text-primary-foreground" />
-          </div>
-          <span className="text-sm font-semibold tracking-tight uppercase">
-            Dealer Intel
-          </span>
+        <Link href="/landing">
+          <BrandWordmark className="text-sm" />
         </Link>
 
         <div className="hidden md:flex items-center gap-8">
@@ -46,7 +42,7 @@ export function MarketingNav() {
           </Link>
           <Link
             href="mailto:sales@dealerintel.com"
-            className="h-9 px-5 flex items-center justify-center bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors shadow-glow"
+            className="h-9 px-5 flex items-center justify-center bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors rounded-md"
           >
             Book a Demo
           </Link>
@@ -82,7 +78,7 @@ export function MarketingNav() {
               </Link>
               <Link
                 href="mailto:sales@dealerintel.com"
-                className="block text-center py-2.5 bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors shadow-glow"
+                className="block text-center py-2.5 bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 transition-colors rounded-md"
               >
                 Book a Demo
               </Link>

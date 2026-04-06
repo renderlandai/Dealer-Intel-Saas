@@ -31,6 +31,10 @@ const AuthContext = createContext<AuthContextType>({
 
 export const PUBLIC_PATHS = ["/login", "/reset-password", "/landing", "/pricing"];
 
+export function isPublicPath(pathname: string): boolean {
+  return PUBLIC_PATHS.includes(pathname) || pathname.startsWith("/invite/");
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [session, setSession] = useState<Session | null>(null);
@@ -50,7 +54,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       (_event, session) => {
         setSession(session);
         setUser(session?.user ?? null);
-        if (!session && !PUBLIC_PATHS.includes(pathname)) {
+        if (!session && !isPublicPath(pathname)) {
           router.push("/landing");
         }
       }
@@ -60,7 +64,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
-    if (!session && !loading && !PUBLIC_PATHS.includes(pathname)) {
+    if (!session && !loading && !isPublicPath(pathname)) {
       router.push("/landing");
     }
   }, [session, loading, pathname]);

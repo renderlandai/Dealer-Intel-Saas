@@ -93,10 +93,10 @@ export function UsageCard({ dealers, campaigns, scans, plan }: UsageCardProps) {
       <CardHeader className="pb-3">
         <div className="flex items-center justify-between">
           <CardTitle className="text-sm font-medium flex items-center gap-2">
-            <Gauge className="h-4 w-4 text-primary" />
+            <Gauge className="h-4 w-4 text-info" />
             Plan Usage
           </CardTitle>
-          <span className="text-2xs font-mono uppercase tracking-wider text-primary bg-primary/10 px-2 py-0.5">
+          <span className="text-2xs font-mono uppercase tracking-wider text-info bg-info/10 px-2 py-0.5">
             {planLabel}
           </span>
         </div>

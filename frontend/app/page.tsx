@@ -81,14 +81,16 @@ export default function DashboardPage() {
   const campaigns = allCampaigns.filter((c: Campaign) => c.status === "active");
   const loading = statsLoading;
   const [downloading, setDownloading] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   const handleDownload = async (format: "pdf" | "csv") => {
     setDownloading(format);
+    setDownloadError(null);
     try {
       await downloadComplianceReport(format);
     } catch (error: any) {
       console.error("Download failed:", error);
-      alert(error?.response?.data?.detail || "Report download failed. Please try again.");
+      setDownloadError(error?.response?.data?.detail || "Report download failed. Please try again.");
     } finally {
       setDownloading(null);
     }
@@ -128,7 +130,7 @@ export default function DashboardPage() {
             <div className="flex-1">
               <p className="text-sm font-medium">Unable to connect to the server</p>
               <p className="text-xs text-muted-foreground mt-0.5">
-                Make sure the backend is running on port 8000. Data shown below may be incomplete.
+                We&apos;re having trouble reaching the server. Some data may be incomplete.
               </p>
             </div>
             <Button size="sm" variant="outline" onClick={() => window.location.reload()}>
@@ -201,7 +203,7 @@ export default function DashboardPage() {
                 title="Tracked Assets"
                 value={stats.total_assets}
                 icon={ImageIcon}
-                iconColor="text-blue-400"
+                iconColor="text-info"
               />
               <StatCard
                 title="Total Matches"
@@ -336,8 +338,8 @@ export default function DashboardPage() {
             <Card className="border-border/60 opacity-0 animate-fade-up">
               <CardHeader className="pb-4">
                 <div className="flex items-center gap-3">
-                  <div className="flex h-10 w-10 items-center justify-center bg-secondary border border-border">
-                    <FileText className="h-5 w-5 text-muted-foreground" />
+                  <div className="flex h-10 w-10 items-center justify-center bg-info/10 border border-info/20">
+                    <FileText className="h-5 w-5 text-info" />
                   </div>
                   <div>
                     <CardTitle className="text-base">Compliance Report</CardTitle>
@@ -370,6 +372,9 @@ export default function DashboardPage() {
                     {downloading === "csv" ? "Generating..." : "CSV Export"}
                   </Button>
                 </div>
+                {downloadError && (
+                  <p className="mt-2 text-xs text-destructive">{downloadError}</p>
+                )}
               </CardContent>
             </Card>
           </div>

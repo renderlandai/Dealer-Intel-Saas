@@ -360,11 +360,62 @@ api.interceptors.request.use(async (config) => {
   return config;
 });
 
-// Surface plan-limit errors as upgrade prompts instead of generic failures
-api.interceptors.response.use(undefined, (error) => {
+// Retry once on 401 after refreshing the Supabase session
+let _isRefreshing = false;
+let _refreshSubscribers: ((token: string | null) => void)[] = [];
+
+function _onTokenRefreshed(token: string | null) {
+  _refreshSubscribers.forEach((cb) => cb(token));
+  _refreshSubscribers = [];
+}
+
+api.interceptors.response.use(undefined, async (error) => {
   const status = error?.response?.status;
   const detail = error?.response?.data?.detail;
+  const originalRequest = error.config;
 
+  // 401 — attempt a token refresh and retry the original request once
+  if (status === 401 && !originalRequest._retried) {
+    originalRequest._retried = true;
+
+    if (_isRefreshing) {
+      return new Promise((resolve, reject) => {
+        _refreshSubscribers.push((token) => {
+          if (token) {
+            originalRequest.headers.Authorization = `Bearer ${token}`;
+            resolve(api(originalRequest));
+          } else {
+            reject(error);
+          }
+        });
+      });
+    }
+
+    _isRefreshing = true;
+    try {
+      const { data } = await supabase.auth.refreshSession();
+      const newToken = data.session?.access_token ?? null;
+
+      // Bust the cached session so subsequent requests pick up the new token
+      _sessionPromise = null;
+      _sessionCachedAt = 0;
+
+      _onTokenRefreshed(newToken);
+
+      if (newToken) {
+        originalRequest.headers.Authorization = `Bearer ${newToken}`;
+        return api(originalRequest);
+      }
+    } catch {
+      _onTokenRefreshed(null);
+    } finally {
+      _isRefreshing = false;
+    }
+
+    return Promise.reject(error);
+  }
+
+  // Surface plan-limit errors as upgrade prompts
   if (status === 403 && typeof detail === "string" && detail.toLowerCase().includes("plan")) {
     upgradeEvents.emit({
       title: "Plan limit reached",

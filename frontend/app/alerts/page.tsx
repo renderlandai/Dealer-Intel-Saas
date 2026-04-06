@@ -5,7 +5,6 @@ import Link from "next/link";
 import {
   Bell,
   CheckCircle,
-  XCircle,
   AlertTriangle,
   Clock,
   Shield,
@@ -42,13 +41,19 @@ interface Alert {
 }
 
 const alertIcons: Record<string, typeof AlertTriangle> = {
-  compliance_violation: XCircle,
+  compliance_violation: AlertTriangle,
+  compliance_drift: AlertTriangle,
   zombie_ad: Clock,
   modified_asset: AlertTriangle,
 };
 
 const severityConfig: Record<string, { label: string; style: string; dot: string }> = {
   critical: {
+    label: "Critical",
+    style: "text-red-400 bg-red-500/10 border-red-500/20",
+    dot: "bg-red-400",
+  },
+  high: {
     label: "Critical",
     style: "text-red-400 bg-red-500/10 border-red-500/20",
     dot: "bg-red-400",
@@ -60,8 +65,8 @@ const severityConfig: Record<string, { label: string; style: string; dot: string
   },
   info: {
     label: "Info",
-    style: "text-blue-400 bg-blue-500/10 border-blue-500/20",
-    dot: "bg-blue-400",
+    style: "text-info bg-info/10 border-info/20",
+    dot: "bg-info",
   },
 };
 

@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { Zap } from "lucide-react";
+import { BrandWordmark } from "@/components/ui/brand-wordmark";
 
 const FOOTER_LINKS = {
   Product: [
@@ -15,17 +15,12 @@ const FOOTER_LINKS = {
 
 export function MarketingFooter() {
   return (
-    <footer className="border-t border-border bg-card/30">
+    <footer className="border-t border-border bg-card/40">
       <div className="mx-auto max-w-7xl px-6 py-16">
         <div className="grid gap-12 md:grid-cols-4">
           <div className="md:col-span-2">
-            <Link href="/landing" className="flex items-center gap-3">
-              <div className="flex h-8 w-8 items-center justify-center bg-primary">
-                <Zap className="h-4 w-4 text-primary-foreground" />
-              </div>
-              <span className="text-sm font-semibold tracking-tight uppercase">
-                Dealer Intel
-              </span>
+            <Link href="/landing">
+              <BrandWordmark className="text-sm" />
             </Link>
             <p className="mt-4 text-sm text-muted-foreground max-w-xs leading-relaxed">
               AI-powered campaign asset monitoring for distributor networks.
@@ -59,7 +54,7 @@ export function MarketingFooter() {
             &copy; {new Date().getFullYear()} Dealer Intel. All rights reserved.
           </p>
           <div className="flex items-center gap-1 text-xs text-muted-foreground">
-            <span className="status-dot active" />
+            <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />
             <span className="ml-1">All systems operational</span>
           </div>
         </div>

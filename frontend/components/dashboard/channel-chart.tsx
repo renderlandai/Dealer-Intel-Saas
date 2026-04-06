@@ -65,7 +65,7 @@ export function ChannelChart({ data }: ChannelChartProps) {
                 type="number" 
                 stroke="hsl(220 10% 50%)" 
                 fontSize={11}
-                fontFamily="JetBrains Mono"
+                fontFamily="JetBrains Mono, monospace"
                 tickLine={false}
                 axisLine={false}
               />
@@ -74,7 +74,7 @@ export function ChannelChart({ data }: ChannelChartProps) {
                 dataKey="name"
                 stroke="hsl(220 10% 50%)"
                 fontSize={11}
-                fontFamily="Sora"
+                fontFamily="Inter, system-ui, sans-serif"
                 width={85}
                 tickLine={false}
                 axisLine={false}
@@ -85,7 +85,7 @@ export function ChannelChart({ data }: ChannelChartProps) {
                   backgroundColor: "hsl(220 18% 7%)",
                   border: "1px solid hsl(220 15% 14%)",
                   borderRadius: "2px",
-                  fontFamily: "Sora",
+                  fontFamily: "Inter, system-ui, sans-serif",
                   fontSize: "12px",
                 }}
                 labelStyle={{ color: "hsl(45 15% 92%)", fontWeight: 500 }}

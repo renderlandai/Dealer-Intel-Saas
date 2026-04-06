@@ -31,7 +31,7 @@ const FEATURES = [
     icon: Brain,
     title: "Proprietary AI Detection",
     description:
-      "Our proprietary multi-stage detection pipeline analyzes every discovered image against your campaign assets using perceptual hashing, visual embeddings, and adaptive reasoning.",
+      "Our multi-stage detection pipeline analyzes every discovered image using perceptual hashing, visual embeddings, and adaptive reasoning.",
   },
   {
     icon: FileText,
@@ -84,10 +84,10 @@ const STEPS = [
 ];
 
 const CHANNELS = [
-  { name: "Websites", color: "bg-emerald-500", glow: "shadow-[0_0_12px_hsl(158_64%_42%/0.4)]" },
-  { name: "Google Ads", color: "bg-amber-500", glow: "shadow-[0_0_12px_hsl(38_92%_55%/0.4)]" },
-  { name: "Facebook", color: "bg-blue-500", glow: "shadow-[0_0_12px_hsl(217_91%_60%/0.4)]" },
-  { name: "Instagram", color: "bg-pink-500", glow: "shadow-[0_0_12px_hsl(330_81%_60%/0.4)]" },
+  { name: "Websites", color: "bg-emerald-500" },
+  { name: "Google Ads", color: "bg-amber-500" },
+  { name: "Facebook", color: "bg-blue-500" },
+  { name: "Instagram", color: "bg-pink-500" },
 ];
 
 const TIERS_PREVIEW = [
@@ -114,59 +114,85 @@ const TIERS_PREVIEW = [
 
 export default function LandingPage() {
   return (
-    <div className="min-h-screen bg-background">
+    <div className="marketing-light min-h-screen bg-background text-foreground">
       <MarketingNav />
 
-      {/* ─── Hero ─── */}
-      <section className="relative pt-32 pb-28 overflow-hidden">
-        <div className="absolute inset-0 grid-bg opacity-30" />
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[800px] h-[800px] rounded-full bg-primary/[0.04] blur-[120px]" />
-
-        <div className="relative mx-auto max-w-5xl px-6 text-center">
-          <div className="inline-flex items-center gap-2.5 border border-primary/20 bg-primary/5 px-4 py-1.5 text-2xs font-mono font-medium uppercase tracking-[0.05em] text-primary mb-8 opacity-0 animate-fade-up">
-            <span className="status-dot active" />
-            14-Day Free Trial — No Credit Card Required
-          </div>
-
-          <h1 className="text-4xl sm:text-5xl md:text-6xl lg:text-7xl font-semibold tracking-[-0.02em] leading-[1.1] opacity-0 animate-fade-up delay-75">
-            Dealer Intelligence.
-            <br />
-            <span className="text-primary">Campaign Compliance.</span>
-          </h1>
-
-          <p className="mt-6 text-base sm:text-lg max-w-2xl mx-auto leading-[1.6] opacity-0 animate-fade-up delay-150" style={{ color: '#A1A1AA' }}>
-            Automatically detect how distributors use your brand assets
-            across websites, Google Ads, Facebook, and Instagram. Full
-            visibility into every channel, every dealer.
-          </p>
-
-          <div className="mt-10 flex flex-col sm:flex-row items-center justify-center gap-4 opacity-0 animate-fade-up delay-225">
-            <Link
-              href="mailto:sales@dealerintel.com"
-              className="h-12 px-8 flex items-center justify-center bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-all shadow-glow-lg gap-2 w-full sm:w-auto"
-            >
-              Book a Demo
-              <ArrowRight className="h-4 w-4" />
-            </Link>
-            <Link
-              href="/login"
-              className="h-12 px-8 flex items-center justify-center border border-border text-foreground text-sm font-medium hover:bg-secondary transition-all w-full sm:w-auto"
-            >
-              Start Free Trial
-            </Link>
-          </div>
-
-          {/* Channel pills */}
-          <div className="mt-16 flex items-center justify-center gap-3 flex-wrap opacity-0 animate-fade-up delay-300">
-            {CHANNELS.map((ch) => (
-              <div
-                key={ch.name}
-                className="flex items-center gap-2 px-3 py-1.5 border border-border bg-card/60 text-xs text-muted-foreground"
-              >
-                <div className={`w-2 h-2 ${ch.color} ${ch.glow}`} />
-                {ch.name}
+      {/* ─── Hero — Split Layout ─── */}
+      <section
+        className="relative pt-28 pb-20 overflow-hidden"
+        style={{
+          background: "linear-gradient(135deg, hsl(38 50% 95%) 0%, hsl(220 20% 96%) 35%, hsl(222 35% 90%) 100%)",
+        }}
+      >
+        <div className="relative mx-auto max-w-7xl px-6">
+          <div className="grid lg:grid-cols-2 gap-12 lg:gap-16 items-center">
+            {/* Left — Copy */}
+            <div className="max-w-xl">
+              <div className="inline-flex items-center gap-2 border border-accent/20 bg-accent/5 px-3 py-1 text-2xs font-mono font-medium uppercase tracking-wide text-accent mb-6 opacity-0 animate-fade-up" style={{ animationFillMode: "forwards" }}>
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                14-Day Free Trial
               </div>
-            ))}
+
+              <h1 className="font-display text-4xl sm:text-5xl lg:text-6xl font-bold tracking-[-0.025em] leading-[1.08] opacity-0 animate-fade-up delay-75" style={{ animationFillMode: "forwards" }}>
+                Dealer Intelligence.{" "}
+                <span className="text-accent">Campaign Compliance.</span>
+              </h1>
+
+              <p className="mt-6 text-lg leading-relaxed text-muted-foreground opacity-0 animate-fade-up delay-150" style={{ animationFillMode: "forwards" }}>
+                Automatically detect how distributors use your brand assets
+                across websites, Google Ads, Facebook, and Instagram.
+              </p>
+
+              <div className="mt-8 flex flex-col sm:flex-row items-start gap-4 opacity-0 animate-fade-up delay-225" style={{ animationFillMode: "forwards" }}>
+                <Link
+                  href="mailto:sales@dealerintel.com"
+                  className="h-12 px-8 flex items-center justify-center bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-all rounded-md gap-2"
+                >
+                  Request Demo
+                  <ArrowRight className="h-4 w-4" />
+                </Link>
+                <Link
+                  href="/login"
+                  className="h-12 px-8 flex items-center justify-center text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  or start a free trial
+                </Link>
+              </div>
+
+              {/* Channel pills */}
+              <div className="mt-10 flex items-center gap-3 flex-wrap opacity-0 animate-fade-up delay-300" style={{ animationFillMode: "forwards" }}>
+                {CHANNELS.map((ch) => (
+                  <div
+                    key={ch.name}
+                    className="flex items-center gap-2 text-xs text-muted-foreground"
+                  >
+                    <div className={`w-2 h-2 rounded-full ${ch.color}`} />
+                    {ch.name}
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Right — Product Screenshot */}
+            <div className="relative opacity-0 animate-fade-up delay-300" style={{ animationFillMode: "forwards" }}>
+              <div
+                className="absolute -inset-8 rounded-full pointer-events-none"
+                style={{
+                  background: "radial-gradient(ellipse at 50% 50%, hsl(222 55% 82% / 0.5) 0%, transparent 70%)",
+                  animation: "glow-breathe 5s ease-in-out infinite",
+                }}
+              />
+              <div className="relative">
+                <div className="rounded-lg overflow-hidden border border-border shadow-2xl shadow-black/10">
+                  <img
+                    src="/dashboard-preview.png"
+                    alt="Dealer Intel Dashboard"
+                    className="w-full h-auto block"
+                  />
+                </div>
+                <div className="absolute -bottom-4 -left-4 -right-4 h-24 bg-gradient-to-t from-[hsl(222_35%_90%)] to-transparent pointer-events-none" />
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -181,7 +207,7 @@ export default function LandingPage() {
             { value: "24/7", label: "Automated Scanning" },
           ].map((stat) => (
             <div key={stat.label} className="py-10 px-6 text-center">
-              <p className="data-value text-primary">{stat.value}</p>
+              <p className="font-mono text-3xl font-semibold tracking-tight text-accent">{stat.value}</p>
               <p className="mt-2 text-2xs text-muted-foreground uppercase tracking-wider">
                 {stat.label}
               </p>
@@ -191,13 +217,13 @@ export default function LandingPage() {
       </section>
 
       {/* ─── Features ─── */}
-      <section id="features" className="py-28 relative">
+      <section id="features" className="py-24">
         <div className="mx-auto max-w-7xl px-6">
           <div className="text-center mb-16">
-            <p className="text-2xs font-semibold uppercase tracking-wider text-primary mb-3">
+            <p className="text-2xs font-semibold uppercase tracking-wider text-accent mb-3">
               Features
             </p>
-            <h2 className="text-3xl md:text-4xl font-semibold tracking-[-0.02em]">
+            <h2 className="font-display text-3xl md:text-4xl font-bold tracking-[-0.025em]">
               Everything you need to protect your brand
             </h2>
             <p className="mt-4 text-muted-foreground max-w-xl mx-auto leading-relaxed">
@@ -208,16 +234,12 @@ export default function LandingPage() {
           </div>
 
           <div className="grid gap-5 md:grid-cols-2 lg:grid-cols-3">
-            {FEATURES.map((feature, i) => (
+            {FEATURES.map((feature) => (
               <div
                 key={feature.title}
-                className="card-sharp p-6 group hover-lift opacity-0 animate-fade-up"
-                style={{
-                  animationDelay: `${100 + i * 75}ms`,
-                  animationFillMode: "forwards",
-                }}
+                className="p-6 border border-border bg-background rounded-md group hover-lift"
               >
-                <div className="flex h-10 w-10 items-center justify-center bg-primary/10 border border-primary/20 mb-4">
+                <div className="flex h-10 w-10 items-center justify-center mb-4 bg-primary/10 border border-primary/20 rounded-md">
                   <feature.icon className="h-5 w-5 text-primary" />
                 </div>
                 <h3 className="text-base font-semibold mb-2">
@@ -233,16 +255,13 @@ export default function LandingPage() {
       </section>
 
       {/* ─── How It Works ─── */}
-      <section
-        id="how-it-works"
-        className="py-28 border-y border-border section-gradient"
-      >
+      <section id="how-it-works" className="py-24 border-y border-border bg-card/30">
         <div className="mx-auto max-w-7xl px-6">
           <div className="text-center mb-16">
-            <p className="text-2xs font-semibold uppercase tracking-wider text-primary mb-3">
+            <p className="text-2xs font-semibold uppercase tracking-wider text-accent mb-3">
               How It Works
             </p>
-            <h2 className="text-3xl md:text-4xl font-semibold tracking-[-0.02em]">
+            <h2 className="font-display text-3xl md:text-4xl font-bold tracking-[-0.025em]">
               Up and running in minutes
             </h2>
             <p className="mt-4 text-muted-foreground max-w-xl mx-auto leading-relaxed">
@@ -263,14 +282,14 @@ export default function LandingPage() {
 
                 <div className="text-center">
                   <div className="inline-flex items-center justify-center relative mb-6">
-                    <div className="flex h-16 w-16 items-center justify-center bg-card border border-border">
+                    <div className="flex h-16 w-16 items-center justify-center bg-background border border-border rounded-md">
                       <step.icon className="h-7 w-7 text-primary" />
                     </div>
-                    <span className="absolute -top-2 -right-2 flex h-6 w-6 items-center justify-center bg-primary text-primary-foreground text-2xs font-bold">
+                    <span className="absolute -top-2 -right-2 flex h-6 w-6 items-center justify-center bg-primary text-primary-foreground text-2xs font-bold rounded-md">
                       {step.number}
                     </span>
                   </div>
-                  <h3 className="text-lg font-semibold mb-2">{step.title}</h3>
+                  <h3 className="font-display text-lg font-semibold mb-2">{step.title}</h3>
                   <p className="text-sm text-muted-foreground leading-relaxed max-w-xs mx-auto">
                     {step.description}
                   </p>
@@ -281,8 +300,8 @@ export default function LandingPage() {
         </div>
       </section>
 
-      {/* ─── Social Proof / Trust ─── */}
-      <section className="py-28">
+      {/* ─── Trust / Why Us ─── */}
+      <section className="py-24">
         <div className="mx-auto max-w-7xl px-6">
           <div className="grid gap-6 md:grid-cols-3">
             {[
@@ -302,18 +321,14 @@ export default function LandingPage() {
                 icon: Brain,
                 title: "Adaptive Detection Engine",
                 description:
-                  "Our proprietary detection engine learns from your feedback. Thumbs-up or down on matches to calibrate thresholds for your brand.",
+                  "Our detection engine learns from your feedback. Thumbs-up or down on matches to calibrate thresholds for your brand.",
               },
-            ].map((item, i) => (
+            ].map((item) => (
               <div
                 key={item.title}
-                className="stat-card p-8 text-center opacity-0 animate-fade-up"
-                style={{
-                  animationDelay: `${100 + i * 100}ms`,
-                  animationFillMode: "forwards",
-                }}
+                className="p-8 text-center border border-border bg-background rounded-md"
               >
-                <div className="inline-flex h-12 w-12 items-center justify-center bg-primary/10 border border-primary/20 mb-4">
+                <div className="inline-flex h-12 w-12 items-center justify-center mb-4 bg-primary/10 border border-primary/20 rounded-md">
                   <item.icon className="h-6 w-6 text-primary" />
                 </div>
                 <h3 className="text-base font-semibold mb-2">{item.title}</h3>
@@ -327,10 +342,10 @@ export default function LandingPage() {
       </section>
 
       {/* ─── Pricing Preview ─── */}
-      <section className="py-28 border-y border-border section-gradient">
+      <section className="py-24 border-y border-border bg-card/30">
         <div className="mx-auto max-w-7xl px-6">
           <div className="text-center mb-16">
-            <h2 className="text-3xl md:text-4xl font-semibold tracking-[-0.02em]">
+            <h2 className="font-display text-3xl md:text-4xl font-bold tracking-[-0.025em]">
               Plans that scale with your network
             </h2>
             <p className="mt-4 text-muted-foreground max-w-xl mx-auto leading-relaxed">
@@ -340,27 +355,23 @@ export default function LandingPage() {
           </div>
 
           <div className="grid gap-6 md:grid-cols-3 max-w-5xl mx-auto">
-            {TIERS_PREVIEW.map((tier, i) => (
+            {TIERS_PREVIEW.map((tier) => (
               <div
                 key={tier.name}
-                className={`relative p-8 border bg-card opacity-0 animate-fade-up ${
+                className={`relative p-8 border bg-background rounded-md ${
                   tier.popular
-                    ? "border-primary/50 shadow-glow"
+                    ? "border-primary/50 shadow-lg shadow-primary/10"
                     : "border-border"
                 }`}
-                style={{
-                  animationDelay: `${100 + i * 100}ms`,
-                  animationFillMode: "forwards",
-                }}
               >
                 {tier.popular && (
-                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 bg-primary text-primary-foreground text-2xs font-semibold uppercase tracking-wider">
+                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 bg-primary text-primary-foreground text-2xs font-semibold uppercase tracking-wider rounded-sm">
                     Most Popular
                   </div>
                 )}
 
-                <h3 className="text-lg font-semibold">{tier.name}</h3>
-                <p className="mt-2 text-sm font-mono text-primary">{tier.tag}</p>
+                <h3 className="font-display text-lg font-semibold">{tier.name}</h3>
+                <p className="mt-2 text-sm font-mono text-accent">{tier.tag}</p>
                 <p className="mt-3 text-sm text-muted-foreground leading-relaxed">
                   {tier.description}
                 </p>
@@ -376,10 +387,10 @@ export default function LandingPage() {
 
                 <Link
                   href="mailto:sales@dealerintel.com"
-                  className={`mt-8 h-10 w-full flex items-center justify-center text-sm font-medium transition-all ${
+                  className={`mt-8 h-10 w-full flex items-center justify-center text-sm font-medium transition-all rounded-md ${
                     tier.popular
-                      ? "bg-primary text-primary-foreground hover:bg-primary/90 shadow-glow"
-                      : "border border-border hover:bg-secondary hover:text-foreground"
+                      ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                      : "border border-border hover:border-primary/40 hover:bg-primary/5 text-foreground"
                   }`}
                 >
                   Book a Demo
@@ -391,7 +402,7 @@ export default function LandingPage() {
           <div className="mt-10 text-center">
             <Link
               href="/pricing"
-              className="inline-flex items-center gap-1.5 text-sm text-primary hover:text-primary/80 transition-colors font-medium"
+              className="inline-flex items-center gap-1.5 text-sm text-accent hover:text-accent/80 transition-colors font-medium"
             >
               Compare all plans in detail
               <ArrowRight className="h-3.5 w-3.5" />
@@ -401,12 +412,9 @@ export default function LandingPage() {
       </section>
 
       {/* ─── Final CTA ─── */}
-      <section className="py-28 relative overflow-hidden">
-        <div className="absolute inset-0 grid-bg opacity-20" />
-        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full bg-primary/[0.03] blur-[100px]" />
-
-        <div className="relative mx-auto max-w-3xl px-6 text-center">
-          <h2 className="text-3xl md:text-4xl font-semibold tracking-[-0.02em]">
+      <section className="py-24">
+        <div className="mx-auto max-w-3xl px-6 text-center">
+          <h2 className="font-display text-3xl md:text-4xl font-bold tracking-[-0.025em]">
             Start monitoring your dealer
             <br className="hidden sm:block" /> network today
           </h2>
@@ -417,14 +425,14 @@ export default function LandingPage() {
           <div className="mt-8 flex flex-col sm:flex-row items-center justify-center gap-4">
             <Link
               href="mailto:sales@dealerintel.com"
-              className="h-12 px-8 flex items-center justify-center bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-all shadow-glow-lg gap-2 w-full sm:w-auto"
+              className="h-12 px-8 flex items-center justify-center bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-all rounded-md gap-2 w-full sm:w-auto"
             >
               Book a Demo
               <ArrowRight className="h-4 w-4" />
             </Link>
             <Link
               href="/login"
-              className="h-12 px-8 flex items-center justify-center border border-border text-foreground text-sm font-medium hover:bg-secondary transition-all w-full sm:w-auto"
+              className="h-12 px-8 flex items-center justify-center border border-border text-foreground text-sm font-medium hover:border-primary/40 hover:bg-primary/5 transition-all rounded-md w-full sm:w-auto"
             >
               Start Free Trial
             </Link>

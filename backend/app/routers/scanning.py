@@ -93,29 +93,25 @@ def _send_scan_notifications(
         }
 
         violations_formatted: List[Dict[str, Any]] = []
-        if violation_count > 0:
+        if violation_count > 0 and img_ids:
             try:
                 v_matches = supabase.table("matches")\
                     .select("*")\
                     .eq("compliance_status", "violation")\
+                    .in_("discovered_image_id", img_ids)\
                     .execute()
                 for m in (v_matches.data or []):
-                    img = supabase.table("discovered_images")\
-                        .select("scan_job_id")\
-                        .eq("id", m.get("discovered_image_id", ""))\
-                        .single().execute()
-                    if img.data and img.data.get("scan_job_id") == str(scan_job_id):
-                        analysis = m.get("ai_analysis", {}) or {}
-                        comp_summary = ""
-                        if isinstance(analysis, dict):
-                            comp_summary = analysis.get("compliance", {}).get("summary", "")
-                        violations_formatted.append({
-                            "asset_name": m.get("asset_name", "Unknown"),
-                            "distributor_name": m.get("distributor_name", "Unknown"),
-                            "channel": m.get("channel", scan_source),
-                            "confidence_score": m.get("confidence_score", 0),
-                            "compliance_summary": comp_summary,
-                        })
+                    analysis = m.get("ai_analysis", {}) or {}
+                    comp_summary = ""
+                    if isinstance(analysis, dict):
+                        comp_summary = analysis.get("compliance", {}).get("summary", "")
+                    violations_formatted.append({
+                        "asset_name": m.get("asset_name", "Unknown"),
+                        "distributor_name": m.get("distributor_name", "Unknown"),
+                        "channel": m.get("channel", scan_source),
+                        "confidence_score": m.get("confidence_score", 0),
+                        "compliance_summary": comp_summary,
+                    })
             except Exception as ve:
                 log.warning("Could not fetch violation details: %s", ve)
 
@@ -150,6 +146,16 @@ async def start_scan(
     check_concurrent_scans(op)
     from ..tasks import dispatch_task
 
+    if scan_request.campaign_id:
+        campaign_check = supabase.table("campaigns")\
+            .select("id")\
+            .eq("id", str(scan_request.campaign_id))\
+            .eq("organization_id", str(user.org_id))\
+            .maybe_single()\
+            .execute()
+        if not campaign_check.data:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
     job_data = {
         "organization_id": str(user.org_id),
         "campaign_id": str(scan_request.campaign_id) if scan_request.campaign_id else None,
@@ -160,16 +166,6 @@ async def start_scan(
     result = supabase.table("scan_jobs").insert(job_data).execute()
     scan_job = result.data[0]
     scan_job_id = scan_job["id"]
-    
-    if scan_request.campaign_id:
-        campaign_check = supabase.table("campaigns")\
-            .select("id")\
-            .eq("id", str(scan_request.campaign_id))\
-            .eq("organization_id", str(user.org_id))\
-            .maybe_single()\
-            .execute()
-        if not campaign_check.data:
-            raise HTTPException(status_code=404, detail="Campaign not found")
 
     if scan_request.distributor_ids:
         distributors = supabase.table("distributors")\
@@ -526,7 +522,7 @@ async def _analyze_single_image(
                                 "match_id": old["id"],
                                 "distributor_id": image.get("distributor_id"),
                                 "alert_type": "compliance_drift",
-                                "severity": "high",
+                                "severity": "critical",
                                 "title": "Compliance drift detected — was compliant, now violation",
                                 "description": result["ai_analysis"].get("compliance", {}).get("summary", ""),
                             }).execute()
@@ -1429,20 +1425,21 @@ async def batch_scan(
 
 @router.post("/quick-scan", summary="Quick scan")
 async def quick_scan(
+    request: Request,
     source: ScanSource,
     user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
 ):
     """
     Quick scan - starts a scan and immediately begins analysis.
     """
     job = await start_scan(
-        ScanJobCreate(
-            organization_id=user.org_id,
-            source=source
-        ),
-        user
+        request,
+        ScanJobCreate(source=source),
+        user,
+        op,
     )
-    
+
     return {
         "message": "Quick scan started",
         "job_id": job["id"],

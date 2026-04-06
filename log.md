@@ -1617,3 +1617,171 @@ Addressed slow page transitions in the frontend by adding query caching, prefetc
 **Changes:**
 
 - **`backend/app/services/ai_service.py`** — Updated `get_compliance_prompt` to explicitly state that ANY color change (colorized, desaturated, tinted, scheme changed) is a compliance violation. Added color changes to the `is_compliant: false` conditions list. Added rule: "Color changes are ALWAYS a violation."
+
+---
+
+## 2026-04-01 — Frontend Brand Refresh & Design System Overhaul
+
+### Summary
+Major frontend visual refresh across the entire application. Replaced the generic Zap icon branding with a typographic `BrandWordmark` / `BrandMark` component used consistently across all pages. Switched fonts from Geist to Inter + Plus Jakarta Sans (display) + JetBrains Mono via Next.js `next/font/google` for proper self-hosting. Introduced a light-mode color theme (`marketing-light`) for marketing pages (landing, pricing) while keeping the dark dashboard. Added a new `info` semantic color (blue) to separate informational UI (plan badges, notification dots, active sidebar) from the gold `primary`/`accent` used for brand emphasis. Redesigned the landing page hero into a split layout with a product screenshot. Replaced all sharp-cornered elements with subtle `rounded-md` borders across marketing and pricing pages. Bumped compliance-drift alert severity from `high` to `critical` in the backend.
+
+### Frontend — Brand Identity Component
+
+**Problem:** The brand identity was a plain Zap icon in a colored square, duplicated with inconsistent markup across the sidebar, navbar, footer, login, invite, and reset-password pages.
+
+**Changes:**
+
+- **`frontend/components/ui/brand-wordmark.tsx`** *(new)* — Created `BrandWordmark` (full "DEALER INTEL" wordmark with accent-colored "I", optional subtitle) and `BrandMark` (standalone accent "I") components using the display font.
+- **`frontend/components/layout/sidebar.tsx`** — Replaced Zap icon + hardcoded text with `BrandWordmark` (expanded) and `BrandMark` (collapsed). Removed `Zap` import.
+- **`frontend/components/marketing/navbar.tsx`** — Replaced Zap logo block with `BrandWordmark`.
+- **`frontend/components/marketing/footer.tsx`** — Same replacement. Replaced `status-dot` class with inline utility classes for the "systems operational" indicator.
+- **`frontend/app/login/page.tsx`** — Replaced Zap icon + `<h1>DEALER INTEL</h1>` with centered `BrandWordmark`.
+- **`frontend/app/reset-password/page.tsx`** — Same replacement, both in the loading state and the form view.
+- **`frontend/app/invite/[token]/page.tsx`** — Same replacement.
+
+### Frontend — Typography & Font System
+
+**Problem:** Fonts were loaded via a Google Fonts CSS `@import` in `globals.css` (render-blocking) and referenced by name in Tailwind config. The Geist font was used for everything with no distinct display weight for headings.
+
+**Changes:**
+
+- **`frontend/app/layout.tsx`** — Added `Inter`, `Plus_Jakarta_Sans`, and `JetBrains_Mono` via `next/font/google` with CSS variables (`--font-sans`, `--font-display`, `--font-mono`). Applied all three variables to the `<html>` element.
+- **`frontend/app/globals.css`** — Removed the `@import url(...)` for Google Fonts. Updated `body` and `.font-mono` to use CSS variables. Added `.font-display` utility class. Changed `h1, h2` to `font-weight: 700` and `h3, h4` to `600`.
+- **`frontend/tailwind.config.ts`** — Updated `fontFamily.sans` and `fontFamily.mono` to reference CSS variables. Added `fontFamily.display` for headings.
+
+### Frontend — Light Mode for Marketing Pages
+
+**Problem:** The landing page and pricing page used the same dark theme as the authenticated dashboard, making the marketing experience feel heavy and less inviting.
+
+**Changes:**
+
+- **`frontend/app/globals.css`** — Added a `.marketing-light` class that overrides all CSS custom properties (background, foreground, card, primary, secondary, muted, accent, border, etc.) to a light color scheme. Added `.section-gradient` and `.hover-lift:hover` overrides for the light context.
+- **`frontend/app/landing/page.tsx`** — Applied `marketing-light` class to the root wrapper. Entire landing page now renders in light mode.
+- **`frontend/app/pricing/page.tsx`** — Same `marketing-light` application. The pricing page now matches the landing page's light aesthetic.
+
+### Frontend — Landing Page Hero Redesign
+
+**Problem:** The hero was a centered text block with no visual element, making it feel generic and text-heavy.
+
+**Changes:**
+
+- **`frontend/app/landing/page.tsx`** — Redesigned the hero into a two-column split layout: left side has the headline, description, CTA buttons, and channel pills; right side has a product screenshot (`dashboard-preview.png`) with a breathing glow background effect. Added a warm gradient background (`linear-gradient` from warm beige to cool blue). Simplified channel pills (removed individual glow shadows). Changed primary CTA from "Book a Demo" to "Request Demo" with a secondary "or start a free trial" text link.
+- **`frontend/public/dashboard-preview.png`** *(new)* — Product screenshot asset for the hero.
+- **`frontend/app/globals.css`** — Added `@keyframes glow-breathe` animation for the screenshot halo effect.
+- **`frontend/components/marketing/scroll-reveal.tsx`** *(new)* — IntersectionObserver-based scroll reveal component with configurable delay, used for staggered section animations on marketing pages.
+
+### Frontend — Info Color & UI Semantics
+
+**Problem:** Informational elements (notification badges, plan usage indicators, active sidebar state, info-severity alerts) all used the gold `primary` color, making them visually indistinguishable from brand-emphasis elements like CTAs and accent text.
+
+**Changes:**
+
+- **`frontend/app/globals.css`** — Added `--info` and `--info-foreground` CSS variables (blue hue, `225 65% 58%`) to both the dark root and the `marketing-light` theme.
+- **`frontend/tailwind.config.ts`** — Added `info` color tokens (`DEFAULT` and `foreground`). Added `shadow-glow-info` box shadow.
+- **`frontend/components/ui/badge.tsx`** — Added `info` badge variant.
+- **`frontend/components/ui/button.tsx`** — Added `info` button variant. Updated `outline` variant hover to use `info` instead of plain `secondary`.
+- **`frontend/components/layout/header.tsx`** — Changed notification dot from `bg-primary` to `bg-info`.
+- **`frontend/components/layout/sidebar.tsx`** — Changed active nav item border from `border-primary` to `border-info`.
+- **`frontend/components/dashboard/usage-card.tsx`** — Changed plan usage icon and badge from `text-primary`/`bg-primary/10` to `text-info`/`bg-info/10`.
+- **`frontend/components/dashboard/alerts-panel.tsx`** — Changed info-severity alert style to use `text-info`/`bg-info/10`. Added `compliance_drift` and `high` severity mappings.
+- **`frontend/app/alerts/page.tsx`** — Same info-severity color update. Added `compliance_drift` alert type and `high` severity config.
+- **`frontend/app/page.tsx`** — Changed "Tracked Assets" stat icon to `text-info`. Changed compliance report card icon container to `bg-info/10` with `text-info`.
+
+### Frontend — Border Radius & Visual Polish
+
+**Problem:** All marketing elements (cards, buttons, badges, step indicators) used hard 0px corners (`card-sharp`, no border-radius), giving the marketing pages an overly rigid appearance.
+
+**Changes:**
+
+- **`frontend/app/landing/page.tsx`** — Replaced `card-sharp` with `border border-border bg-background rounded-md` on feature cards, trust cards, and pricing cards. Added `rounded-md` to step icons, number badges, "Most Popular" labels, and all CTA buttons. Removed staggered `animationDelay` from feature cards. Used `font-display` on all section headings. Replaced `text-primary` section labels with `text-accent`.
+- **`frontend/app/pricing/page.tsx`** — Applied `rounded-md` to all tier cards, CTA buttons, and "Most Popular" badge. Changed `bg-card` to `bg-background` on cards. Used `font-display` on all headings. Changed `shadow-glow` to `shadow-lg shadow-primary/10` on the popular tier. Replaced `section-gradient` with `bg-card/30`. Changed section labels and tier tags from `text-primary` to `text-accent`.
+- **`frontend/components/marketing/navbar.tsx`** — Added `rounded-md` to "Book a Demo" CTA button.
+- **`frontend/components/dashboard/channel-chart.tsx`** — Updated hardcoded `fontFamily` references from `"Sora"` to `"Inter, system-ui, sans-serif"` and `"JetBrains Mono"` to `"JetBrains Mono, monospace"`.
+
+### Backend — Compliance Drift Alert Severity
+
+**Problem:** Compliance-drift alerts (asset was previously compliant, now shows a violation) were created with `severity: "high"`, but the frontend only mapped `critical`, `warning`, and `info` — `high` had no styling and fell through to the default.
+
+**Changes:**
+
+- **`backend/app/routers/scanning.py`** — Changed compliance-drift alert severity from `"high"` to `"critical"` so it renders with the red critical styling in the alerts panel.
+- **`frontend/components/dashboard/alerts-panel.tsx`** / **`frontend/app/alerts/page.tsx`** — Added `high` severity mapping (aliased to `critical` styling) as a safety net for any existing `high` records in the database.
+
+---
+
+## Upcoming Software Connections
+
+Planned integrations to extend the platform's reach, reduce setup friction, and close the compliance-to-action loop.
+
+### Communication & Alerts
+
+| Software | Purpose |
+|----------|---------|
+| **Slack** | Push violation and compliance-drift alerts to team channels in real time via webhooks. |
+| **Microsoft Teams** | Same real-time alert delivery for enterprise orgs on the Microsoft stack. |
+
+### CRM & Dealer Management
+
+| Software | Purpose |
+|----------|---------|
+| **Salesforce** | Two-way sync of dealer/distributor records — eliminates manual onboarding and keeps dealer metadata current. Push compliance status back as contact properties. |
+| **HubSpot** | Mid-market CRM alternative. Same dealer sync and compliance-status enrichment. |
+
+### Digital Asset Management
+
+| Software | Purpose |
+|----------|---------|
+| **Bynder** | Auto-ingest approved campaign assets from the brand DAM instead of manual upload. |
+| **Brandfolder (Smartsheet)** | Alternative DAM connector — watch folders for new approved creative. |
+| **Adobe Experience Manager** | Enterprise DAM integration for large OEMs. |
+| **Frontify** | Brand guideline + asset platform — pull approved assets and brand rules. |
+
+### Through-Channel / Co-op Marketing Platforms
+
+| Software | Purpose |
+|----------|---------|
+| **SproutLoud** | Tie compliance status to co-op fund approval — violations can auto-block reimbursement. |
+| **BrandMuscle** | Local marketing automation for dealer networks. Same compliance-gates-funding story. |
+| **Ansira** | Channel marketing platform. Flag non-compliant creative before co-op funds are released. |
+
+### Expanded Ad Platform APIs
+
+| Software | Purpose |
+|----------|---------|
+| **Google Ads API** (direct) | Replace SerpApi proxy with direct dealer ad-account access for richer data (copy, extensions, landing pages, spend). |
+| **Meta Marketing API** (direct) | Replace Apify scraping with direct ad-account access for reliable data and impression/spend metrics. |
+| **YouTube** | Extend scanning to video thumbnails and pre-roll ads (source enum already exists). |
+| **Microsoft / Bing Ads** | Second-largest search ad platform — dealers running Google Ads almost always run Bing too. |
+| **TikTok Ads** | Growing channel for local/dealer advertising, especially consumer-facing verticals. |
+
+### Reporting
+
+| Software | Purpose |
+|----------|---------|
+| **Power BI** | Compliance data connector so enterprise teams can embed metrics in existing executive dashboards. |
+| **Tableau** | Alternative BI connector for compliance trend analysis. |
+| **Looker / Google Sheets** | Push compliance summaries to shared sheets or Looker dashboards for Google Workspace orgs. |
+
+### Project Management & Workflow
+
+| Software | Purpose |
+|----------|---------|
+| **Jira** | Auto-create tickets from violations — assigned to regional manager or dealer contact, closed when resolved. |
+| **Asana** | Violation-to-task workflow with deadlines, screenshots attached, status synced back. |
+| **Monday.com** | Alternative project management connector for violation resolution tracking. |
+
+### File Storage
+
+| Software | Purpose |
+|----------|---------|
+| **Google Drive** | Point to a folder of approved assets instead of uploading — auto-sync on changes. |
+| **Dropbox** | Same folder-watch asset ingestion. |
+| **SharePoint / OneDrive** | Enterprise file storage connector for Microsoft-stack orgs. |
+
+### Build Priority
+
+1. **Slack / Teams** — fastest to ship (webhooks), instant demo value, daily stickiness
+2. **Salesforce** — eliminates dealer onboarding friction, signals enterprise readiness
+3. **Bynder or Brandfolder** — eliminates asset upload friction, makes setup near-zero
+4. **Jira** — closes the violation-to-resolution loop, critical for proving ROI
+5. **Ansira** — ties compliance to co-op dollars, the core business case

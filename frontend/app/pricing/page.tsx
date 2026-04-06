@@ -23,7 +23,7 @@ const TIERS = [
     description: "Explore the platform with a small test network.",
     cta: "Start Free Trial",
     ctaHref: "/login",
-    ctaStyle: "border border-border hover:bg-secondary" as const,
+    ctaStyle: "border border-primary/40 bg-primary/5 text-primary hover:bg-primary/10 rounded-md" as const,
     highlights: [
       "2 dealers",
       "1 campaign",
@@ -39,7 +39,7 @@ const TIERS = [
     description: "For small dealer networks getting started with compliance monitoring.",
     cta: "Book a Demo",
     ctaHref: "mailto:sales@dealerintel.com",
-    ctaStyle: "border border-border hover:bg-secondary" as const,
+    ctaStyle: "border border-border hover:border-primary/40 hover:bg-primary/5 rounded-md" as const,
     highlights: [
       "10 dealers included",
       "3 campaigns",
@@ -57,7 +57,7 @@ const TIERS = [
     description: "For growing brands that need full multi-channel visibility.",
     cta: "Book a Demo",
     ctaHref: "mailto:sales@dealerintel.com",
-    ctaStyle: "bg-primary text-primary-foreground hover:bg-primary/90 shadow-glow" as const,
+    ctaStyle: "bg-primary text-primary-foreground hover:bg-primary/90 rounded-md" as const,
     highlights: [
       "40 dealers included",
       "10 campaigns",
@@ -75,7 +75,7 @@ const TIERS = [
     description: "For established networks with high-volume monitoring needs.",
     cta: "Book a Demo",
     ctaHref: "mailto:sales@dealerintel.com",
-    ctaStyle: "border border-border hover:bg-secondary" as const,
+    ctaStyle: "border border-border hover:border-primary/40 hover:bg-primary/5 rounded-md" as const,
     highlights: [
       "100 dealers included",
       "Unlimited campaigns",
@@ -93,7 +93,7 @@ const TIERS = [
     description: "Tailored for large-scale manufacturer networks with custom needs.",
     cta: "Contact Sales",
     ctaHref: "mailto:sales@dealerintel.com",
-    ctaStyle: "border border-border hover:bg-secondary" as const,
+    ctaStyle: "border border-border hover:border-primary/40 hover:bg-primary/5 rounded-md" as const,
     highlights: [
       "Unlimited dealers",
       "Unlimited campaigns & scans",
@@ -244,20 +244,19 @@ function FaqItem({ q, a }: { q: string; a: string }) {
 
 export default function PricingPage() {
   return (
-    <div className="min-h-screen bg-background">
+    <div className="marketing-light min-h-screen bg-background text-foreground">
       <MarketingNav />
 
       {/* ─── Header ─── */}
       <section className="pt-32 pb-20 relative overflow-hidden">
-        <div className="absolute inset-0 grid-bg opacity-20" />
         <div className="relative mx-auto max-w-3xl px-6 text-center">
-          <p className="text-2xs font-semibold uppercase tracking-wider text-primary mb-3 opacity-0 animate-fade-up">
+          <p className="text-2xs font-semibold uppercase tracking-wider text-accent mb-3 opacity-0 animate-fade-up">
             Pricing
           </p>
-          <h1 className="text-4xl md:text-5xl font-semibold tracking-[-0.02em] opacity-0 animate-fade-up delay-75">
+          <h1 className="font-display text-4xl md:text-5xl font-bold tracking-[-0.025em] opacity-0 animate-fade-up delay-75">
             Plans that scale with
             <br />
-            <span className="text-primary">your dealer network</span>
+            <span className="text-accent">your dealer network</span>
           </h1>
           <p className="mt-4 text-muted-foreground max-w-lg mx-auto leading-relaxed opacity-0 animate-fade-up delay-150">
             Custom pricing based on your network size. Start with a free
@@ -267,7 +266,7 @@ export default function PricingPage() {
       </section>
 
       {/* ─── Tier Cards ─── */}
-      <section className="pb-28">
+      <section className="pb-24">
         <div className="mx-auto max-w-7xl px-6">
           {/* Top 3 tiers — main focus */}
           <div className="grid gap-6 lg:grid-cols-3 max-w-5xl mx-auto mb-8">
@@ -276,9 +275,9 @@ export default function PricingPage() {
             ).map((tier, i) => (
               <div
                 key={tier.id}
-                className={`relative p-8 border bg-card opacity-0 animate-fade-up ${
+                className={`relative p-8 border bg-background rounded-md opacity-0 animate-fade-up ${
                   tier.popular
-                    ? "border-primary/50 shadow-glow lg:-mt-4 lg:pb-12"
+                    ? "border-primary/50 shadow-lg shadow-primary/10 lg:-mt-4 lg:pb-12"
                     : "border-border"
                 }`}
                 style={{
@@ -287,13 +286,13 @@ export default function PricingPage() {
                 }}
               >
                 {tier.popular && (
-                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 bg-primary text-primary-foreground text-2xs font-semibold uppercase tracking-wider">
+                  <div className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-0.5 bg-primary text-primary-foreground text-2xs font-semibold uppercase tracking-wider rounded-sm">
                     Most Popular
                   </div>
                 )}
 
-                <h3 className="text-lg font-semibold">{tier.name}</h3>
-                <p className="mt-2 text-sm font-mono text-primary">
+                <h3 className="font-display text-lg font-semibold">{tier.name}</h3>
+                <p className="mt-2 text-sm font-mono text-accent">
                   {tier.tag}
                 </p>
                 <p className="mt-3 text-sm text-muted-foreground leading-relaxed min-h-[40px]">
@@ -302,7 +301,7 @@ export default function PricingPage() {
 
                 <Link
                   href={tier.ctaHref}
-                  className={`mt-6 h-10 w-full flex items-center justify-center text-sm font-medium transition-all ${tier.ctaStyle}`}
+                  className={`mt-6 h-10 w-full flex items-center justify-center text-sm font-medium transition-all rounded-md ${tier.ctaStyle}`}
                 >
                   {tier.cta}
                 </Link>
@@ -326,7 +325,7 @@ export default function PricingPage() {
             ).map((tier, i) => (
               <div
                 key={tier.id}
-                className="p-8 border border-border bg-card opacity-0 animate-fade-up"
+                className="p-8 border border-border bg-background rounded-md opacity-0 animate-fade-up"
                 style={{
                   animationDelay: `${400 + i * 100}ms`,
                   animationFillMode: "forwards",
@@ -334,8 +333,8 @@ export default function PricingPage() {
               >
                 <div className="flex items-baseline justify-between">
                   <div>
-                    <h3 className="text-lg font-semibold">{tier.name}</h3>
-                    <p className="mt-1 text-sm font-mono text-primary">
+                    <h3 className="font-display text-lg font-semibold">{tier.name}</h3>
+                    <p className="mt-1 text-sm font-mono text-accent">
                       {tier.tag}
                     </p>
                   </div>
@@ -352,7 +351,7 @@ export default function PricingPage() {
                 <ul className="mt-4 grid grid-cols-2 gap-2">
                   {tier.highlights.map((h) => (
                     <li key={h} className="flex items-start gap-2 text-sm">
-                      <Check className="h-3.5 w-3.5 text-primary flex-shrink-0 mt-0.5" />
+                      <Check className="h-3.5 w-3.5 flex-shrink-0 mt-0.5 text-primary" />
                       <span className="text-foreground/80">{h}</span>
                     </li>
                   ))}
@@ -364,10 +363,10 @@ export default function PricingPage() {
       </section>
 
       {/* ─── Feature Comparison Table ─── */}
-      <section className="py-28 border-y border-border section-gradient">
+      <section className="py-24 border-y border-border bg-card/30">
         <div className="mx-auto max-w-7xl px-6">
           <div className="text-center mb-16">
-            <h2 className="text-3xl font-semibold tracking-[-0.02em]">
+            <h2 className="font-display text-3xl font-bold tracking-[-0.025em]">
               Compare every feature
             </h2>
             <p className="mt-3 text-muted-foreground">
@@ -401,7 +400,7 @@ export default function PricingPage() {
                   <tr>
                     <td
                       colSpan={6}
-                      className="pt-8 pb-3 text-2xs font-semibold uppercase tracking-wider text-primary"
+                      className="pt-8 pb-3 text-2xs font-semibold uppercase tracking-wider text-accent"
                     >
                       {group.heading}
                     </td>
@@ -429,10 +428,10 @@ export default function PricingPage() {
       </section>
 
       {/* ─── FAQ ─── */}
-      <section className="py-28">
+      <section className="py-24">
         <div className="mx-auto max-w-3xl px-6">
           <div className="text-center mb-12">
-            <h2 className="text-3xl font-semibold tracking-[-0.02em]">
+            <h2 className="font-display text-3xl font-bold tracking-[-0.025em]">
               Frequently asked questions
             </h2>
           </div>
@@ -446,9 +445,9 @@ export default function PricingPage() {
       </section>
 
       {/* ─── Bottom CTA ─── */}
-      <section className="py-20 border-t border-border section-gradient">
+      <section className="py-20 border-t border-border">
         <div className="mx-auto max-w-3xl px-6 text-center">
-          <h2 className="text-2xl md:text-3xl font-semibold tracking-[-0.02em]">
+          <h2 className="font-display text-2xl md:text-3xl font-bold tracking-[-0.025em]">
             Ready to protect your brand?
           </h2>
           <p className="mt-3 text-muted-foreground">
@@ -457,14 +456,14 @@ export default function PricingPage() {
           <div className="mt-8 flex flex-col sm:flex-row items-center justify-center gap-4">
             <Link
               href="mailto:sales@dealerintel.com"
-              className="h-12 px-8 flex items-center justify-center bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-all shadow-glow-lg gap-2 w-full sm:w-auto"
+              className="h-12 px-8 flex items-center justify-center bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-all rounded-md gap-2 w-full sm:w-auto"
             >
               Book a Demo
               <ArrowRight className="h-4 w-4" />
             </Link>
             <Link
               href="/login"
-              className="h-12 px-8 flex items-center justify-center border border-border text-foreground text-sm font-medium hover:bg-secondary transition-all w-full sm:w-auto"
+              className="h-12 px-8 flex items-center justify-center border border-border text-foreground text-sm font-medium hover:border-primary/40 hover:bg-primary/5 transition-all rounded-md w-full sm:w-auto"
             >
               Start Free Trial
             </Link>

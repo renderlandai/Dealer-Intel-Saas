@@ -328,13 +328,14 @@ async def start_campaign_scan(
     campaign = supabase.table("campaigns")\
         .select("*, organizations!campaigns_organization_id_fkey(id)")\
         .eq("id", str(campaign_id))\
+        .eq("organization_id", str(user.org_id))\
         .single()\
         .execute()
     
     if not campaign.data:
         raise HTTPException(status_code=404, detail="Campaign not found")
     
-    organization_id = campaign.data["organization_id"]
+    organization_id = user.org_id
     
     job_data = {
         "organization_id": str(organization_id),
@@ -351,6 +352,7 @@ async def start_campaign_scan(
         distributors = supabase.table("distributors")\
             .select("*")\
             .in_("id", [str(d) for d in distributor_ids])\
+            .eq("organization_id", str(user.org_id))\
             .execute()
     else:
         distributors = supabase.table("distributors")\
