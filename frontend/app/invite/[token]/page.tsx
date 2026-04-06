@@ -5,7 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { CheckCircle, XCircle, Loader2, Users, LogIn } from "lucide-react";
 import { BrandWordmark } from "@/components/ui/brand-wordmark";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { acceptInvite } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
@@ -68,16 +68,12 @@ export default function AcceptInvitePage() {
                   </p>
                 </div>
                 <div className="flex gap-3 w-full">
-                  <Button asChild variant="outline" className="flex-1">
-                    <Link href={`/login?redirect=/invite/${token}`}>
-                      Sign In
-                    </Link>
-                  </Button>
-                  <Button asChild className="flex-1">
-                    <Link href={`/login?redirect=/invite/${token}&tab=signup`}>
-                      Create Account
-                    </Link>
-                  </Button>
+                  <Link href={`/login?redirect=/invite/${token}`} className={buttonVariants({ variant: "outline", className: "flex-1" })}>
+                    Sign In
+                  </Link>
+                  <Link href={`/login?redirect=/invite/${token}&tab=signup`} className={buttonVariants({ className: "flex-1" })}>
+                    Create Account
+                  </Link>
                 </div>
               </>
             ) : status === "accepted" ? (

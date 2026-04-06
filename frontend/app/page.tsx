@@ -235,8 +235,8 @@ export default function DashboardPage() {
                       { name: "Instagram", key: "instagram", color: "bg-pink-500" },
                       { name: "Websites", key: "website", color: "bg-emerald-500" },
                     ].map((channel, index) => {
-                      const count = channelData.find((c: any) => c.channel === channel.key)?.count ?? 0;
-                      const maxCount = Math.max(...channelData.map((c: any) => c.count ?? 0), 1);
+                      const count = channelData.find((c: any) => c.channel === channel.key)?.match_count ?? 0;
+                      const maxCount = Math.max(...channelData.map((c: any) => c.match_count ?? 0), 1);
                       const percentage = (count / maxCount) * 100;
                       
                       return (
