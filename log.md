@@ -1907,8 +1907,87 @@ Planned integrations to extend the platform's reach, reduce setup friction, and 
 
 ### Build Priority
 
-1. **Slack / Teams** — fastest to ship (webhooks), instant demo value, daily stickiness
-2. **Salesforce** — eliminates dealer onboarding friction, signals enterprise readiness
+1. ~~**Slack / Teams** — fastest to ship (webhooks), instant demo value, daily stickiness~~ ✅ Slack done
+2. ~~**Salesforce** — eliminates dealer onboarding friction, signals enterprise readiness~~ ✅ Done
 3. **Bynder or Brandfolder** — eliminates asset upload friction, makes setup near-zero
 4. **Jira** — closes the violation-to-resolution loop, critical for proving ROI
 5. **Ansira** — ties compliance to co-op dollars, the core business case
+
+---
+
+## 2026-04-07 — Slack & Salesforce Integrations
+
+### Summary
+Built and deployed two full third-party integrations: Slack (OAuth + scan notifications) and Salesforce (OAuth + violation Tasks). Both are live in production, verified end-to-end, and gated to the Enterprise plan tier.
+
+### Changes
+
+**Database**
+- `020_integrations.sql` — New `integrations` table with org/provider unique constraint, stores OAuth tokens, webhook URLs, channel info
+- `021_salesforce_integration.sql` — Extended provider check constraint to include `salesforce`, added `refresh_token` and `instance_url` columns
+
+**Backend — Slack Integration**
+- New `integrations.py` router with full OAuth flow:
+  - `GET /integrations/slack/install` — generates HMAC-signed state, returns Slack authorize URL
+  - `GET /integrations/slack/callback` — exchanges code for token, stores integration
+  - `GET /integrations/slack/status` — returns connection status for frontend
+  - `DELETE /integrations/slack` — disconnects and removes integration
+  - `POST /integrations/slack/test` — sends test message to connected channel
+- `notification_service.py` — Added Slack Block Kit message builder with scan summary (images analyzed, matches, violations, compliance rate) and top violations list
+- Dual delivery: `chat.postMessage` API (primary) with incoming webhook fallback
+- Mounted router in `main.py`
+
+**Backend — Salesforce Integration**
+- Added to existing `integrations.py` router:
+  - `GET /integrations/salesforce/install` — Salesforce OAuth consent redirect
+  - `GET /integrations/salesforce/callback` — exchanges code for access + refresh tokens, fetches org name
+  - `GET /integrations/salesforce/status` — returns connection status
+  - `DELETE /integrations/salesforce` — disconnects
+  - `POST /integrations/salesforce/test` — creates test Task in Salesforce
+- `notification_service.py` — Added Salesforce REST API integration:
+  - Automatic token refresh on 401 (stores refreshed token back to DB)
+  - Creates Tasks via `/services/data/v59.0/sobjects/Task`
+  - High priority for violations, Normal for all-clear scans
+  - Detailed description with scan stats and top 15 violations
+
+**Backend — Shared Infrastructure**
+- `config.py` — Added `SLACK_CLIENT_ID`, `SLACK_CLIENT_SECRET`, `SLACK_SIGNING_SECRET`, `SALESFORCE_CLIENT_ID`, `SALESFORCE_CLIENT_SECRET` settings
+- `plan_enforcement.py` — Added `check_slack_notifications()` and `check_salesforce_notifications()` gates
+- `config.py` plan limits — Added `salesforce_notifications` flag (Enterprise-only)
+- `scanning.py` — Wired both `notify_slack_scan_complete()` and `notify_salesforce_scan_complete()` into `_send_scan_notifications()` post-scan hook
+- `.env.example` and `.do/app.yaml` — Added all 5 new env vars
+
+**Frontend**
+- `api.ts` — Added `SlackStatus`, `SalesforceStatus` interfaces and API functions for install/status/disconnect/test for both integrations
+- `settings/page.tsx` — Two new integration cards:
+  - **Slack Integration** card with Slack logo SVG, connect/disconnect/test buttons, workspace + channel display
+  - **Salesforce Integration** card with Salesforce cloud logo SVG, connect/disconnect/test buttons, org name display
+  - Both show green "Connected" badge, loading states, test result feedback
+
+### Architecture Notes
+- Both integrations follow the same pattern: OAuth install → store token → push on scan complete → status/disconnect/test endpoints
+- The `integrations` table is extensible — adding Teams, Jira, etc. is a new provider row with the same OAuth pattern
+- Salesforce tokens auto-refresh on expiry — no manual re-auth needed
+- Slack supports both Bot API (`chat.postMessage`) and Incoming Webhook delivery
+- HMAC-signed OAuth state params prevent CSRF across both flows
+- All integrations are feature-gated via plan limits in `config.py`
+
+### Files Created
+| File | Purpose |
+|------|---------|
+| `backend/app/routers/integrations.py` | OAuth flows for Slack + Salesforce |
+| `supabase/migrations/020_integrations.sql` | Integrations table |
+| `supabase/migrations/021_salesforce_integration.sql` | Salesforce columns + provider constraint |
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `backend/app/config.py` | Slack + Salesforce env vars, `salesforce_notifications` plan flag |
+| `backend/app/plan_enforcement.py` | `check_slack_notifications()`, `check_salesforce_notifications()` |
+| `backend/app/services/notification_service.py` | Slack Block Kit sender, Salesforce Task creator with token refresh |
+| `backend/app/routers/scanning.py` | Wired Slack + Salesforce into post-scan notification hook |
+| `backend/app/main.py` | Mounted integrations router |
+| `backend/.env.example` | 5 new env vars |
+| `.do/app.yaml` | 5 new DigitalOcean env vars |
+| `frontend/lib/api.ts` | Slack + Salesforce API functions and types |
+| `frontend/app/settings/page.tsx` | Two integration cards with full connect/disconnect/test UI |
