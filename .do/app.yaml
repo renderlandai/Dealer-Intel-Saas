@@ -129,3 +129,11 @@ services:
         scope: RUN_TIME
         type: SECRET
         value: "PLACEHOLDER"
+      - key: SALESFORCE_CLIENT_ID
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SALESFORCE_CLIENT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"

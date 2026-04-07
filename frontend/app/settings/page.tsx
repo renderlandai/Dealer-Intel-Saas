@@ -27,8 +27,8 @@ import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage } from "@/lib/api";
-import type { SlackStatus } from "@/lib/api";
+import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage, getSalesforceStatus, startSalesforceInstall, disconnectSalesforce, testSalesforceTask } from "@/lib/api";
+import type { SlackStatus, SalesforceStatus } from "@/lib/api";
 import { orgSettingsSchema } from "@/lib/schemas";
 import { useBillingUsage } from "@/lib/hooks";
 import { useAuth } from "@/lib/auth-context";
@@ -76,6 +76,13 @@ export default function SettingsPage() {
   const [slackTesting, setSlackTesting] = useState(false);
   const [slackTestResult, setSlackTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
+  const [sf, setSf] = useState<SalesforceStatus>({ connected: false });
+  const [sfLoading, setSfLoading] = useState(true);
+  const [sfConnecting, setSfConnecting] = useState(false);
+  const [sfDisconnecting, setSfDisconnecting] = useState(false);
+  const [sfTesting, setSfTesting] = useState(false);
+  const [sfTestResult, setSfTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+
   useEffect(() => {
     getOrgSettings()
       .then((res) => {
@@ -97,9 +104,18 @@ export default function SettingsPage() {
       .catch(() => {})
       .finally(() => setSlackLoading(false));
 
+    getSalesforceStatus()
+      .then(setSf)
+      .catch(() => {})
+      .finally(() => setSfLoading(false));
+
     const params = new URLSearchParams(window.location.search);
     if (params.get("slack") === "connected") {
       getSlackStatus().then(setSlack).catch(() => {});
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    if (params.get("salesforce") === "connected") {
+      getSalesforceStatus().then(setSf).catch(() => {});
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
@@ -242,6 +258,46 @@ export default function SettingsPage() {
       setSlackTestResult({ ok: false, msg: detail });
     } finally {
       setSlackTesting(false);
+    }
+  };
+
+  const handleConnectSalesforce = async () => {
+    setSfConnecting(true);
+    try {
+      const { authorize_url } = await startSalesforceInstall();
+      window.location.href = authorize_url;
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || "Failed to start Salesforce connection";
+      alert(detail);
+      setSfConnecting(false);
+    }
+  };
+
+  const handleDisconnectSalesforce = async () => {
+    if (!confirm("Disconnect Salesforce? Violation alerts will stop syncing.")) return;
+    setSfDisconnecting(true);
+    try {
+      await disconnectSalesforce();
+      setSf({ connected: false });
+      setSfTestResult(null);
+    } catch {
+      alert("Failed to disconnect Salesforce.");
+    } finally {
+      setSfDisconnecting(false);
+    }
+  };
+
+  const handleTestSalesforce = async () => {
+    setSfTesting(true);
+    setSfTestResult(null);
+    try {
+      const result = await testSalesforceTask();
+      setSfTestResult({ ok: true, msg: result.message });
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || "Failed to create test task";
+      setSfTestResult({ ok: false, msg: detail });
+    } finally {
+      setSfTesting(false);
     }
   };
 
@@ -673,6 +729,109 @@ export default function SettingsPage() {
                       <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
                     )}
                     {slackConnecting ? "Connecting..." : "Connect Slack"}
+                  </Button>
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Salesforce Integration */}
+        <Card className="opacity-0 animate-fade-up" style={{ animationFillMode: "forwards", animationDelay: "130ms" }}>
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center bg-secondary border border-border">
+                <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none">
+                  <path d="M10.006 3.003c.927-1.04 2.237-1.693 3.708-1.693 1.87 0 3.468 1.022 4.33 2.54a5.36 5.36 0 0 1 2.113-.434c2.96 0 5.36 2.4 5.36 5.36 0 2.96-2.4 5.36-5.36 5.36-.3 0-.594-.025-.88-.073a4.47 4.47 0 0 1-3.877 2.27c-.596 0-1.166-.118-1.687-.33a4.89 4.89 0 0 1-4.394 2.74c-2.15 0-3.97-1.39-4.62-3.32a4.04 4.04 0 0 1-.85.09c-2.24 0-4.06-1.82-4.06-4.06 0-1.54.86-2.88 2.12-3.57a4.19 4.19 0 0 1-.33-1.63c0-2.33 1.89-4.21 4.21-4.21.95 0 1.82.31 2.53.83l.03.02-.33-.03z" fill="#00A1E0"/>
+                </svg>
+              </div>
+              <div className="flex-1">
+                <CardTitle className="text-base">Salesforce Integration</CardTitle>
+                <CardDescription className="text-xs">
+                  Push scan violations as Tasks into your Salesforce CRM
+                </CardDescription>
+              </div>
+              {sf.connected && (
+                <span className="flex items-center gap-1.5 text-xs text-success font-medium">
+                  <span className="h-1.5 w-1.5 rounded-full bg-success" />
+                  Connected
+                </span>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {sfLoading ? (
+              <div className="h-16 border border-border bg-secondary/20 animate-pulse" />
+            ) : sf.connected ? (
+              <>
+                <div className="flex items-center gap-4 p-4 border border-border bg-secondary/20">
+                  <div className="flex-1">
+                    <p className="text-sm font-medium">{sf.org_name || "Salesforce Org"}</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Violations synced as Tasks
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleTestSalesforce}
+                      disabled={sfTesting}
+                    >
+                      {sfTesting ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Send className="mr-1.5 h-3.5 w-3.5" />
+                      )}
+                      Test
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-destructive hover:text-destructive hover:border-destructive/50"
+                      onClick={handleDisconnectSalesforce}
+                      disabled={sfDisconnecting}
+                    >
+                      <Unplug className="mr-1.5 h-3.5 w-3.5" />
+                      {sfDisconnecting ? "Removing..." : "Disconnect"}
+                    </Button>
+                  </div>
+                </div>
+
+                {sfTestResult && (
+                  <div className={`flex items-center gap-2 ${sfTestResult.ok ? "text-success" : "text-destructive"}`}>
+                    {sfTestResult.ok ? <CheckCircle className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                    <span className="text-sm">{sfTestResult.msg}</span>
+                  </div>
+                )}
+
+                <p className="text-2xs text-muted-foreground">
+                  Scan violations will be created as Tasks in Salesforce automatically after each scan.
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="border border-dashed border-border p-4 flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center bg-secondary/50 border border-border flex-shrink-0">
+                    <MessageSquare className="h-5 w-5 text-muted-foreground" />
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-sm text-muted-foreground">Salesforce is not connected</p>
+                    <p className="text-2xs text-muted-foreground mt-0.5">
+                      Connect Salesforce to push violation alerts as Tasks into your CRM
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={handleConnectSalesforce}
+                    disabled={sfConnecting}
+                  >
+                    {sfConnecting ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    {sfConnecting ? "Connecting..." : "Connect Salesforce"}
                   </Button>
                 </div>
               </>

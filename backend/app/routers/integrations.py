@@ -15,7 +15,7 @@ from slowapi.util import get_remote_address
 from ..auth import AuthUser, get_current_user
 from ..config import get_settings
 from ..database import supabase
-from ..plan_enforcement import OrgPlan, get_org_plan, check_slack_notifications
+from ..plan_enforcement import OrgPlan, get_org_plan, check_slack_notifications, check_salesforce_notifications
 
 log = logging.getLogger("dealer_intel.integrations")
 
@@ -27,14 +27,21 @@ SLACK_OAUTH_AUTHORIZE = "https://slack.com/oauth/v2/authorize"
 SLACK_OAUTH_ACCESS = "https://slack.com/api/oauth.v2.access"
 SLACK_SCOPES = "chat:write,channels:read,incoming-webhook"
 
+SF_OAUTH_AUTHORIZE = "https://login.salesforce.com/services/oauth2/authorize"
+SF_OAUTH_TOKEN = "https://login.salesforce.com/services/oauth2/token"
+SF_SCOPES = "full refresh_token"
 
-def _get_redirect_uri() -> str:
+
+def _get_backend_base() -> str:
     settings = get_settings()
     base = settings.frontend_url.rstrip("/")
     if "localhost" in base:
-        return "http://localhost:8000/api/v1/integrations/slack/callback"
-    return base.replace("dealer-intel-saas.vercel.app",
-                        "dealer-intel-api-c2m2p.ondigitalocean.app") + "/api/v1/integrations/slack/callback"
+        return "http://localhost:8000"
+    return "https://dealer-intel-api-c2m2p.ondigitalocean.app"
+
+
+def _get_redirect_uri() -> str:
+    return _get_backend_base() + "/api/v1/integrations/slack/callback"
 
 
 def _sign_state(org_id: str) -> str:
@@ -201,3 +208,155 @@ async def slack_test(
     if success:
         return {"success": True, "message": "Test message sent to Slack"}
     raise HTTPException(500, "Failed to send test message. Check the Slack connection.")
+
+
+# ─── Salesforce ─────────────────────────────────────────────────
+
+
+def _sf_redirect_uri() -> str:
+    return _get_backend_base() + "/api/v1/integrations/salesforce/callback"
+
+
+@router.get("/salesforce/install", summary="Start Salesforce OAuth flow")
+async def salesforce_install(
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    """Redirect the user to Salesforce's OAuth consent screen."""
+    check_salesforce_notifications(op)
+    settings = get_settings()
+    if not settings.salesforce_client_id:
+        raise HTTPException(500, "Salesforce integration is not configured")
+
+    state = _sign_state(str(user.org_id))
+    params = urlencode({
+        "response_type": "code",
+        "client_id": settings.salesforce_client_id,
+        "redirect_uri": _sf_redirect_uri(),
+        "scope": SF_SCOPES,
+        "state": state,
+    })
+    return {"authorize_url": f"{SF_OAUTH_AUTHORIZE}?{params}"}
+
+
+@router.get("/salesforce/callback", summary="Salesforce OAuth callback")
+async def salesforce_callback(code: str, state: str):
+    """Exchange the authorization code for tokens and store the integration."""
+    org_id = _verify_state(state)
+    settings = get_settings()
+
+    try:
+        resp = httpx.post(SF_OAUTH_TOKEN, data={
+            "grant_type": "authorization_code",
+            "client_id": settings.salesforce_client_id,
+            "client_secret": settings.salesforce_client_secret,
+            "code": code,
+            "redirect_uri": _sf_redirect_uri(),
+        }, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        log.error("Salesforce OAuth token exchange failed: %s", e)
+        return RedirectResponse(f"{settings.frontend_url}/settings?salesforce=error")
+
+    if "error" in data:
+        log.error("Salesforce OAuth error: %s — %s", data.get("error"), data.get("error_description"))
+        return RedirectResponse(f"{settings.frontend_url}/settings?salesforce=error")
+
+    access_token = data.get("access_token", "")
+    refresh_token = data.get("refresh_token", "")
+    instance_url = data.get("instance_url", "")
+
+    # Fetch the org name from Salesforce
+    sf_org_name = ""
+    try:
+        org_resp = httpx.get(
+            f"{instance_url}/services/data/v59.0/query",
+            params={"q": "SELECT Name FROM Organization LIMIT 1"},
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        records = org_resp.json().get("records", [])
+        if records:
+            sf_org_name = records[0].get("Name", "")
+    except Exception:
+        pass
+
+    supabase.table("integrations").upsert({
+        "organization_id": org_id,
+        "provider": "salesforce",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "instance_url": instance_url,
+        "workspace_name": sf_org_name,
+        "connected_at": "now()",
+    }, on_conflict="organization_id,provider").execute()
+
+    log.info("Salesforce connected for org %s — instance '%s', sf_org '%s'",
+             org_id, instance_url, sf_org_name)
+
+    return RedirectResponse(f"{settings.frontend_url}/settings?salesforce=connected")
+
+
+@router.get("/salesforce/status", summary="Get Salesforce integration status")
+async def salesforce_status(user: AuthUser = Depends(get_current_user)):
+    """Return current Salesforce integration status for the org."""
+    try:
+        result = supabase.table("integrations")\
+            .select("workspace_name, instance_url, connected_at")\
+            .eq("organization_id", str(user.org_id))\
+            .eq("provider", "salesforce")\
+            .maybe_single()\
+            .execute()
+    except Exception:
+        return {"connected": False}
+
+    if not result.data:
+        return {"connected": False}
+
+    return {
+        "connected": True,
+        "org_name": result.data.get("workspace_name", ""),
+        "instance_url": result.data.get("instance_url", ""),
+        "connected_at": result.data.get("connected_at"),
+    }
+
+
+@router.delete("/salesforce", summary="Disconnect Salesforce")
+async def salesforce_disconnect(user: AuthUser = Depends(get_current_user)):
+    """Remove the Salesforce integration for the org."""
+    supabase.table("integrations")\
+        .delete()\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "salesforce")\
+        .execute()
+
+    log.info("Salesforce disconnected for org %s", user.org_id)
+    return {"status": "disconnected"}
+
+
+@router.post("/salesforce/test", summary="Create a test Salesforce Task")
+@limiter.limit("5/minute")
+async def salesforce_test(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    """Create a test Task in Salesforce to verify the connection."""
+    check_salesforce_notifications(op)
+
+    result = supabase.table("integrations")\
+        .select("access_token, refresh_token, instance_url")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "salesforce")\
+        .maybe_single()\
+        .execute()
+
+    if not result.data:
+        raise HTTPException(400, "Salesforce is not connected. Connect Salesforce first.")
+
+    from ..services.notification_service import send_salesforce_test
+
+    success = send_salesforce_test(organization_id=user.org_id)
+    if success:
+        return {"success": True, "message": "Test task created in Salesforce"}
+    raise HTTPException(500, "Failed to create test task. Check the Salesforce connection.")

@@ -459,3 +459,187 @@ def send_slack_test(*, access_token: str, channel_id: str, webhook_url: str) -> 
     elif webhook_url:
         return _post_slack_webhook(webhook_url=webhook_url, blocks=blocks)
     return False
+
+
+# ─── Salesforce ─────────────────────────────────────────────────
+
+
+def _get_salesforce_integration(organization_id: UUID) -> Optional[Dict[str, Any]]:
+    """Return the Salesforce integration row for the org, or None."""
+    try:
+        result = supabase.table("integrations")\
+            .select("access_token, refresh_token, instance_url")\
+            .eq("organization_id", str(organization_id))\
+            .eq("provider", "salesforce")\
+            .maybe_single()\
+            .execute()
+        return result.data
+    except Exception:
+        return None
+
+
+def _refresh_salesforce_token(organization_id: UUID, refresh_token: str) -> Optional[str]:
+    """Refresh an expired Salesforce access token. Returns new token or None."""
+    settings = get_settings()
+    try:
+        resp = httpx.post("https://login.salesforce.com/services/oauth2/token", data={
+            "grant_type": "refresh_token",
+            "client_id": settings.salesforce_client_id,
+            "client_secret": settings.salesforce_client_secret,
+            "refresh_token": refresh_token,
+        }, timeout=15)
+        data = resp.json()
+        new_token = data.get("access_token")
+        if not new_token:
+            log.error("Salesforce token refresh failed: %s", data.get("error"))
+            return None
+
+        supabase.table("integrations")\
+            .update({"access_token": new_token})\
+            .eq("organization_id", str(organization_id))\
+            .eq("provider", "salesforce")\
+            .execute()
+
+        log.info("Salesforce token refreshed for org %s", organization_id)
+        return new_token
+    except Exception as e:
+        log.error("Salesforce token refresh error: %s", e)
+        return None
+
+
+def _sf_api_request(
+    *,
+    organization_id: UUID,
+    integration: Dict[str, Any],
+    method: str,
+    path: str,
+    json_body: Optional[Dict] = None,
+) -> Optional[httpx.Response]:
+    """Make a Salesforce REST API request with automatic token refresh on 401."""
+    instance_url = integration["instance_url"]
+    token = integration["access_token"]
+    url = f"{instance_url}{path}"
+
+    for attempt in range(2):
+        try:
+            resp = httpx.request(
+                method,
+                url,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=json_body,
+                timeout=15,
+            )
+            if resp.status_code == 401 and attempt == 0:
+                new_token = _refresh_salesforce_token(organization_id, integration["refresh_token"])
+                if new_token:
+                    token = new_token
+                    continue
+                return None
+            return resp
+        except Exception as e:
+            log.error("Salesforce API request failed: %s", e)
+            return None
+    return None
+
+
+def _create_sf_task(
+    *,
+    organization_id: UUID,
+    integration: Dict[str, Any],
+    subject: str,
+    description: str,
+    priority: str = "Normal",
+) -> bool:
+    """Create a Task record in Salesforce."""
+    resp = _sf_api_request(
+        organization_id=organization_id,
+        integration=integration,
+        method="POST",
+        path="/services/data/v59.0/sobjects/Task",
+        json_body={
+            "Subject": subject,
+            "Description": description,
+            "Priority": priority,
+            "Status": "Open",
+            "Type": "Other",
+        },
+    )
+    if resp and resp.status_code in (200, 201):
+        log.info("Salesforce Task created for org %s: %s", organization_id, subject)
+        return True
+    if resp:
+        log.error("Salesforce Task creation failed %d: %s", resp.status_code, resp.text[:300])
+    return False
+
+
+def notify_salesforce_scan_complete(
+    *,
+    organization_id: UUID,
+    scan_source: str = "",
+    summary: Dict[str, Any],
+    violations: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Create a Salesforce Task for scan results if connected. Returns True on success."""
+    integration = _get_salesforce_integration(organization_id)
+    if not integration:
+        return False
+
+    violations = violations or []
+    violation_count = len(violations)
+    total = summary.get("total_images", 0)
+    compliance_rate = summary.get("compliance_rate", 0)
+    channel = (scan_source or "scan").replace("_", " ").title()
+    org_name = _get_org_name(organization_id)
+
+    if violation_count > 0:
+        subject = f"[Dealer Intel] {channel} Scan — {violation_count} violation{'s' if violation_count != 1 else ''} found"
+        priority = "High"
+    else:
+        subject = f"[Dealer Intel] {channel} Scan — All Clear"
+        priority = "Normal"
+
+    lines = [
+        f"Organization: {org_name}",
+        f"Channel: {channel}",
+        f"Images Analyzed: {total}",
+        f"Matches: {summary.get('matches', 0)}",
+        f"Violations: {violation_count}",
+        f"Compliance Rate: {compliance_rate}%",
+    ]
+
+    if violations:
+        lines.append("")
+        lines.append("--- Top Violations ---")
+        for v in violations[:15]:
+            lines.append(
+                f"• {v.get('asset_name', '?')} at {v.get('distributor_name', '?')} "
+                f"— {v.get('confidence_score', 0)}% confidence"
+            )
+        if violation_count > 15:
+            lines.append(f"...and {violation_count - 15} more")
+
+    description = "\n".join(lines)
+
+    return _create_sf_task(
+        organization_id=organization_id,
+        integration=integration,
+        subject=subject,
+        description=description,
+        priority=priority,
+    )
+
+
+def send_salesforce_test(*, organization_id: UUID) -> bool:
+    """Create a test Task in Salesforce."""
+    integration = _get_salesforce_integration(organization_id)
+    if not integration:
+        return False
+
+    return _create_sf_task(
+        organization_id=organization_id,
+        integration=integration,
+        subject="[Dealer Intel] Connection Test — Salesforce Connected",
+        description="This is a test task from Dealer Intel.\n\n"
+                    "Scan results and violation alerts will appear as Tasks automatically.",
+        priority="Low",
+    )

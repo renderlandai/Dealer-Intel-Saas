@@ -162,6 +162,13 @@ class Settings(BaseSettings):
     slack_client_secret: str = Field(default="", description="Slack App OAuth Client Secret")
     slack_signing_secret: str = Field(default="", description="Slack App Signing Secret")
     
+    # ===========================================
+    # Salesforce Integration (OAuth)
+    # ===========================================
+    
+    salesforce_client_id: str = Field(default="", description="Salesforce Connected App Consumer Key")
+    salesforce_client_secret: str = Field(default="", description="Salesforce Connected App Consumer Secret")
+    
     class Config:
         env_file = ".env"
         case_sensitive = False
@@ -225,6 +232,7 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
         "report_branding": False,
         "email_notifications": False,
         "slack_notifications": False,
+        "salesforce_notifications": False,
         "compliance_trends": False,
         "adaptive_calibration_active": False,
         "api_access": False,
@@ -250,6 +258,7 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
         "report_branding": False,
         "email_notifications": False,
         "slack_notifications": False,
+        "salesforce_notifications": False,
         "compliance_trends": False,
         "adaptive_calibration_active": False,
         "api_access": False,
@@ -275,6 +284,7 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
         "report_branding": True,
         "email_notifications": True,
         "slack_notifications": False,
+        "salesforce_notifications": False,
         "compliance_trends": False,
         "adaptive_calibration_active": True,
         "api_access": False,
@@ -300,6 +310,7 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
         "report_branding": True,
         "email_notifications": True,
         "slack_notifications": False,
+        "salesforce_notifications": False,
         "compliance_trends": True,
         "adaptive_calibration_active": True,
         "api_access": False,
@@ -325,6 +336,7 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
         "report_branding": True,
         "email_notifications": True,
         "slack_notifications": True,
+        "salesforce_notifications": True,
         "compliance_trends": True,
         "adaptive_calibration_active": True,
         "api_access": True,

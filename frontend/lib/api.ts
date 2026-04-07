@@ -806,6 +806,33 @@ export const testSlackMessage = async (): Promise<{ success: boolean; message: s
   return data;
 };
 
+export interface SalesforceStatus {
+  connected: boolean;
+  org_name?: string;
+  instance_url?: string;
+  connected_at?: string;
+}
+
+export const getSalesforceStatus = async (): Promise<SalesforceStatus> => {
+  const { data } = await api.get("/integrations/salesforce/status");
+  return data;
+};
+
+export const startSalesforceInstall = async (): Promise<{ authorize_url: string }> => {
+  const { data } = await api.get("/integrations/salesforce/install");
+  return data;
+};
+
+export const disconnectSalesforce = async (): Promise<{ status: string }> => {
+  const { data } = await api.delete("/integrations/salesforce");
+  return data;
+};
+
+export const testSalesforceTask = async (): Promise<{ success: boolean; message: string }> => {
+  const { data } = await api.post("/integrations/salesforce/test");
+  return data;
+};
+
 // ── Billing ────────────────────────────────────────────────────
 
 export const getBillingUsage = async (): Promise<BillingUsage> => {
