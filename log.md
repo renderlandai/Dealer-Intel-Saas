@@ -1709,6 +1709,133 @@ Major frontend visual refresh across the entire application. Replaced the generi
 
 ---
 
+## 2026-04-06 (Monday) — Landing Page Stats Strip Accuracy Fix
+
+### Summary
+Replaced a hardcoded, unsubstantiated "99.2% Detection Accuracy" stat on the landing page with an honest capability descriptor. The original figure had no backing data — no model benchmark, no aggregate metric, no API query — it was a static marketing string. Updated the stat to "Smart — Visual Detection," which accurately describes the system's AI-powered visual matching capability without making a false precision claim.
+
+### Changes
+
+- **`frontend/app/landing/page.tsx`** — Changed the stats strip entry from `{ value: "99.2%", label: "Detection Accuracy" }` to `{ value: "Smart", label: "Visual Detection" }`. The other three stats ("4 Channels Monitored", "< 5 min Setup Time", "24/7 Automated Scanning") remain unchanged as they are factual product capabilities.
+
+### Rationale
+
+The detection system (`ai_service.py`) uses an ensemble of vision-LLM comparison, perceptual hashing, screenshot detection with tiling, compliance analysis, and gated verification — returning per-scan confidence scores (0–100). There is no global accuracy metric aggregated across scans. Claiming "99.2%" implied a measured benchmark that doesn't exist. The new label describes the capability honestly and fits the pattern of the other stats in the strip.
+
+---
+
+## 2026-04-06 (Monday) — Pilot Readiness: Security, UX & Hardening
+
+### Summary
+
+Comprehensive pilot-readiness review and fix pass. Resolved all P0 blockers (broken invite flow, tenant isolation gaps, developer-facing error messages) and all P1 high-priority issues (expired token handling, broken endpoint, scheduler enforcement, stale scan cleanup). Built a fully functional header with Cmd+K command palette, notification dropdown, and user menu. Enabled GitHub branch protection to gate deployments behind CI.
+
+### P0 Blockers Fixed
+
+#### Invite Flow for New Users
+
+**Problem:** `/invite/[token]` was not in `PUBLIC_PATHS`, so unauthenticated users clicking an invite link were silently redirected to `/landing` and the invite token was lost. The invite page also required authentication to render, creating a dead end for new users.
+
+**Changes:**
+
+- **`frontend/lib/auth-context.tsx`** — Added `isPublicPath()` helper that matches the static `PUBLIC_PATHS` array plus any path starting with `/invite/`. Replaced all three `PUBLIC_PATHS.includes(pathname)` checks with `isPublicPath(pathname)`.
+- **`frontend/components/layout/auth-gate.tsx`** — Switched from importing `PUBLIC_PATHS` to importing `isPublicPath`. Auth gate now lets invite pages render without the sidebar/dashboard shell.
+- **`frontend/app/invite/[token]/page.tsx`** — Added full unauthenticated state: loading spinner while auth resolves, then a "Sign In Required" screen with Sign In and Create Account buttons that pass `redirect=/invite/{token}` as a query parameter. Authenticated users see the existing accept flow unchanged.
+
+#### Tenant Isolation Gaps
+
+**Problem:** Two backend code paths queried data without scoping by `organization_id`, allowing potential cross-tenant data access. A third code path created a scan job before validating campaign ownership, leaving orphaned records on failure.
+
+**Changes:**
+
+- **`backend/app/routers/campaigns.py`** — `start_campaign_scan` now filters the campaign query by `.eq("organization_id", str(user.org_id))` and scopes the distributor query by `org_id` when specific `distributor_ids` are provided.
+- **`backend/app/routers/scanning.py`** — `_send_scan_notifications` now queries violations by `.in_("discovered_image_id", img_ids)` scoped to the images from the specific scan job, instead of querying all violations globally and filtering in Python.
+- **`backend/app/routers/scanning.py`** — Moved campaign ownership validation before scan job insertion in `start_scan`, preventing orphaned `pending` scan jobs on validation failure.
+
+#### Developer Error Messages
+
+**Problem:** The dashboard error banner showed "Make sure the backend is running on port 8000" and `alert()` was used for report download failures — both inappropriate for pilot users.
+
+**Changes:**
+
+- **`frontend/app/page.tsx`** — Replaced developer message with "We're having trouble reaching the server. Some data may be incomplete." Replaced `alert()` with an inline `downloadError` state variable that renders a red text message below the download buttons.
+
+### P1 High Priority Fixed
+
+#### 401 Token Refresh/Retry
+
+**Problem:** The API client cached session tokens for 30 seconds with no mechanism to handle 401 responses. If a Supabase JWT expired during a long demo session, all API calls failed until the user manually refreshed the page.
+
+**Changes:**
+
+- **`frontend/lib/api.ts`** — Added an Axios response interceptor that catches 401 errors, calls `supabase.auth.refreshSession()`, busts the cached session promise, retries the original request with the new token, and queues concurrent requests during the refresh to avoid duplicate refresh calls.
+
+#### Broken `quick_scan` Endpoint
+
+**Problem:** The `quick_scan` endpoint called `start_scan()` with wrong arguments — missing `request: Request` and `op: OrgPlan` dependencies — causing a `TypeError` at runtime.
+
+**Changes:**
+
+- **`backend/app/routers/scanning.py`** — Added `request: Request` and `op: OrgPlan = Depends(get_org_plan)` as proper FastAPI dependencies. Updated the call to pass all four arguments. Removed the invalid `organization_id` field from `ScanJobCreate`.
+
+#### Scheduled Scans Bypass Plan Enforcement
+
+**Problem:** `_trigger_scan` in the scheduler service created scan jobs without checking trial expiration, channel allowlists, or monthly scan quotas. A free-tier org with a leftover schedule could scan indefinitely.
+
+**Changes:**
+
+- **`backend/app/services/scheduler_service.py`** — Added plan enforcement gate inside `_trigger_scan()` that runs before scan job creation: checks trial expiration, validates the scan source against the plan's `allowed_channels`, and counts monthly scans against `max_scans_per_month`. All checks gracefully skip the scan with an info-level log and update schedule timestamps for the next run.
+
+#### Stale Scan Cleanup Timestamp
+
+**Problem:** `_cleanup_stale_scans()` compared against `created_at` for running/analyzing scans. Since the scanning pipeline calls `_heartbeat()` to update `updated_at`, long-running but healthy scans were auto-failed after 30 minutes from creation.
+
+**Changes:**
+
+- **`backend/app/services/scheduler_service.py`** — Changed `.lt("created_at", running_cutoff)` to `.lt("updated_at", running_cutoff)` for running/analyzing scan cleanup.
+
+### Header Controls — Full Rewrite
+
+**Problem:** The search bar, notification bell, and user avatar in the dashboard header were purely decorative — no click handlers, no state, no functionality. Every pilot user would click these and nothing would happen.
+
+**Changes:**
+
+- **`frontend/components/layout/header.tsx`** — Complete rewrite (55 → 660 lines).
+
+**Command Palette (Cmd+K):**
+- Search bar is now a clickable trigger that opens a full-screen command palette overlay.
+- Responds to `Cmd+K` / `Ctrl+K` keyboard shortcut globally.
+- Fetches campaigns, distributors, scan jobs, matches, and alerts via React Query (with `enabled: open` so data is only fetched when the palette is visible, 30s stale time shared with the rest of the app).
+- Groups results by category (Pages, Campaigns & Creatives, Distributors, Scans, Matches, Alerts) with result counts.
+- Each data result shows a label, metadata sublabel, and color-coded status dot.
+- Full keyboard navigation: arrow keys, Enter to navigate, Escape to close.
+- Auto-scrolls selected items into view.
+
+**Notification Dropdown:**
+- Shows real unread count from `useUnreadAlertCount` (red badge, hidden when 0).
+- Dropdown displays 5 most recent alerts from `useRecentAlerts` with severity icons, titles, timestamps, and unread indicators.
+- Clicking an alert navigates to the match detail page (or `/alerts` if no match linked).
+- "Mark all read" button wired to `useMarkAllAlertsRead` mutation.
+- Empty state when no alerts exist. "View all alerts" footer link.
+
+**User Menu Dropdown:**
+- Displays the user's initial (from email) in an avatar circle.
+- Dropdown shows email, with links to Settings and Billing.
+- Sign out button with destructive hover styling, wired to auth context's `signOut`.
+
+All dropdowns close on click-outside via a shared `useClickOutside` hook.
+
+### Build Fix
+
+**Problem:** Vercel deployment failed with two TypeScript errors.
+
+**Changes:**
+
+- **`frontend/app/invite/[token]/page.tsx`** — Replaced `<Button asChild>` (not supported by the Button component) with `<Link className={buttonVariants(...)}>`.
+- **`frontend/app/page.tsx`** — Fixed `ChannelCoverage` field reference from `.count` to `.match_count`.
+
+---
+
 ## Upcoming Software Connections
 
 Planned integrations to extend the platform's reach, reduce setup friction, and close the compliance-to-action loop.

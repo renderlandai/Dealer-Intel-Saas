@@ -154,6 +154,14 @@ class Settings(BaseSettings):
     resend_api_key: str = Field(default="", description="Resend API key for transactional emails")
     resend_from_email: str = Field(default="Dealer Intel <notifications@resend.dev>", description="From address for notification emails")
     
+    # ===========================================
+    # Slack Integration (OAuth)
+    # ===========================================
+    
+    slack_client_id: str = Field(default="", description="Slack App OAuth Client ID")
+    slack_client_secret: str = Field(default="", description="Slack App OAuth Client Secret")
+    slack_signing_secret: str = Field(default="", description="Slack App Signing Secret")
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

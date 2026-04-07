@@ -117,3 +117,15 @@ services:
       - key: FRONTEND_URL
         scope: RUN_TIME
         value: "https://dealer-intel-saas.vercel.app"
+      - key: SLACK_CLIENT_ID
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SLACK_CLIENT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SLACK_SIGNING_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"

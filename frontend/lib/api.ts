@@ -777,6 +777,35 @@ export const deleteOrgLogo = async (orgId?: string): Promise<{ message: string }
   return data;
 };
 
+// ── Integrations ───────────────────────────────────────────────
+
+export interface SlackStatus {
+  connected: boolean;
+  workspace_name?: string;
+  channel_name?: string;
+  connected_at?: string;
+}
+
+export const getSlackStatus = async (): Promise<SlackStatus> => {
+  const { data } = await api.get("/integrations/slack/status");
+  return data;
+};
+
+export const startSlackInstall = async (): Promise<{ authorize_url: string }> => {
+  const { data } = await api.get("/integrations/slack/install");
+  return data;
+};
+
+export const disconnectSlack = async (): Promise<{ status: string }> => {
+  const { data } = await api.delete("/integrations/slack");
+  return data;
+};
+
+export const testSlackMessage = async (): Promise<{ success: boolean; message: string }> => {
+  const { data } = await api.post("/integrations/slack/test");
+  return data;
+};
+
 // ── Billing ────────────────────────────────────────────────────
 
 export const getBillingUsage = async (): Promise<BillingUsage> => {

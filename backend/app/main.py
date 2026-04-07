@@ -15,7 +15,7 @@ from .logging_config import setup_logging
 from contextlib import asynccontextmanager
 from fastapi import Depends
 from .auth import AuthUser, get_current_user
-from .routers import campaigns, distributors, matches, dashboard, scanning, feedback, reports, organizations, schedules, billing, team, alerts, compliance_rules
+from .routers import campaigns, distributors, matches, dashboard, scanning, feedback, reports, organizations, schedules, billing, team, alerts, compliance_rules, integrations
 from .services import scheduler_service
 
 settings = get_settings()
@@ -103,6 +103,7 @@ app.include_router(billing.router, prefix="/api/v1")
 app.include_router(team.router, prefix="/api/v1")
 app.include_router(alerts.router, prefix="/api/v1")
 app.include_router(compliance_rules.router, prefix="/api/v1")
+app.include_router(integrations.router, prefix="/api/v1")
 
 
 if settings.enable_dangerous_endpoints:
@@ -168,6 +169,7 @@ async def api_root():
             "team": "/api/v1/team",
             "alerts": "/api/v1/alerts",
             "compliance-rules": "/api/v1/compliance-rules",
+            "integrations": "/api/v1/integrations",
         }
     }
 

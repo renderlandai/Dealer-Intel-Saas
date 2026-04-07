@@ -19,12 +19,16 @@ import {
   ArrowRight,
   Clock,
   Gauge,
+  MessageSquare,
+  Unplug,
+  Loader2,
 } from "lucide-react";
 import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession } from "@/lib/api";
+import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage } from "@/lib/api";
+import type { SlackStatus } from "@/lib/api";
 import { orgSettingsSchema } from "@/lib/schemas";
 import { useBillingUsage } from "@/lib/hooks";
 import { useAuth } from "@/lib/auth-context";
@@ -65,6 +69,13 @@ export default function SettingsPage() {
   const [sendingTest, setSendingTest] = useState(false);
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
+  const [slack, setSlack] = useState<SlackStatus>({ connected: false });
+  const [slackLoading, setSlackLoading] = useState(true);
+  const [slackConnecting, setSlackConnecting] = useState(false);
+  const [slackDisconnecting, setSlackDisconnecting] = useState(false);
+  const [slackTesting, setSlackTesting] = useState(false);
+  const [slackTestResult, setSlackTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+
   useEffect(() => {
     getOrgSettings()
       .then((res) => {
@@ -80,6 +91,17 @@ export default function SettingsPage() {
       })
       .catch(() => {})
       .finally(() => setLoading(false));
+
+    getSlackStatus()
+      .then(setSlack)
+      .catch(() => {})
+      .finally(() => setSlackLoading(false));
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("slack") === "connected") {
+      getSlackStatus().then(setSlack).catch(() => {});
+      window.history.replaceState({}, "", window.location.pathname);
+    }
   }, []);
 
   const handleSaveName = async () => {
@@ -182,6 +204,46 @@ export default function SettingsPage() {
   };
 
   const emailChanged = notifyEmail.trim() !== savedEmail;
+
+  const handleConnectSlack = async () => {
+    setSlackConnecting(true);
+    try {
+      const { authorize_url } = await startSlackInstall();
+      window.location.href = authorize_url;
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || "Failed to start Slack connection";
+      alert(detail);
+      setSlackConnecting(false);
+    }
+  };
+
+  const handleDisconnectSlack = async () => {
+    if (!confirm("Disconnect Slack? You will stop receiving notifications in this channel.")) return;
+    setSlackDisconnecting(true);
+    try {
+      await disconnectSlack();
+      setSlack({ connected: false });
+      setSlackTestResult(null);
+    } catch {
+      alert("Failed to disconnect Slack.");
+    } finally {
+      setSlackDisconnecting(false);
+    }
+  };
+
+  const handleTestSlack = async () => {
+    setSlackTesting(true);
+    setSlackTestResult(null);
+    try {
+      const result = await testSlackMessage();
+      setSlackTestResult({ ok: true, msg: result.message });
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || "Failed to send test message";
+      setSlackTestResult({ ok: false, msg: detail });
+    } finally {
+      setSlackTesting(false);
+    }
+  };
 
   const handleUpload = async (file: File) => {
     setUploading(true);
@@ -510,6 +572,112 @@ export default function SettingsPage() {
               )}
             </CardContent>
           )}
+        </Card>
+
+        {/* Slack Integration */}
+        <Card className="opacity-0 animate-fade-up" style={{ animationFillMode: "forwards", animationDelay: "112ms" }}>
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center bg-secondary border border-border">
+                <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none">
+                  <path d="M5.042 15.165a2.528 2.528 0 0 1-2.52 2.523A2.528 2.528 0 0 1 0 15.165a2.527 2.527 0 0 1 2.522-2.52h2.52v2.52zm1.271 0a2.527 2.527 0 0 1 2.521-2.52 2.527 2.527 0 0 1 2.521 2.52v6.313A2.528 2.528 0 0 1 8.834 24a2.528 2.528 0 0 1-2.521-2.522v-6.313z" fill="#E01E5A"/>
+                  <path d="M8.834 5.042a2.528 2.528 0 0 1-2.521-2.52A2.528 2.528 0 0 1 8.834 0a2.528 2.528 0 0 1 2.521 2.522v2.52H8.834zm0 1.271a2.527 2.527 0 0 1 2.521 2.521 2.527 2.527 0 0 1-2.521 2.521H2.522A2.528 2.528 0 0 1 0 8.834a2.528 2.528 0 0 1 2.522-2.521h6.312z" fill="#36C5F0"/>
+                  <path d="M18.956 8.834a2.528 2.528 0 0 1 2.522-2.521A2.528 2.528 0 0 1 24 8.834a2.528 2.528 0 0 1-2.522 2.521h-2.522V8.834zm-1.27 0a2.527 2.527 0 0 1-2.522 2.521 2.527 2.527 0 0 1-2.521-2.521V2.522A2.527 2.527 0 0 1 15.165 0a2.528 2.528 0 0 1 2.521 2.522v6.312z" fill="#2EB67D"/>
+                  <path d="M15.165 18.956a2.528 2.528 0 0 1 2.521 2.522A2.528 2.528 0 0 1 15.165 24a2.527 2.527 0 0 1-2.521-2.522v-2.522h2.521zm0-1.27a2.527 2.527 0 0 1-2.521-2.522 2.527 2.527 0 0 1 2.521-2.521h6.313A2.528 2.528 0 0 1 24 15.165a2.528 2.528 0 0 1-2.522 2.521h-6.313z" fill="#ECB22E"/>
+                </svg>
+              </div>
+              <div className="flex-1">
+                <CardTitle className="text-base">Slack Integration</CardTitle>
+                <CardDescription className="text-xs">
+                  Receive scan results and violation alerts in a Slack channel
+                </CardDescription>
+              </div>
+              {slack.connected && (
+                <span className="flex items-center gap-1.5 text-xs text-success font-medium">
+                  <span className="h-1.5 w-1.5 rounded-full bg-success" />
+                  Connected
+                </span>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {slackLoading ? (
+              <div className="h-16 border border-border bg-secondary/20 animate-pulse" />
+            ) : slack.connected ? (
+              <>
+                <div className="flex items-center gap-4 p-4 border border-border bg-secondary/20">
+                  <div className="flex-1">
+                    <p className="text-sm font-medium">{slack.workspace_name || "Slack Workspace"}</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      Posting to <span className="font-mono text-foreground">#{slack.channel_name || "channel"}</span>
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleTestSlack}
+                      disabled={slackTesting}
+                    >
+                      {slackTesting ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Send className="mr-1.5 h-3.5 w-3.5" />
+                      )}
+                      Test
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-destructive hover:text-destructive hover:border-destructive/50"
+                      onClick={handleDisconnectSlack}
+                      disabled={slackDisconnecting}
+                    >
+                      <Unplug className="mr-1.5 h-3.5 w-3.5" />
+                      {slackDisconnecting ? "Removing..." : "Disconnect"}
+                    </Button>
+                  </div>
+                </div>
+
+                {slackTestResult && (
+                  <div className={`flex items-center gap-2 ${slackTestResult.ok ? "text-success" : "text-destructive"}`}>
+                    {slackTestResult.ok ? <CheckCircle className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                    <span className="text-sm">{slackTestResult.msg}</span>
+                  </div>
+                )}
+
+                <p className="text-2xs text-muted-foreground">
+                  Scan summaries and violation alerts will be posted to this channel automatically.
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="border border-dashed border-border p-4 flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center bg-secondary/50 border border-border flex-shrink-0">
+                    <MessageSquare className="h-5 w-5 text-muted-foreground" />
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-sm text-muted-foreground">Slack is not connected</p>
+                    <p className="text-2xs text-muted-foreground mt-0.5">
+                      Connect a Slack workspace to receive scan alerts in a channel
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={handleConnectSlack}
+                    disabled={slackConnecting}
+                  >
+                    {slackConnecting ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    {slackConnecting ? "Connecting..." : "Connect Slack"}
+                  </Button>
+                </div>
+              </>
+            )}
+          </CardContent>
         </Card>
 
         {/* Report Theme */}

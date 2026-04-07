@@ -1,4 +1,4 @@
-"""Email notification service via Resend — single HTTP POST, zero SMTP config."""
+"""Notification service — email via Resend + Slack via Bot API."""
 import logging
 from typing import Any, Dict, List, Optional
 from uuid import UUID
@@ -11,6 +11,7 @@ from ..database import supabase
 log = logging.getLogger("dealer_intel.notifications")
 
 RESEND_URL = "https://api.resend.com/emails"
+SLACK_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 
 
 def _get_org_notify_email(organization_id: UUID) -> Optional[str]:
@@ -294,3 +295,167 @@ def send_test_email(organization_id: UUID) -> dict:
         masked = to_email[:3] + "***" + to_email[to_email.index("@"):] if "@" in to_email else to_email[:3] + "***"
         return {"success": True, "message": f"Test email sent to {masked}"}
     return {"success": False, "error": "Failed to send email. Check the server logs for details."}
+
+
+# ─── Slack ──────────────────────────────────────────────────────
+
+
+def _get_slack_integration(organization_id: UUID) -> Optional[Dict[str, Any]]:
+    """Return the Slack integration row for the org, or None."""
+    try:
+        result = supabase.table("integrations")\
+            .select("access_token, channel_id, webhook_url")\
+            .eq("organization_id", str(organization_id))\
+            .eq("provider", "slack")\
+            .maybe_single()\
+            .execute()
+        return result.data
+    except Exception:
+        return None
+
+
+def _post_slack_message(*, access_token: str, channel_id: str, blocks: list) -> bool:
+    """Post a Block Kit message via Slack's chat.postMessage API."""
+    try:
+        resp = httpx.post(
+            SLACK_POST_MESSAGE,
+            headers={"Authorization": f"Bearer {access_token}",
+                     "Content-Type": "application/json; charset=utf-8"},
+            json={"channel": channel_id, "blocks": blocks},
+            timeout=10,
+        )
+        data = resp.json()
+        if data.get("ok"):
+            log.info("Slack message sent to channel %s", channel_id)
+            return True
+        log.error("Slack API error: %s", data.get("error"))
+        return False
+    except Exception as e:
+        log.error("Slack message failed: %s", e)
+        return False
+
+
+def _post_slack_webhook(*, webhook_url: str, blocks: list) -> bool:
+    """Fallback: post via Incoming Webhook if channel_id is missing."""
+    try:
+        resp = httpx.post(webhook_url, json={"blocks": blocks}, timeout=10)
+        if resp.status_code == 200:
+            log.info("Slack webhook message sent")
+            return True
+        log.error("Slack webhook error %d: %s", resp.status_code, resp.text[:200])
+        return False
+    except Exception as e:
+        log.error("Slack webhook failed: %s", e)
+        return False
+
+
+def _build_scan_slack_blocks(
+    *,
+    org_name: str,
+    scan_source: str,
+    summary: Dict[str, Any],
+    violations: List[Dict[str, Any]],
+) -> list:
+    """Build Slack Block Kit blocks for a scan report."""
+    total = summary.get("total_images", 0)
+    matches = summary.get("matches", 0)
+    violation_count = len(violations)
+    compliance_rate = summary.get("compliance_rate", 0)
+    channel = (scan_source or "scan").replace("_", " ").title()
+
+    status_emoji = ":white_check_mark:" if violation_count == 0 else ":warning:"
+    status_text = "all clear" if violation_count == 0 else f"{violation_count} violation{'s' if violation_count != 1 else ''} found"
+
+    blocks: list = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": f"{status_emoji} {channel} Scan Complete", "emoji": True},
+        },
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{org_name}* — {status_text}"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Images Analyzed:*\n{total}"},
+                {"type": "mrkdwn", "text": f"*Matches:*\n{matches}"},
+                {"type": "mrkdwn", "text": f"*Violations:*\n{violation_count}"},
+                {"type": "mrkdwn", "text": f"*Compliance:*\n{compliance_rate}%"},
+            ],
+        },
+    ]
+
+    if violations:
+        lines = "\n".join(
+            f"• *{v.get('asset_name', '?')}* at {v.get('distributor_name', '?')} "
+            f"— {v.get('confidence_score', 0)}% confidence"
+            for v in violations[:10]
+        )
+        if violation_count > 10:
+            lines += f"\n_...and {violation_count - 10} more_"
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*Top Violations:*\n{lines}"},
+        })
+
+    blocks.append({"type": "divider"})
+    blocks.append({
+        "type": "context",
+        "elements": [{"type": "mrkdwn", "text": "Sent by *Dealer Intel* — AI-powered campaign compliance"}],
+    })
+
+    return blocks
+
+
+def notify_slack_scan_complete(
+    *,
+    organization_id: UUID,
+    scan_source: str = "",
+    summary: Dict[str, Any],
+    violations: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Send a scan report to Slack if connected. Returns True on success."""
+    integration = _get_slack_integration(organization_id)
+    if not integration:
+        return False
+
+    org_name = _get_org_name(organization_id)
+    blocks = _build_scan_slack_blocks(
+        org_name=org_name,
+        scan_source=scan_source,
+        summary=summary,
+        violations=violations or [],
+    )
+
+    access_token = integration.get("access_token", "")
+    channel_id = integration.get("channel_id", "")
+    webhook_url = integration.get("webhook_url", "")
+
+    if access_token and channel_id:
+        return _post_slack_message(access_token=access_token, channel_id=channel_id, blocks=blocks)
+    elif webhook_url:
+        return _post_slack_webhook(webhook_url=webhook_url, blocks=blocks)
+
+    log.warning("Slack integration for org %s has no token or webhook", organization_id)
+    return False
+
+
+def send_slack_test(*, access_token: str, channel_id: str, webhook_url: str) -> bool:
+    """Send a test message to Slack."""
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": ":white_check_mark: *Dealer Intel — Slack Connected*\n"
+                        "You will receive scan summaries and violation alerts in this channel.",
+            },
+        },
+    ]
+
+    if access_token and channel_id:
+        return _post_slack_message(access_token=access_token, channel_id=channel_id, blocks=blocks)
+    elif webhook_url:
+        return _post_slack_webhook(webhook_url=webhook_url, blocks=blocks)
+    return False

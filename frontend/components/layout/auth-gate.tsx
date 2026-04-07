@@ -1,5 +1,6 @@
 "use client";
 
+import { useState, useEffect } from "react";
 import { usePathname } from "next/navigation";
 import { AuthProvider, useAuth, isPublicPath } from "@/lib/auth-context";
 import { SidebarProvider } from "@/components/layout/sidebar-context";
@@ -7,6 +8,14 @@ import { Sidebar } from "@/components/layout/sidebar";
 import { MainContent } from "@/components/layout/main-content";
 import { UpgradeModalProvider } from "@/components/dashboard/upgrade-modal";
 import { Loader2 } from "lucide-react";
+
+function LoadingScreen() {
+  return (
+    <div className="flex min-h-screen items-center justify-center">
+      <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
+    </div>
+  );
+}
 
 function AuthenticatedShell({ children }: { children: React.ReactNode }) {
   const { loading, session } = useAuth();
@@ -17,11 +26,7 @@ function AuthenticatedShell({ children }: { children: React.ReactNode }) {
   }
 
   if (loading) {
-    return (
-      <div className="flex min-h-screen items-center justify-center">
-        <Loader2 className="h-8 w-8 animate-spin text-muted-foreground" />
-      </div>
-    );
+    return <LoadingScreen />;
   }
 
   if (!session) {
@@ -41,6 +46,16 @@ function AuthenticatedShell({ children }: { children: React.ReactNode }) {
 }
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+
+  if (!mounted) {
+    return <LoadingScreen />;
+  }
+
   return (
     <AuthProvider>
       <AuthenticatedShell>{children}</AuthenticatedShell>

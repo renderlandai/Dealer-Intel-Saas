@@ -293,6 +293,16 @@ def check_email_notifications(op: OrgPlan) -> None:
         )
 
 
+def check_slack_notifications(op: OrgPlan) -> None:
+    """Raise 403 if Slack notifications are not included in the plan."""
+    if not op.limits.get("slack_notifications"):
+        raise HTTPException(
+            403,
+            f"Slack notifications are not available on your {op.plan} plan. "
+            f"Upgrade to Enterprise to enable Slack integration.",
+        )
+
+
 def check_compliance_rules_limit(op: OrgPlan) -> None:
     """Raise 403 if the org has reached its compliance rules cap."""
     max_rules = op.limits.get("max_compliance_rules")

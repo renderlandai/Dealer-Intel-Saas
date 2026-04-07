@@ -202,7 +202,7 @@ export default function LandingPage() {
         <div className="mx-auto max-w-7xl grid grid-cols-2 md:grid-cols-4 divide-x divide-border">
           {[
             { value: "4", label: "Channels Monitored" },
-            { value: "99.2%", label: "Detection Accuracy" },
+            { value: "Smart", label: "Visual Detection" },
             { value: "< 5 min", label: "Setup Time" },
             { value: "24/7", label: "Automated Scanning" },
           ].map((stat) => (
