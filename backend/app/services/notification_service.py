@@ -560,8 +560,7 @@ def _create_sf_task(
             "Subject": subject,
             "Description": description,
             "Priority": priority,
-            "Status": "Open",
-            "Type": "Other",
+            "Status": "Not Started",
         },
     )
     if resp and resp.status_code in (200, 201):
