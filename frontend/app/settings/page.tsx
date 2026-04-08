@@ -95,6 +95,7 @@ export default function SettingsPage() {
   const [dbxCurrentPath, setDbxCurrentPath] = useState("");
   const [dbxImageCount, setDbxImageCount] = useState(0);
   const [dbxBrowsing, setDbxBrowsing] = useState(false);
+  const [dbxBrowseOpen, setDbxBrowseOpen] = useState(false);
   const [dbxCampaigns, setDbxCampaigns] = useState<Campaign[]>([]);
   const [dbxSelectedCampaign, setDbxSelectedCampaign] = useState("");
   const [dbxSyncing, setDbxSyncing] = useState(false);
@@ -344,6 +345,7 @@ export default function SettingsPage() {
       setDbx({ connected: false });
       setDbxFolders([]);
       setDbxSyncResult(null);
+      setDbxBrowseOpen(false);
     } catch {} finally {
       setDbxDisconnecting(false);
     }
@@ -359,6 +361,7 @@ export default function SettingsPage() {
       setDbxImageCount(res.image_count);
       const campaigns = await getCampaigns();
       setDbxCampaigns(campaigns);
+      setDbxBrowseOpen(true);
     } catch (e: any) {
       const detail = e?.response?.data?.detail || "Failed to browse Dropbox folders";
       setDbxSyncResult({ ok: false, msg: detail });
@@ -373,6 +376,7 @@ export default function SettingsPage() {
       await selectDropboxFolder(folderPath, folderName, dbxSelectedCampaign);
       setDbx(prev => ({ ...prev, folder_path: folderPath, folder_name: folderName, campaign_id: dbxSelectedCampaign }));
       setDbxFolders([]);
+      setDbxBrowseOpen(false);
     } catch {}
   };
 
@@ -1010,7 +1014,7 @@ export default function SettingsPage() {
                 </div>
 
                 {/* Folder browser */}
-                {dbxFolders.length > 0 && (
+                {dbxBrowseOpen ? (
                   <div className="border border-border p-4 space-y-3">
                     <div className="flex items-center justify-between">
                       <p className="text-sm font-medium">
@@ -1031,23 +1035,29 @@ export default function SettingsPage() {
                       </button>
                     )}
 
-                    <div className="space-y-1 max-h-48 overflow-y-auto">
-                      {dbxFolders.map((f) => (
-                        <div key={f.path} className="flex items-center gap-2 p-2 hover:bg-secondary/50 cursor-pointer border border-transparent hover:border-border transition-colors">
-                          <FolderOpen className="h-4 w-4 text-muted-foreground flex-shrink-0" />
-                          <span className="text-sm flex-1">{f.name}</span>
-                          <div className="flex gap-1">
-                            <button
-                              className="text-xs text-primary hover:underline"
-                              onClick={() => handleBrowseDropbox(f.path)}
-                            >
-                              Open
-                            </button>
-                            <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                    {dbxFolders.length > 0 ? (
+                      <div className="space-y-1 max-h-48 overflow-y-auto">
+                        {dbxFolders.map((f) => (
+                          <div key={f.path} className="flex items-center gap-2 p-2 hover:bg-secondary/50 cursor-pointer border border-transparent hover:border-border transition-colors">
+                            <FolderOpen className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                            <span className="text-sm flex-1">{f.name}</span>
+                            <div className="flex gap-1">
+                              <button
+                                className="text-xs text-primary hover:underline"
+                                onClick={() => handleBrowseDropbox(f.path)}
+                              >
+                                Open
+                              </button>
+                              <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                            </div>
                           </div>
-                        </div>
-                      ))}
-                    </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-sm text-muted-foreground py-2">
+                        No subfolders here.{dbxImageCount > 0 ? ` ${dbxImageCount} image${dbxImageCount !== 1 ? "s" : ""} found — select a campaign below to use this folder.` : " This folder is empty."}
+                      </p>
+                    )}
 
                     {/* Campaign selector + select folder */}
                     <div className="border-t border-border pt-3 space-y-2">
@@ -1065,10 +1075,10 @@ export default function SettingsPage() {
                         </select>
                         <Button
                           size="sm"
-                          disabled={!dbxSelectedCampaign || !dbxCurrentPath}
+                          disabled={!dbxSelectedCampaign}
                           onClick={() => handleSelectDropboxFolder(
-                            dbxCurrentPath,
-                            dbxCurrentPath.split("/").pop() || "Root",
+                            dbxCurrentPath || "",
+                            dbxCurrentPath ? dbxCurrentPath.split("/").pop() || "Root" : "Root",
                           )}
                         >
                           Use This Folder
@@ -1076,7 +1086,7 @@ export default function SettingsPage() {
                       </div>
                     </div>
                   </div>
-                )}
+                ) : null}
 
                 {dbxSyncResult && (
                   <div className={`flex items-center gap-2 ${dbxSyncResult.ok ? "text-success" : "text-destructive"}`}>
