@@ -31,6 +31,9 @@ SF_OAUTH_AUTHORIZE = "https://login.salesforce.com/services/oauth2/authorize"
 SF_OAUTH_TOKEN = "https://login.salesforce.com/services/oauth2/token"
 SF_SCOPES = "full refresh_token"
 
+DBX_OAUTH_AUTHORIZE = "https://www.dropbox.com/oauth2/authorize"
+DBX_OAUTH_TOKEN = "https://api.dropboxapi.com/oauth2/token"
+
 
 def _get_backend_base() -> str:
     settings = get_settings()
@@ -360,3 +363,268 @@ async def salesforce_test(
     if success:
         return {"success": True, "message": "Test task created in Salesforce"}
     raise HTTPException(500, "Failed to create test task. Check the Salesforce connection.")
+
+
+# ─── Dropbox ────────────────────────────────────────────────────
+
+
+def _dbx_redirect_uri() -> str:
+    return _get_backend_base() + "/api/v1/integrations/dropbox/callback"
+
+
+@router.get("/dropbox/install", summary="Start Dropbox OAuth flow")
+async def dropbox_install(user: AuthUser = Depends(get_current_user)):
+    """Redirect the user to Dropbox's OAuth consent screen."""
+    settings = get_settings()
+    if not settings.dropbox_client_id:
+        raise HTTPException(500, "Dropbox integration is not configured")
+
+    state = _sign_state(str(user.org_id))
+    params = urlencode({
+        "client_id": settings.dropbox_client_id,
+        "redirect_uri": _dbx_redirect_uri(),
+        "response_type": "code",
+        "token_access_type": "offline",
+        "state": state,
+    })
+    return {"authorize_url": f"{DBX_OAUTH_AUTHORIZE}?{params}"}
+
+
+@router.get("/dropbox/callback", summary="Dropbox OAuth callback")
+async def dropbox_callback(code: str, state: str):
+    """Exchange the authorization code for tokens and store the integration."""
+    org_id = _verify_state(state)
+    settings = get_settings()
+
+    try:
+        resp = httpx.post(DBX_OAUTH_TOKEN, data={
+            "code": code,
+            "grant_type": "authorization_code",
+            "client_id": settings.dropbox_client_id,
+            "client_secret": settings.dropbox_client_secret,
+            "redirect_uri": _dbx_redirect_uri(),
+        }, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        log.error("Dropbox OAuth token exchange failed: %s", e)
+        return RedirectResponse(f"{settings.frontend_url}/settings?dropbox=error")
+
+    if "error" in data:
+        log.error("Dropbox OAuth error: %s", data.get("error_description", data.get("error")))
+        return RedirectResponse(f"{settings.frontend_url}/settings?dropbox=error")
+
+    access_token = data.get("access_token", "")
+    refresh_token = data.get("refresh_token", "")
+
+    # Fetch account display name
+    account_name = ""
+    try:
+        acct_resp = httpx.post(
+            "https://api.dropboxapi.com/2/users/get_current_account",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        acct_data = acct_resp.json()
+        account_name = acct_data.get("name", {}).get("display_name", "")
+    except Exception:
+        pass
+
+    supabase.table("integrations").upsert({
+        "organization_id": org_id,
+        "provider": "dropbox",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "workspace_name": account_name,
+        "connected_at": "now()",
+    }, on_conflict="organization_id,provider").execute()
+
+    log.info("Dropbox connected for org %s — account '%s'", org_id, account_name)
+    return RedirectResponse(f"{settings.frontend_url}/settings?dropbox=connected")
+
+
+@router.get("/dropbox/status", summary="Get Dropbox integration status")
+async def dropbox_status(user: AuthUser = Depends(get_current_user)):
+    """Return current Dropbox integration status for the org."""
+    try:
+        result = supabase.table("integrations")\
+            .select("workspace_name, folder_path, folder_name, campaign_id, last_synced_at, connected_at")\
+            .eq("organization_id", str(user.org_id))\
+            .eq("provider", "dropbox")\
+            .maybe_single()\
+            .execute()
+    except Exception:
+        return {"connected": False}
+
+    if not result.data:
+        return {"connected": False}
+
+    return {
+        "connected": True,
+        "account_name": result.data.get("workspace_name", ""),
+        "folder_path": result.data.get("folder_path"),
+        "folder_name": result.data.get("folder_name"),
+        "campaign_id": result.data.get("campaign_id"),
+        "last_synced_at": result.data.get("last_synced_at"),
+        "connected_at": result.data.get("connected_at"),
+    }
+
+
+@router.delete("/dropbox", summary="Disconnect Dropbox")
+async def dropbox_disconnect(user: AuthUser = Depends(get_current_user)):
+    """Remove the Dropbox integration for the org."""
+    supabase.table("integrations")\
+        .delete()\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "dropbox")\
+        .execute()
+
+    log.info("Dropbox disconnected for org %s", user.org_id)
+    return {"status": "disconnected"}
+
+
+@router.get("/dropbox/folders", summary="List Dropbox folders")
+async def dropbox_list_folders(
+    path: str = "",
+    user: AuthUser = Depends(get_current_user),
+):
+    """List folders in the connected Dropbox account for folder selection."""
+    integration = supabase.table("integrations")\
+        .select("access_token, refresh_token")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "dropbox")\
+        .maybe_single()\
+        .execute()
+
+    if not integration.data:
+        raise HTTPException(400, "Dropbox is not connected")
+
+    token = integration.data["access_token"]
+    folder_path = path if path else ""
+
+    try:
+        resp = httpx.post(
+            "https://api.dropboxapi.com/2/files/list_folder",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"path": folder_path, "include_non_downloadable_files": False},
+            timeout=15,
+        )
+
+        if resp.status_code == 401:
+            token = _refresh_dropbox_token(user.org_id, integration.data["refresh_token"])
+            if not token:
+                raise HTTPException(401, "Dropbox session expired. Please reconnect.")
+            resp = httpx.post(
+                "https://api.dropboxapi.com/2/files/list_folder",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={"path": folder_path, "include_non_downloadable_files": False},
+                timeout=15,
+            )
+
+        data = resp.json()
+        entries = data.get("entries", [])
+
+        folders = [
+            {"name": e["name"], "path": e["path_lower"]}
+            for e in entries if e[".tag"] == "folder"
+        ]
+        image_count = sum(
+            1 for e in entries
+            if e[".tag"] == "file" and e.get("name", "").lower().split(".")[-1] in ("png", "jpg", "jpeg", "gif", "webp")
+        )
+
+        return {"folders": folders, "image_count": image_count, "current_path": folder_path or "/"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("Dropbox folder listing failed: %s", e)
+        raise HTTPException(500, "Failed to list Dropbox folders")
+
+
+@router.post("/dropbox/select-folder", summary="Select folder and campaign for sync")
+async def dropbox_select_folder(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Set which Dropbox folder to sync and which campaign to import into."""
+    body = await request.json()
+    folder_path = body.get("folder_path", "")
+    folder_name = body.get("folder_name", "")
+    campaign_id = body.get("campaign_id")
+
+    if not campaign_id:
+        raise HTTPException(400, "campaign_id is required")
+
+    supabase.table("integrations").update({
+        "folder_path": folder_path,
+        "folder_name": folder_name,
+        "campaign_id": campaign_id,
+    }).eq("organization_id", str(user.org_id))\
+      .eq("provider", "dropbox")\
+      .execute()
+
+    return {"status": "folder_selected", "folder_path": folder_path, "campaign_id": campaign_id}
+
+
+@router.post("/dropbox/sync", summary="Sync assets from Dropbox folder")
+@limiter.limit("5/minute")
+async def dropbox_sync(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Pull images from the selected Dropbox folder and import as campaign assets."""
+    integration = supabase.table("integrations")\
+        .select("access_token, refresh_token, folder_path, campaign_id")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "dropbox")\
+        .maybe_single()\
+        .execute()
+
+    if not integration.data:
+        raise HTTPException(400, "Dropbox is not connected")
+    if not integration.data.get("folder_path") and integration.data.get("folder_path") != "":
+        raise HTTPException(400, "No folder selected. Choose a folder first.")
+    if not integration.data.get("campaign_id"):
+        raise HTTPException(400, "No campaign selected. Choose a campaign first.")
+
+    from ..services.dropbox_service import sync_dropbox_folder
+
+    result = sync_dropbox_folder(
+        organization_id=user.org_id,
+        access_token=integration.data["access_token"],
+        refresh_token=integration.data["refresh_token"],
+        folder_path=integration.data["folder_path"],
+        campaign_id=integration.data["campaign_id"],
+    )
+
+    # Update last_synced_at
+    supabase.table("integrations").update({
+        "last_synced_at": "now()",
+    }).eq("organization_id", str(user.org_id))\
+      .eq("provider", "dropbox")\
+      .execute()
+
+    return result
+
+
+def _refresh_dropbox_token(org_id, refresh_token: str):
+    """Refresh an expired Dropbox access token."""
+    settings = get_settings()
+    try:
+        resp = httpx.post(DBX_OAUTH_TOKEN, data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": settings.dropbox_client_id,
+            "client_secret": settings.dropbox_client_secret,
+        }, timeout=15)
+        data = resp.json()
+        new_token = data.get("access_token")
+        if not new_token:
+            return None
+        supabase.table("integrations").update({
+            "access_token": new_token,
+        }).eq("organization_id", str(org_id))\
+          .eq("provider", "dropbox")\
+          .execute()
+        return new_token
+    except Exception:
+        return None

@@ -22,13 +22,17 @@ import {
   MessageSquare,
   Unplug,
   Loader2,
+  FolderOpen,
+  RefreshCw,
+  ChevronRight,
+  HardDrive,
 } from "lucide-react";
 import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage, getSalesforceStatus, startSalesforceInstall, disconnectSalesforce, testSalesforceTask } from "@/lib/api";
-import type { SlackStatus, SalesforceStatus } from "@/lib/api";
+import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage, getSalesforceStatus, startSalesforceInstall, disconnectSalesforce, testSalesforceTask, getDropboxStatus, startDropboxInstall, disconnectDropbox, listDropboxFolders, selectDropboxFolder, syncDropbox, getCampaigns } from "@/lib/api";
+import type { SlackStatus, SalesforceStatus, DropboxStatus, DropboxFolder, Campaign } from "@/lib/api";
 import { orgSettingsSchema } from "@/lib/schemas";
 import { useBillingUsage } from "@/lib/hooks";
 import { useAuth } from "@/lib/auth-context";
@@ -83,6 +87,19 @@ export default function SettingsPage() {
   const [sfTesting, setSfTesting] = useState(false);
   const [sfTestResult, setSfTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
+  const [dbx, setDbx] = useState<DropboxStatus>({ connected: false });
+  const [dbxLoading, setDbxLoading] = useState(true);
+  const [dbxConnecting, setDbxConnecting] = useState(false);
+  const [dbxDisconnecting, setDbxDisconnecting] = useState(false);
+  const [dbxFolders, setDbxFolders] = useState<DropboxFolder[]>([]);
+  const [dbxCurrentPath, setDbxCurrentPath] = useState("");
+  const [dbxImageCount, setDbxImageCount] = useState(0);
+  const [dbxBrowsing, setDbxBrowsing] = useState(false);
+  const [dbxCampaigns, setDbxCampaigns] = useState<Campaign[]>([]);
+  const [dbxSelectedCampaign, setDbxSelectedCampaign] = useState("");
+  const [dbxSyncing, setDbxSyncing] = useState(false);
+  const [dbxSyncResult, setDbxSyncResult] = useState<{ ok: boolean; msg: string } | null>(null);
+
   useEffect(() => {
     getOrgSettings()
       .then((res) => {
@@ -109,6 +126,11 @@ export default function SettingsPage() {
       .catch(() => {})
       .finally(() => setSfLoading(false));
 
+    getDropboxStatus()
+      .then(setDbx)
+      .catch(() => {})
+      .finally(() => setDbxLoading(false));
+
     const params = new URLSearchParams(window.location.search);
     if (params.get("slack") === "connected") {
       getSlackStatus().then(setSlack).catch(() => {});
@@ -116,6 +138,10 @@ export default function SettingsPage() {
     }
     if (params.get("salesforce") === "connected") {
       getSalesforceStatus().then(setSf).catch(() => {});
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    if (params.get("dropbox") === "connected") {
+      getDropboxStatus().then(setDbx).catch(() => {});
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
@@ -298,6 +324,65 @@ export default function SettingsPage() {
       setSfTestResult({ ok: false, msg: detail });
     } finally {
       setSfTesting(false);
+    }
+  };
+
+  const handleConnectDropbox = async () => {
+    setDbxConnecting(true);
+    try {
+      const { authorize_url } = await startDropboxInstall();
+      window.location.href = authorize_url;
+    } catch {
+      setDbxConnecting(false);
+    }
+  };
+
+  const handleDisconnectDropbox = async () => {
+    setDbxDisconnecting(true);
+    try {
+      await disconnectDropbox();
+      setDbx({ connected: false });
+      setDbxFolders([]);
+      setDbxSyncResult(null);
+    } catch {} finally {
+      setDbxDisconnecting(false);
+    }
+  };
+
+  const handleBrowseDropbox = async (path = "") => {
+    setDbxBrowsing(true);
+    try {
+      const res = await listDropboxFolders(path);
+      setDbxFolders(res.folders);
+      setDbxCurrentPath(res.current_path);
+      setDbxImageCount(res.image_count);
+      const campaigns = await getCampaigns();
+      setDbxCampaigns(campaigns);
+    } catch {} finally {
+      setDbxBrowsing(false);
+    }
+  };
+
+  const handleSelectDropboxFolder = async (folderPath: string, folderName: string) => {
+    if (!dbxSelectedCampaign) return;
+    try {
+      await selectDropboxFolder(folderPath, folderName, dbxSelectedCampaign);
+      setDbx(prev => ({ ...prev, folder_path: folderPath, folder_name: folderName, campaign_id: dbxSelectedCampaign }));
+      setDbxFolders([]);
+    } catch {}
+  };
+
+  const handleSyncDropbox = async () => {
+    setDbxSyncing(true);
+    setDbxSyncResult(null);
+    try {
+      const res = await syncDropbox();
+      setDbxSyncResult({ ok: res.errors === 0, msg: res.message });
+      getDropboxStatus().then(setDbx).catch(() => {});
+    } catch (e: any) {
+      setDbxSyncResult({ ok: false, msg: e?.response?.data?.detail || "Sync failed" });
+    } finally {
+      setDbxSyncing(false);
     }
   };
 
@@ -839,8 +924,201 @@ export default function SettingsPage() {
           </CardContent>
         </Card>
 
-        {/* Report Theme */}
+        {/* Dropbox Integration */}
         <Card className="opacity-0 animate-fade-up" style={{ animationFillMode: "forwards", animationDelay: "150ms" }}>
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center bg-secondary border border-border">
+                <HardDrive className="h-5 w-5 text-blue-500" />
+              </div>
+              <div className="flex-1">
+                <CardTitle className="text-base">Dropbox Integration</CardTitle>
+                <CardDescription className="text-xs">
+                  Import campaign assets directly from your Dropbox
+                </CardDescription>
+              </div>
+              {dbx.connected && (
+                <span className="flex items-center gap-1.5 text-xs text-success font-medium">
+                  <span className="h-1.5 w-1.5 rounded-full bg-success" />
+                  Connected
+                </span>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {dbxLoading ? (
+              <div className="h-16 border border-border bg-secondary/20 animate-pulse" />
+            ) : dbx.connected ? (
+              <>
+                <div className="flex items-center gap-4 p-4 border border-border bg-secondary/20">
+                  <div className="flex-1">
+                    <p className="text-sm font-medium">{dbx.account_name || "Dropbox Account"}</p>
+                    {dbx.folder_path !== null && dbx.folder_path !== undefined ? (
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        Syncing from: <span className="font-mono">{dbx.folder_name || dbx.folder_path || "/"}</span>
+                      </p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        No folder selected — choose a folder to sync
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => handleBrowseDropbox("")}
+                      disabled={dbxBrowsing}
+                    >
+                      {dbxBrowsing ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <FolderOpen className="mr-1.5 h-3.5 w-3.5" />
+                      )}
+                      {dbx.folder_path !== null && dbx.folder_path !== undefined ? "Change Folder" : "Pick Folder"}
+                    </Button>
+                    {dbx.folder_path !== null && dbx.folder_path !== undefined && dbx.campaign_id && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleSyncDropbox}
+                        disabled={dbxSyncing}
+                      >
+                        {dbxSyncing ? (
+                          <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                        )}
+                        {dbxSyncing ? "Syncing..." : "Sync Now"}
+                      </Button>
+                    )}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-destructive hover:text-destructive hover:border-destructive/50"
+                      onClick={handleDisconnectDropbox}
+                      disabled={dbxDisconnecting}
+                    >
+                      <Unplug className="mr-1.5 h-3.5 w-3.5" />
+                      {dbxDisconnecting ? "Removing..." : "Disconnect"}
+                    </Button>
+                  </div>
+                </div>
+
+                {/* Folder browser */}
+                {dbxFolders.length > 0 && (
+                  <div className="border border-border p-4 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm font-medium">
+                        {dbxCurrentPath === "/" || dbxCurrentPath === "" ? "Root" : dbxCurrentPath}
+                      </p>
+                      <span className="text-xs text-muted-foreground">{dbxImageCount} image{dbxImageCount !== 1 ? "s" : ""} here</span>
+                    </div>
+
+                    {dbxCurrentPath && dbxCurrentPath !== "/" && dbxCurrentPath !== "" && (
+                      <button
+                        className="text-xs text-primary hover:underline"
+                        onClick={() => {
+                          const parent = dbxCurrentPath.split("/").slice(0, -1).join("/");
+                          handleBrowseDropbox(parent || "");
+                        }}
+                      >
+                        ← Back
+                      </button>
+                    )}
+
+                    <div className="space-y-1 max-h-48 overflow-y-auto">
+                      {dbxFolders.map((f) => (
+                        <div key={f.path} className="flex items-center gap-2 p-2 hover:bg-secondary/50 cursor-pointer border border-transparent hover:border-border transition-colors">
+                          <FolderOpen className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+                          <span className="text-sm flex-1">{f.name}</span>
+                          <div className="flex gap-1">
+                            <button
+                              className="text-xs text-primary hover:underline"
+                              onClick={() => handleBrowseDropbox(f.path)}
+                            >
+                              Open
+                            </button>
+                            <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* Campaign selector + select folder */}
+                    <div className="border-t border-border pt-3 space-y-2">
+                      <p className="text-xs text-muted-foreground">Select a campaign to import images into:</p>
+                      <div className="flex gap-2">
+                        <select
+                          className="flex-1 text-sm border border-border bg-background px-3 py-1.5"
+                          value={dbxSelectedCampaign}
+                          onChange={(e) => setDbxSelectedCampaign(e.target.value)}
+                        >
+                          <option value="">Choose campaign…</option>
+                          {dbxCampaigns.map((c) => (
+                            <option key={c.id} value={c.id}>{c.name}</option>
+                          ))}
+                        </select>
+                        <Button
+                          size="sm"
+                          disabled={!dbxSelectedCampaign || !dbxCurrentPath}
+                          onClick={() => handleSelectDropboxFolder(
+                            dbxCurrentPath,
+                            dbxCurrentPath.split("/").pop() || "Root",
+                          )}
+                        >
+                          Use This Folder
+                        </Button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {dbxSyncResult && (
+                  <div className={`flex items-center gap-2 ${dbxSyncResult.ok ? "text-success" : "text-destructive"}`}>
+                    {dbxSyncResult.ok ? <CheckCircle className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                    <span className="text-sm">{dbxSyncResult.msg}</span>
+                  </div>
+                )}
+
+                {dbx.last_synced_at && (
+                  <p className="text-2xs text-muted-foreground">
+                    Last synced: {new Date(dbx.last_synced_at).toLocaleString()}
+                  </p>
+                )}
+              </>
+            ) : (
+              <>
+                <div className="border border-dashed border-border p-4 flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center bg-secondary/50 border border-border flex-shrink-0">
+                    <HardDrive className="h-5 w-5 text-muted-foreground" />
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-sm text-muted-foreground">Dropbox is not connected</p>
+                    <p className="text-2xs text-muted-foreground mt-0.5">
+                      Connect Dropbox to import campaign assets from your cloud storage
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={handleConnectDropbox}
+                    disabled={dbxConnecting}
+                  >
+                    {dbxConnecting ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    {dbxConnecting ? "Connecting..." : "Connect Dropbox"}
+                  </Button>
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Report Theme */}
+        <Card className="opacity-0 animate-fade-up" style={{ animationFillMode: "forwards", animationDelay: "170ms" }}>
           <CardHeader>
             <div className="flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center bg-secondary border border-border">

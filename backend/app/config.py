@@ -169,6 +169,13 @@ class Settings(BaseSettings):
     salesforce_client_id: str = Field(default="", description="Salesforce Connected App Consumer Key")
     salesforce_client_secret: str = Field(default="", description="Salesforce Connected App Consumer Secret")
     
+    # ===========================================
+    # Dropbox Integration (OAuth)
+    # ===========================================
+    
+    dropbox_client_id: str = Field(default="", description="Dropbox App Key")
+    dropbox_client_secret: str = Field(default="", description="Dropbox App Secret")
+    
     class Config:
         env_file = ".env"
         case_sensitive = False

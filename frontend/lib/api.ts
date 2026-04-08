@@ -833,6 +833,55 @@ export const testSalesforceTask = async (): Promise<{ success: boolean; message:
   return data;
 };
 
+export interface DropboxStatus {
+  connected: boolean;
+  account_name?: string;
+  folder_path?: string | null;
+  folder_name?: string | null;
+  campaign_id?: string | null;
+  last_synced_at?: string | null;
+  connected_at?: string;
+}
+
+export interface DropboxFolder {
+  name: string;
+  path: string;
+}
+
+export const getDropboxStatus = async (): Promise<DropboxStatus> => {
+  const { data } = await api.get("/integrations/dropbox/status");
+  return data;
+};
+
+export const startDropboxInstall = async (): Promise<{ authorize_url: string }> => {
+  const { data } = await api.get("/integrations/dropbox/install");
+  return data;
+};
+
+export const disconnectDropbox = async (): Promise<{ status: string }> => {
+  const { data } = await api.delete("/integrations/dropbox");
+  return data;
+};
+
+export const listDropboxFolders = async (path = ""): Promise<{ folders: DropboxFolder[]; image_count: number; current_path: string }> => {
+  const { data } = await api.get(`/integrations/dropbox/folders?path=${encodeURIComponent(path)}`);
+  return data;
+};
+
+export const selectDropboxFolder = async (folderPath: string, folderName: string, campaignId: string): Promise<{ status: string }> => {
+  const { data } = await api.post("/integrations/dropbox/select-folder", {
+    folder_path: folderPath,
+    folder_name: folderName,
+    campaign_id: campaignId,
+  });
+  return data;
+};
+
+export const syncDropbox = async (): Promise<{ imported: number; skipped: number; errors: number; message: string }> => {
+  const { data } = await api.post("/integrations/dropbox/sync", {}, { timeout: 120000 });
+  return data;
+};
+
 // ── Billing ────────────────────────────────────────────────────
 
 export const getBillingUsage = async (): Promise<BillingUsage> => {

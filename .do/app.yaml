@@ -137,3 +137,11 @@ services:
         scope: RUN_TIME
         type: SECRET
         value: "PLACEHOLDER"
+      - key: DROPBOX_CLIENT_ID
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: DROPBOX_CLIENT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
