@@ -520,6 +520,13 @@ async def dropbox_list_folders(
                 timeout=15,
             )
 
+        if resp.status_code != 200:
+            log.error("Dropbox list_folder %d: %s", resp.status_code, resp.text[:500])
+            raise HTTPException(
+                502,
+                f"Dropbox API error ({resp.status_code}): {resp.text[:200]}",
+            )
+
         data = resp.json()
         entries = data.get("entries", [])
 
@@ -537,7 +544,7 @@ async def dropbox_list_folders(
         raise
     except Exception as e:
         log.error("Dropbox folder listing failed: %s", e)
-        raise HTTPException(500, "Failed to list Dropbox folders")
+        raise HTTPException(500, f"Failed to list Dropbox folders: {e}")
 
 
 @router.post("/dropbox/select-folder", summary="Select folder and campaign for sync")
