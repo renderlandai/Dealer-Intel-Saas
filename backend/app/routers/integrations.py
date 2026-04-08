@@ -492,13 +492,13 @@ async def dropbox_list_folders(
         .select("access_token, refresh_token")\
         .eq("organization_id", str(user.org_id))\
         .eq("provider", "dropbox")\
-        .maybe_single()\
         .execute()
 
     if not integration.data:
         raise HTTPException(400, "Dropbox is not connected")
 
-    token = integration.data["access_token"]
+    row = integration.data[0]
+    token = row["access_token"]
     folder_path = path if path else ""
 
     try:
@@ -510,7 +510,7 @@ async def dropbox_list_folders(
         )
 
         if resp.status_code == 401:
-            token = _refresh_dropbox_token(user.org_id, integration.data["refresh_token"])
+            token = _refresh_dropbox_token(user.org_id, row["refresh_token"])
             if not token:
                 raise HTTPException(401, "Dropbox session expired. Please reconnect.")
             resp = httpx.post(
@@ -576,24 +576,25 @@ async def dropbox_sync(
         .select("access_token, refresh_token, folder_path, campaign_id")\
         .eq("organization_id", str(user.org_id))\
         .eq("provider", "dropbox")\
-        .maybe_single()\
         .execute()
 
     if not integration.data:
         raise HTTPException(400, "Dropbox is not connected")
-    if not integration.data.get("folder_path") and integration.data.get("folder_path") != "":
+
+    row = integration.data[0]
+    if not row.get("folder_path") and row.get("folder_path") != "":
         raise HTTPException(400, "No folder selected. Choose a folder first.")
-    if not integration.data.get("campaign_id"):
+    if not row.get("campaign_id"):
         raise HTTPException(400, "No campaign selected. Choose a campaign first.")
 
     from ..services.dropbox_service import sync_dropbox_folder
 
     result = sync_dropbox_folder(
         organization_id=user.org_id,
-        access_token=integration.data["access_token"],
-        refresh_token=integration.data["refresh_token"],
-        folder_path=integration.data["folder_path"],
-        campaign_id=integration.data["campaign_id"],
+        access_token=row["access_token"],
+        refresh_token=row["refresh_token"],
+        folder_path=row["folder_path"],
+        campaign_id=row["campaign_id"],
     )
 
     # Update last_synced_at
