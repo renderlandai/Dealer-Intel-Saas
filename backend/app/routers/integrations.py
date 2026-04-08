@@ -8,7 +8,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -416,8 +416,8 @@ async def dropbox_callback(code: str, state: str):
     access_token = data.get("access_token", "")
     refresh_token = data.get("refresh_token", "")
 
-    # Fetch account display name
     account_name = ""
+    account_id = data.get("account_id", "")
     try:
         acct_resp = httpx.post(
             "https://api.dropboxapi.com/2/users/get_current_account",
@@ -426,6 +426,8 @@ async def dropbox_callback(code: str, state: str):
         )
         acct_data = acct_resp.json()
         account_name = acct_data.get("name", {}).get("display_name", "")
+        if not account_id:
+            account_id = acct_data.get("account_id", "")
     except Exception:
         pass
 
@@ -435,10 +437,24 @@ async def dropbox_callback(code: str, state: str):
         "access_token": access_token,
         "refresh_token": refresh_token,
         "workspace_name": account_name,
+        "external_account_id": account_id,
+        "folder_path": "/Dealer Intel",
+        "folder_name": "Dealer Intel",
         "connected_at": "now()",
     }, on_conflict="organization_id,provider").execute()
 
-    log.info("Dropbox connected for org %s — account '%s'", org_id, account_name)
+    # Create /Dealer Intel/ root folder in Dropbox
+    try:
+        httpx.post(
+            "https://api.dropboxapi.com/2/files/create_folder_v2",
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json={"path": "/Dealer Intel", "autorename": False},
+            timeout=10,
+        )
+    except Exception:
+        pass  # folder may already exist
+
+    log.info("Dropbox connected for org %s — account '%s', id '%s'", org_id, account_name, account_id)
     return RedirectResponse(f"{settings.frontend_url}/settings?dropbox=connected")
 
 
@@ -636,3 +652,93 @@ def _refresh_dropbox_token(org_id, refresh_token: str):
         return new_token
     except Exception:
         return None
+
+
+# ─── Dropbox Webhook ────────────────────────────────────────────
+
+
+@router.get("/dropbox/webhook", summary="Dropbox webhook verification")
+async def dropbox_webhook_verify(challenge: str = ""):
+    """Respond to Dropbox's webhook verification request."""
+    return PlainTextResponse(content=challenge, headers={"X-Content-Type-Options": "nosniff"})
+
+
+@router.post("/dropbox/webhook", summary="Dropbox webhook notification")
+async def dropbox_webhook_notification(request: Request):
+    """
+    Receive change notifications from Dropbox.
+    Dropbox sends a list of account IDs that have changed.
+    We match them to our integrations and trigger auto-sync.
+    """
+    import threading
+
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    accounts = body.get("list_folder", {}).get("accounts", [])
+    if not accounts:
+        return {"ok": True}
+
+    for account_id in accounts:
+        result = supabase.table("integrations")\
+            .select("id, organization_id, access_token, refresh_token, external_account_id")\
+            .eq("provider", "dropbox")\
+            .eq("external_account_id", account_id)\
+            .execute()
+
+        if not result.data:
+            continue
+
+        integration = result.data[0]
+        # Run sync in background thread to return 200 quickly
+        thread = threading.Thread(
+            target=_run_auto_sync,
+            args=(integration,),
+            daemon=True,
+        )
+        thread.start()
+
+    return {"ok": True}
+
+
+def _run_auto_sync(integration: dict):
+    """Run auto-sync in a background thread."""
+    from ..services.dropbox_service import auto_sync_org
+    try:
+        auto_sync_org(integration)
+    except Exception as e:
+        log.error("Dropbox auto-sync failed for org %s: %s", integration.get("organization_id"), e)
+
+
+@router.post("/dropbox/auto-sync", summary="Trigger Dropbox auto-sync manually")
+@limiter.limit("3/minute")
+async def dropbox_trigger_auto_sync(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Manually trigger the auto-sync process for the current org."""
+    integration = supabase.table("integrations")\
+        .select("id, organization_id, access_token, refresh_token, external_account_id")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "dropbox")\
+        .execute()
+
+    if not integration.data:
+        raise HTTPException(400, "Dropbox is not connected")
+
+    from ..services.dropbox_service import auto_sync_org
+
+    result = auto_sync_org(integration.data[0])
+    return {
+        "success": True,
+        "campaigns_created": result["campaigns_created"],
+        "images_imported": result["images_imported"],
+        "images_skipped": result["images_skipped"],
+        "message": (
+            f"Synced: {result['campaigns_created']} new campaign(s), "
+            f"{result['images_imported']} image(s) imported, "
+            f"{result['images_skipped']} skipped"
+        ),
+    }

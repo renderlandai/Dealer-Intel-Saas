@@ -882,6 +882,17 @@ export const syncDropbox = async (): Promise<{ imported: number; skipped: number
   return data;
 };
 
+export const autoSyncDropbox = async (): Promise<{
+  success: boolean;
+  campaigns_created: number;
+  images_imported: number;
+  images_skipped: number;
+  message: string;
+}> => {
+  const { data } = await api.post("/integrations/dropbox/auto-sync", {}, { timeout: 120000 });
+  return data;
+};
+
 // ── Billing ────────────────────────────────────────────────────
 
 export const getBillingUsage = async (): Promise<BillingUsage> => {
