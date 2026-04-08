@@ -127,19 +127,19 @@ def _send_scan_notifications(
             summary=summary,
             violations=violations_formatted,
         )
-                notify_salesforce_scan_complete(
-                    organization_id=UUID(org_id),
-                    scan_source=scan_source,
-                    summary=summary,
-                    violations=violations_formatted,
-                )
-                notify_jira_scan_complete(
-                    organization_id=UUID(org_id),
-                    scan_source=scan_source,
-                    summary=summary,
-                    violations=violations_formatted,
-                )
-            except Exception as e:
+        notify_salesforce_scan_complete(
+            organization_id=UUID(org_id),
+            scan_source=scan_source,
+            summary=summary,
+            violations=violations_formatted,
+        )
+        notify_jira_scan_complete(
+            organization_id=UUID(org_id),
+            scan_source=scan_source,
+            summary=summary,
+            violations=violations_formatted,
+        )
+    except Exception as e:
         log.warning("Failed to send scan notifications for %s: %s", scan_job_id, e)
 
 
