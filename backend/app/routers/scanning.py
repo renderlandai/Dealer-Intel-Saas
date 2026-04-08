@@ -768,7 +768,7 @@ async def run_website_scan(
             "drift_detected": 0,
             "errors": 0,
             "pages_discovered": total_pages,
-            "pages_scanned": len(cached_pages) if cache_early_stopped else len(cached_pages),
+            "pages_scanned": len(cached_pages) if cache_early_stopped else 0,
             "pages_skipped": 0,
             "early_stopped": cache_early_stopped,
             "cache_hit": cache_early_stopped,

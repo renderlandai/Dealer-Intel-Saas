@@ -40,13 +40,16 @@ settings = get_settings()
 _browser: Optional[Browser] = None
 _pw_instance = None
 _browser_lock = asyncio.Lock()
+_browser_created_at: float = 0.0
+_BROWSER_MAX_AGE_SECONDS = 600  # recycle browser every 10 minutes
 
 
 async def _get_browser() -> Browser:
     """Return a shared headless Chromium instance, launching if needed."""
-    global _browser, _pw_instance
+    global _browser, _pw_instance, _browser_created_at
     async with _browser_lock:
-        if _browser is None or not _browser.is_connected():
+        stale = (time.monotonic() - _browser_created_at) > _BROWSER_MAX_AGE_SECONDS
+        if _browser is None or not _browser.is_connected() or stale:
             if _browser is not None:
                 try:
                     await _browser.close()
@@ -62,6 +65,8 @@ async def _get_browser() -> Browser:
                 headless=True,
                 args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
             )
+            _browser_created_at = time.monotonic()
+            log.info("Launched fresh Playwright browser")
     return _browser
 
 
@@ -524,14 +529,102 @@ async def _extract_from_viewport(
             extracted_count += 1
 
     except PlaywrightTimeout:
-        log.error("Timeout loading %s (%s)", url, viewport_label)
+        log.error("Timeout loading %s (%s) — will retry with fresh browser", url, viewport_label)
     except Exception as e:
-        log.error("Error on %s (%s): %s", url, viewport_label, e, exc_info=True)
+        log.error("Error on %s (%s): %s — will retry with fresh browser", url, viewport_label, e, exc_info=True)
     finally:
         try:
             await page.context.close()
         except Exception:
             pass
+
+    # Retry once with a recycled browser when extraction failed completely
+    if extracted_count == 0 and evidence_url is None:
+        log.info("Retrying %s (%s) with fresh browser", url, viewport_label)
+        global _browser, _pw_instance, _browser_created_at
+        async with _browser_lock:
+            if _browser is not None:
+                try:
+                    await _browser.close()
+                except Exception:
+                    pass
+            if _pw_instance is not None:
+                try:
+                    await _pw_instance.stop()
+                except Exception:
+                    pass
+            _pw_instance = await async_playwright().start()
+            _browser = await _pw_instance.chromium.launch(
+                headless=True,
+                args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            _browser_created_at = time.monotonic()
+            log.info("Browser recycled for retry")
+
+        retry_page = await _new_page(_browser, mobile=mobile)
+        try:
+            await retry_page.goto(url, wait_until="domcontentloaded", timeout=settings.playwright_timeout)
+            await asyncio.sleep(2)
+            await _dismiss_overlays(retry_page)
+            await _scroll_to_bottom(retry_page)
+
+            try:
+                await retry_page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass
+
+            images = await _extract_images_from_page(retry_page)
+            carousel_images = await _advance_carousels(retry_page)
+            for img in carousel_images:
+                if img["src"] not in {i["src"] for i in images}:
+                    images.append(img)
+
+            page_height = await retry_page.evaluate("document.body.scrollHeight")
+            screenshot_bytes = await retry_page.screenshot(full_page=True, type="png")
+            evidence_url = await _upload_screenshot(screenshot_bytes, scan_job_id, f"{url}#_{viewport_label}")
+
+            if campaign_assets:
+                localized = await _localize_and_crop_assets(screenshot_bytes, scan_job_id, campaign_assets)
+                images.extend(localized)
+
+            log.info("Retry found %d images+sections (%s) on %s", len(images), viewport_label, url)
+
+            for img in images:
+                if img["src"] in seen_srcs:
+                    continue
+                seen_srcs.add(img["src"])
+                location = _classify_location(img["y"], page_height)
+                supabase.table("discovered_images").insert({
+                    "scan_job_id": str(scan_job_id),
+                    "distributor_id": str(distributor_id) if distributor_id else None,
+                    "source_url": url,
+                    "image_url": img["src"],
+                    "source_type": "extracted_image",
+                    "channel": "website",
+                    "metadata": {
+                        "extraction_method": "playwright",
+                        "viewport": viewport_label,
+                        "element_tag": img["tag"],
+                        "original_width": img["width"],
+                        "original_height": img["height"],
+                        "position": {"x": img["x"], "y": img["y"]},
+                        "page_location": location,
+                        "alt_text": img["alt"],
+                        "css_classes": img["classes"],
+                        "evidence_screenshot_url": evidence_url,
+                    },
+                }).execute()
+                extracted_count += 1
+
+        except PlaywrightTimeout:
+            log.error("Retry also timed out for %s (%s)", url, viewport_label)
+        except Exception as e:
+            log.error("Retry also failed for %s (%s): %s", url, viewport_label, e)
+        finally:
+            try:
+                await retry_page.context.close()
+            except Exception:
+                pass
 
     return extracted_count, evidence_url, seen_srcs
 

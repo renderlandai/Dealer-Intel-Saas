@@ -16,6 +16,7 @@ campaign creatives, capped at a configurable maximum.
 import asyncio
 import logging
 import re
+import time
 import xml.etree.ElementTree as ET
 from typing import List, Set, Optional
 from urllib.parse import urljoin, urlparse
@@ -27,6 +28,8 @@ from ..config import get_settings
 log = logging.getLogger("dealer_intel.page_discovery")
 
 settings = get_settings()
+
+_CLIENT_MAX_AGE_SECONDS = 300  # recycle httpx client every 5 minutes
 
 PROMO_KEYWORDS = {
     "promo", "promotion", "promotions", "deal", "deals", "offer", "offers",
@@ -66,11 +69,18 @@ COMMON_PROMO_PATHS = [
 ]
 
 _http_client: Optional[httpx.AsyncClient] = None
+_http_client_created_at: float = 0.0
 
 
 async def _get_client() -> httpx.AsyncClient:
-    global _http_client
-    if _http_client is None or _http_client.is_closed:
+    global _http_client, _http_client_created_at
+    stale = (time.monotonic() - _http_client_created_at) > _CLIENT_MAX_AGE_SECONDS
+    if _http_client is None or _http_client.is_closed or stale:
+        if _http_client is not None and not _http_client.is_closed:
+            try:
+                await _http_client.aclose()
+            except Exception:
+                pass
         _http_client = httpx.AsyncClient(
             timeout=15.0,
             follow_redirects=True,
@@ -82,6 +92,8 @@ async def _get_client() -> httpx.AsyncClient:
                 )
             },
         )
+        _http_client_created_at = time.monotonic()
+        log.debug("Created fresh httpx client for page discovery")
     return _http_client
 
 
@@ -272,19 +284,26 @@ async def _probe_common_paths(base_url: str) -> List[str]:
     client = await _get_client()
     valid: List[str] = []
 
+    errors = []
+
     async def _probe(path: str):
         url = f"{origin}{path}"
         try:
             resp = await client.head(url)
             if resp.status_code == 200:
                 valid.append(_normalize_url(url))
-        except Exception:
-            pass
+        except Exception as e:
+            errors.append((path, str(e)))
 
     tasks = [_probe(p) for p in COMMON_PROMO_PATHS]
     await asyncio.gather(*tasks)
 
     log.info("Probed %d common paths: %d valid", len(COMMON_PROMO_PATHS), len(valid))
+    if not valid and errors:
+        log.warning(
+            "All %d path probes failed for %s — first error: %s",
+            len(errors), base_url, errors[0][1][:200],
+        )
     return valid
 
 
