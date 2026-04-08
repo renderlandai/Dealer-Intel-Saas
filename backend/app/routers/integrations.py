@@ -450,7 +450,6 @@ async def dropbox_status(user: AuthUser = Depends(get_current_user)):
             .select("workspace_name, folder_path, folder_name, campaign_id, last_synced_at, connected_at")\
             .eq("organization_id", str(user.org_id))\
             .eq("provider", "dropbox")\
-            .maybe_single()\
             .execute()
     except Exception:
         return {"connected": False}
@@ -458,14 +457,15 @@ async def dropbox_status(user: AuthUser = Depends(get_current_user)):
     if not result.data:
         return {"connected": False}
 
+    row = result.data[0]
     return {
         "connected": True,
-        "account_name": result.data.get("workspace_name", ""),
-        "folder_path": result.data.get("folder_path"),
-        "folder_name": result.data.get("folder_name"),
-        "campaign_id": result.data.get("campaign_id"),
-        "last_synced_at": result.data.get("last_synced_at"),
-        "connected_at": result.data.get("connected_at"),
+        "account_name": row.get("workspace_name", ""),
+        "folder_path": row.get("folder_path"),
+        "folder_name": row.get("folder_name"),
+        "campaign_id": row.get("campaign_id"),
+        "last_synced_at": row.get("last_synced_at"),
+        "connected_at": row.get("connected_at"),
     }
 
 
