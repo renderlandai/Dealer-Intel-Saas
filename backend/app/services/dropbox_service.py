@@ -70,11 +70,16 @@ def _list_folder(integration: Dict[str, Any], path: str) -> List[Dict[str, Any]]
         headers={"Content-Type": "application/json"},
         json={"path": path, "include_non_downloadable_files": False, "limit": 2000},
     )
-    if not resp or resp.status_code != 200:
+    if not resp:
+        log.error("Dropbox list_folder returned None for path '%s'", path)
+        return entries
+    if resp.status_code != 200:
+        log.error("Dropbox list_folder %d for path '%s': %s", resp.status_code, path, resp.text[:300])
         return entries
 
     data = resp.json()
     entries.extend(data.get("entries", []))
+    log.info("Dropbox list_folder '%s': found %d entries", path, len(entries))
 
     while data.get("has_more"):
         resp = _dbx_request(
@@ -101,7 +106,11 @@ def _import_image(integration: Dict[str, Any], entry: Dict[str, Any], campaign_i
         "https://content.dropboxapi.com/2/files/download",
         headers={"Dropbox-API-Arg": f'{{"path": "{dbx_path}"}}'},
     )
-    if not dl_resp or dl_resp.status_code != 200:
+    if not dl_resp:
+        log.error("Download returned None for '%s'", dbx_path)
+        return False
+    if dl_resp.status_code != 200:
+        log.error("Download failed %d for '%s': %s", dl_resp.status_code, dbx_path, dl_resp.text[:200])
         return False
 
     content = dl_resp.content
@@ -211,21 +220,32 @@ def auto_sync_org(integration: Dict[str, Any]) -> Dict[str, Any]:
 
         # List images in this subfolder
         folder_entries = _list_folder(integration, folder_path)
+        log.info(
+            "Subfolder '%s': %d total entries, tags: %s",
+            folder_path, len(folder_entries),
+            [f"{e.get('name')} ({e.get('.tag')})" for e in folder_entries[:10]],
+        )
+
         image_entries = [
             e for e in folder_entries
             if e.get(".tag") == "file"
             and e.get("name", "").rsplit(".", 1)[-1].lower() in IMAGE_EXTENSIONS
             and e.get("size", 0) <= MAX_FILE_SIZE
         ]
+        log.info("Subfolder '%s': %d images after filter", folder_path, len(image_entries))
 
         for img in image_entries:
             if img["name"] in existing_names:
                 images_skipped += 1
                 continue
             try:
-                if _import_image(integration, img, campaign_id):
+                success = _import_image(integration, img, campaign_id)
+                if success:
                     existing_names.add(img["name"])
                     images_imported += 1
+                    log.info("Imported '%s' into campaign %s", img["name"], campaign_id)
+                else:
+                    log.warning("_import_image returned False for '%s'", img["name"])
             except Exception as e:
                 log.error("Failed to import %s: %s", img["name"], e)
 
