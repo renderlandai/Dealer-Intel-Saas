@@ -1,5 +1,6 @@
 """Dropbox auto-sync — watch /Dealer Intel/ subfolders, auto-create campaigns, import images."""
 import base64
+import json
 import logging
 import time
 import uuid as uuid_lib
@@ -101,10 +102,11 @@ def _import_image(integration: Dict[str, Any], entry: Dict[str, Any], campaign_i
     name = entry["name"]
     dbx_path = entry["path_lower"]
 
+    api_arg = json.dumps({"path": dbx_path}, ensure_ascii=True)
     dl_resp = _dbx_request(
         integration, "POST",
         "https://content.dropboxapi.com/2/files/download",
-        headers={"Dropbox-API-Arg": f'{{"path": "{dbx_path}"}}'},
+        headers={"Dropbox-API-Arg": api_arg},
     )
     if not dl_resp:
         log.error("Download returned None for '%s'", dbx_path)
