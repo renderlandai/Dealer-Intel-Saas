@@ -145,3 +145,11 @@ services:
         scope: RUN_TIME
         type: SECRET
         value: "PLACEHOLDER"
+      - key: JIRA_CLIENT_ID
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: JIRA_CLIENT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"

@@ -893,6 +893,50 @@ export const autoSyncDropbox = async (): Promise<{
   return data;
 };
 
+export interface JiraStatus {
+  connected: boolean;
+  site_name?: string;
+  cloud_id?: string;
+  project_key?: string | null;
+  connected_at?: string;
+}
+
+export interface JiraProject {
+  key: string;
+  name: string;
+  id: string;
+}
+
+export const getJiraStatus = async (): Promise<JiraStatus> => {
+  const { data } = await api.get("/integrations/jira/status");
+  return data;
+};
+
+export const startJiraInstall = async (): Promise<{ authorize_url: string }> => {
+  const { data } = await api.get("/integrations/jira/install");
+  return data;
+};
+
+export const disconnectJira = async (): Promise<{ status: string }> => {
+  const { data } = await api.delete("/integrations/jira");
+  return data;
+};
+
+export const listJiraProjects = async (): Promise<{ projects: JiraProject[] }> => {
+  const { data } = await api.get("/integrations/jira/projects");
+  return data;
+};
+
+export const selectJiraProject = async (projectKey: string): Promise<{ status: string }> => {
+  const { data } = await api.post("/integrations/jira/select-project", { project_key: projectKey });
+  return data;
+};
+
+export const testJiraIssue = async (): Promise<{ success: boolean; message: string }> => {
+  const { data } = await api.post("/integrations/jira/test");
+  return data;
+};
+
 // ── Billing ────────────────────────────────────────────────────
 
 export const getBillingUsage = async (): Promise<BillingUsage> => {

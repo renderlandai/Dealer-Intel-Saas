@@ -34,6 +34,10 @@ SF_SCOPES = "full refresh_token"
 DBX_OAUTH_AUTHORIZE = "https://www.dropbox.com/oauth2/authorize"
 DBX_OAUTH_TOKEN = "https://api.dropboxapi.com/oauth2/token"
 
+JIRA_OAUTH_AUTHORIZE = "https://auth.atlassian.com/authorize"
+JIRA_OAUTH_TOKEN = "https://auth.atlassian.com/oauth/token"
+JIRA_SCOPES = "read:jira-work write:jira-work read:jira-user offline_access"
+
 
 def _get_backend_base() -> str:
     settings = get_settings()
@@ -742,3 +746,243 @@ async def dropbox_trigger_auto_sync(
             f"{result['images_skipped']} skipped"
         ),
     }
+
+
+# ─── Jira ───────────────────────────────────────────────────────
+
+
+def _jira_redirect_uri() -> str:
+    return _get_backend_base() + "/api/v1/integrations/jira/callback"
+
+
+@router.get("/jira/install", summary="Start Jira OAuth flow")
+async def jira_install(user: AuthUser = Depends(get_current_user)):
+    """Redirect the user to Atlassian's OAuth consent screen."""
+    settings = get_settings()
+    if not settings.jira_client_id:
+        raise HTTPException(500, "Jira integration is not configured")
+
+    state = _sign_state(str(user.org_id))
+    params = urlencode({
+        "audience": "api.atlassian.com",
+        "client_id": settings.jira_client_id,
+        "scope": JIRA_SCOPES,
+        "redirect_uri": _jira_redirect_uri(),
+        "state": state,
+        "response_type": "code",
+        "prompt": "consent",
+    })
+    return {"authorize_url": f"{JIRA_OAUTH_AUTHORIZE}?{params}"}
+
+
+@router.get("/jira/callback", summary="Jira OAuth callback")
+async def jira_callback(code: str, state: str):
+    """Exchange the authorization code for tokens and store the integration."""
+    org_id = _verify_state(state)
+    settings = get_settings()
+
+    try:
+        resp = httpx.post(JIRA_OAUTH_TOKEN, json={
+            "grant_type": "authorization_code",
+            "client_id": settings.jira_client_id,
+            "client_secret": settings.jira_client_secret,
+            "code": code,
+            "redirect_uri": _jira_redirect_uri(),
+        }, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        log.error("Jira OAuth token exchange failed: %s", e)
+        return RedirectResponse(f"{settings.frontend_url}/settings?jira=error")
+
+    if "error" in data:
+        log.error("Jira OAuth error: %s", data.get("error_description", data.get("error")))
+        return RedirectResponse(f"{settings.frontend_url}/settings?jira=error")
+
+    access_token = data.get("access_token", "")
+    refresh_token = data.get("refresh_token", "")
+
+    # Fetch accessible resources (cloud sites)
+    cloud_id = ""
+    site_name = ""
+    try:
+        res_resp = httpx.get(
+            "https://api.atlassian.com/oauth/token/accessible-resources",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+        resources = res_resp.json()
+        if resources:
+            cloud_id = resources[0].get("id", "")
+            site_name = resources[0].get("name", "")
+    except Exception:
+        pass
+
+    supabase.table("integrations").upsert({
+        "organization_id": org_id,
+        "provider": "jira",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "cloud_id": cloud_id,
+        "workspace_name": site_name,
+        "connected_at": "now()",
+    }, on_conflict="organization_id,provider").execute()
+
+    log.info("Jira connected for org %s — site '%s' (cloud %s)", org_id, site_name, cloud_id)
+    return RedirectResponse(f"{settings.frontend_url}/settings?jira=connected")
+
+
+@router.get("/jira/status", summary="Get Jira integration status")
+async def jira_status(user: AuthUser = Depends(get_current_user)):
+    """Return current Jira integration status for the org."""
+    try:
+        result = supabase.table("integrations")\
+            .select("workspace_name, cloud_id, project_key, connected_at")\
+            .eq("organization_id", str(user.org_id))\
+            .eq("provider", "jira")\
+            .execute()
+    except Exception:
+        return {"connected": False}
+
+    if not result.data:
+        return {"connected": False}
+
+    row = result.data[0]
+    return {
+        "connected": True,
+        "site_name": row.get("workspace_name", ""),
+        "cloud_id": row.get("cloud_id", ""),
+        "project_key": row.get("project_key"),
+        "connected_at": row.get("connected_at"),
+    }
+
+
+@router.delete("/jira", summary="Disconnect Jira")
+async def jira_disconnect(user: AuthUser = Depends(get_current_user)):
+    """Remove the Jira integration for the org."""
+    supabase.table("integrations")\
+        .delete()\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "jira")\
+        .execute()
+
+    log.info("Jira disconnected for org %s", user.org_id)
+    return {"status": "disconnected"}
+
+
+@router.get("/jira/projects", summary="List Jira projects")
+async def jira_list_projects(user: AuthUser = Depends(get_current_user)):
+    """List available projects in the connected Jira site."""
+    integration = supabase.table("integrations")\
+        .select("access_token, refresh_token, cloud_id")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "jira")\
+        .execute()
+
+    if not integration.data:
+        raise HTTPException(400, "Jira is not connected")
+
+    row = integration.data[0]
+    token = row["access_token"]
+    cloud_id = row["cloud_id"]
+
+    try:
+        resp = httpx.get(
+            f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/project/search",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            timeout=15,
+        )
+
+        if resp.status_code == 401:
+            token = _refresh_jira_token(user.org_id, row["refresh_token"])
+            if not token:
+                raise HTTPException(401, "Jira session expired. Please reconnect.")
+            resp = httpx.get(
+                f"https://api.atlassian.com/ex/jira/{cloud_id}/rest/api/3/project/search",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+                timeout=15,
+            )
+
+        if resp.status_code != 200:
+            raise HTTPException(502, f"Jira API error: {resp.text[:200]}")
+
+        data = resp.json()
+        projects = [
+            {"key": p["key"], "name": p["name"], "id": p["id"]}
+            for p in data.get("values", [])
+        ]
+        return {"projects": projects}
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.error("Jira project listing failed: %s", e)
+        raise HTTPException(500, f"Failed to list Jira projects: {e}")
+
+
+@router.post("/jira/select-project", summary="Select Jira project for violations")
+async def jira_select_project(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Set which Jira project to create violation issues in."""
+    body = await request.json()
+    project_key = body.get("project_key", "")
+
+    if not project_key:
+        raise HTTPException(400, "project_key is required")
+
+    supabase.table("integrations").update({
+        "project_key": project_key,
+    }).eq("organization_id", str(user.org_id))\
+      .eq("provider", "jira")\
+      .execute()
+
+    return {"status": "project_selected", "project_key": project_key}
+
+
+@router.post("/jira/test", summary="Create test Jira issue")
+@limiter.limit("5/minute")
+async def jira_test(request: Request, user: AuthUser = Depends(get_current_user)):
+    """Create a test issue in the selected Jira project."""
+    result = supabase.table("integrations")\
+        .select("access_token, refresh_token, cloud_id, project_key")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "jira")\
+        .execute()
+
+    if not result.data:
+        raise HTTPException(400, "Jira is not connected. Connect Jira first.")
+
+    row = result.data[0]
+    if not row.get("project_key"):
+        raise HTTPException(400, "No Jira project selected. Choose a project first.")
+
+    from ..services.notification_service import send_jira_test
+
+    success = send_jira_test(organization_id=user.org_id)
+    if success:
+        return {"success": True, "message": "Test issue created in Jira"}
+    raise HTTPException(500, "Failed to create test issue. Check the Jira connection.")
+
+
+def _refresh_jira_token(org_id, refresh_token: str):
+    """Refresh an expired Jira access token."""
+    settings = get_settings()
+    try:
+        resp = httpx.post(JIRA_OAUTH_TOKEN, json={
+            "grant_type": "refresh_token",
+            "client_id": settings.jira_client_id,
+            "client_secret": settings.jira_client_secret,
+            "refresh_token": refresh_token,
+        }, timeout=15)
+        data = resp.json()
+        new_token = data.get("access_token")
+        if not new_token:
+            return None
+        supabase.table("integrations").update({
+            "access_token": new_token,
+        }).eq("organization_id", str(org_id))\
+          .eq("provider", "jira")\
+          .execute()
+        return new_token
+    except Exception:
+        return None

@@ -642,3 +642,200 @@ def send_salesforce_test(*, organization_id: UUID) -> bool:
                     "Scan results and violation alerts will appear as Tasks automatically.",
         priority="Low",
     )
+
+
+# ─── Jira ────────────────────────────────────────────────────────
+
+
+def _get_jira_integration(organization_id: UUID) -> Optional[Dict[str, Any]]:
+    """Return the Jira integration row for the org, or None."""
+    try:
+        result = supabase.table("integrations")\
+            .select("access_token, refresh_token, cloud_id, project_key")\
+            .eq("organization_id", str(organization_id))\
+            .eq("provider", "jira")\
+            .execute()
+        if result.data:
+            return result.data[0]
+    except Exception:
+        pass
+    return None
+
+
+def _refresh_jira_token(organization_id: UUID, refresh_token: str) -> Optional[str]:
+    """Refresh an expired Jira access token. Returns new token or None."""
+    from ..config import get_settings
+    settings = get_settings()
+    try:
+        resp = httpx.post("https://auth.atlassian.com/oauth/token", json={
+            "grant_type": "refresh_token",
+            "client_id": settings.jira_client_id,
+            "client_secret": settings.jira_client_secret,
+            "refresh_token": refresh_token,
+        }, timeout=15)
+        data = resp.json()
+        new_token = data.get("access_token")
+        if not new_token:
+            return None
+        supabase.table("integrations").update({
+            "access_token": new_token,
+        }).eq("organization_id", str(organization_id))\
+          .eq("provider", "jira")\
+          .execute()
+        return new_token
+    except Exception as e:
+        log.error("Jira token refresh failed for org %s: %s", organization_id, e)
+    return None
+
+
+def _jira_api_request(
+    *,
+    organization_id: UUID,
+    integration: Dict[str, Any],
+    method: str,
+    path: str,
+    json_body: Optional[Dict] = None,
+) -> Optional[httpx.Response]:
+    """Make a Jira REST API request with automatic token refresh on 401."""
+    cloud_id = integration.get("cloud_id", "")
+    token = integration["access_token"]
+    url = f"https://api.atlassian.com/ex/jira/{cloud_id}{path}"
+
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"}
+
+    try:
+        resp = httpx.request(method, url, headers=headers, json=json_body, timeout=15)
+    except Exception as e:
+        log.error("Jira API request failed: %s", e)
+        return None
+
+    if resp.status_code == 401:
+        new_token = _refresh_jira_token(organization_id, integration.get("refresh_token", ""))
+        if not new_token:
+            return resp
+        headers["Authorization"] = f"Bearer {new_token}"
+        try:
+            resp = httpx.request(method, url, headers=headers, json=json_body, timeout=15)
+        except Exception:
+            return None
+
+    return resp
+
+
+def _create_jira_issue(
+    *,
+    organization_id: UUID,
+    integration: Dict[str, Any],
+    summary: str,
+    description: str,
+    priority: str = "Medium",
+    issue_type: str = "Task",
+) -> bool:
+    """Create an issue in the selected Jira project."""
+    project_key = integration.get("project_key")
+    if not project_key:
+        log.warning("Jira project_key not set for org %s", organization_id)
+        return False
+
+    resp = _jira_api_request(
+        organization_id=organization_id,
+        integration=integration,
+        method="POST",
+        path="/rest/api/3/issue",
+        json_body={
+            "fields": {
+                "project": {"key": project_key},
+                "summary": summary,
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [{"type": "text", "text": description}],
+                        }
+                    ],
+                },
+                "issuetype": {"name": issue_type},
+                "priority": {"name": priority},
+            }
+        },
+    )
+    if resp and resp.status_code in (200, 201):
+        issue_key = resp.json().get("key", "")
+        log.info("Jira issue %s created for org %s: %s", issue_key, organization_id, summary)
+        return True
+    if resp:
+        log.error("Jira issue creation failed %d: %s", resp.status_code, resp.text[:300])
+    return False
+
+
+def notify_jira_scan_complete(
+    *,
+    organization_id: UUID,
+    scan_source: str = "",
+    summary: Dict[str, Any],
+    violations: Optional[List[Dict[str, Any]]] = None,
+) -> bool:
+    """Create Jira issues for scan violations if connected. Returns True on success."""
+    integration = _get_jira_integration(organization_id)
+    if not integration or not integration.get("project_key"):
+        return False
+
+    violations = violations or []
+    if not violations:
+        return False
+
+    total = summary.get("total_images", 0)
+    compliance_rate = summary.get("compliance_rate", 0)
+    channel = (scan_source or "scan").replace("_", " ").title()
+
+    issue_summary = (
+        f"[Dealer Intel] {channel} Scan — "
+        f"{len(violations)} violation{'s' if len(violations) != 1 else ''} found "
+        f"({compliance_rate}% compliance)"
+    )
+
+    lines = [
+        f"Scan Source: {channel}",
+        f"Total Images Analyzed: {total}",
+        f"Compliance Rate: {compliance_rate}%",
+        f"Violations: {len(violations)}",
+        "",
+        "--- Violations ---",
+    ]
+    for v in violations[:20]:
+        lines.append(
+            f"• {v.get('asset_name', '?')} at {v.get('distributor_name', '?')} "
+            f"— {v.get('confidence_score', 0)}% confidence"
+        )
+    if len(violations) > 20:
+        lines.append(f"...and {len(violations) - 20} more")
+
+    description = "\n".join(lines)
+
+    priority = "High" if len(violations) >= 5 else "Medium"
+
+    return _create_jira_issue(
+        organization_id=organization_id,
+        integration=integration,
+        summary=issue_summary,
+        description=description,
+        priority=priority,
+    )
+
+
+def send_jira_test(*, organization_id: UUID) -> bool:
+    """Create a test issue in Jira."""
+    integration = _get_jira_integration(organization_id)
+    if not integration:
+        return False
+
+    return _create_jira_issue(
+        organization_id=organization_id,
+        integration=integration,
+        summary="[Dealer Intel] Connection Test — Jira Connected",
+        description="This is a test issue from Dealer Intel.\n\n"
+                    "Scan violations will appear as issues in this project automatically.",
+        priority="Low",
+    )

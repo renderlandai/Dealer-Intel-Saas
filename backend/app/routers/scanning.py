@@ -8,7 +8,7 @@ from ..auth import AuthUser, get_current_user
 from ..database import supabase
 from ..models import ScanJobCreate, ScanJob, ScanSource
 from ..services import screenshot_service, extraction_service, ai_service, serpapi_service, apify_meta_service, apify_instagram_service
-from ..services.notification_service import notify_scan_complete, notify_slack_scan_complete, notify_salesforce_scan_complete
+from ..services.notification_service import notify_scan_complete, notify_slack_scan_complete, notify_salesforce_scan_complete, notify_jira_scan_complete
 from ..plan_enforcement import (
     OrgPlan, get_org_plan,
     check_scan_quota, check_concurrent_scans, check_channel_allowed,
@@ -127,13 +127,19 @@ def _send_scan_notifications(
             summary=summary,
             violations=violations_formatted,
         )
-        notify_salesforce_scan_complete(
-            organization_id=UUID(org_id),
-            scan_source=scan_source,
-            summary=summary,
-            violations=violations_formatted,
-        )
-    except Exception as e:
+                notify_salesforce_scan_complete(
+                    organization_id=UUID(org_id),
+                    scan_source=scan_source,
+                    summary=summary,
+                    violations=violations_formatted,
+                )
+                notify_jira_scan_complete(
+                    organization_id=UUID(org_id),
+                    scan_source=scan_source,
+                    summary=summary,
+                    violations=violations_formatted,
+                )
+            except Exception as e:
         log.warning("Failed to send scan notifications for %s: %s", scan_job_id, e)
 
 

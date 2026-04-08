@@ -313,6 +313,16 @@ def check_salesforce_notifications(op: OrgPlan) -> None:
         )
 
 
+def check_jira_notifications(op: OrgPlan) -> None:
+    """Raise 403 if Jira integration is not included in the plan."""
+    if not op.limits.get("jira_notifications"):
+        raise HTTPException(
+            403,
+            f"Jira integration is not available on your {op.plan} plan. "
+            f"Upgrade to Enterprise to enable Jira.",
+        )
+
+
 def check_compliance_rules_limit(op: OrgPlan) -> None:
     """Raise 403 if the org has reached its compliance rules cap."""
     max_rules = op.limits.get("max_compliance_rules")

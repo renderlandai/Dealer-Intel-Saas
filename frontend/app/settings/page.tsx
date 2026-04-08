@@ -29,8 +29,8 @@ import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage, getSalesforceStatus, startSalesforceInstall, disconnectSalesforce, testSalesforceTask, getDropboxStatus, startDropboxInstall, disconnectDropbox, autoSyncDropbox } from "@/lib/api";
-import type { SlackStatus, SalesforceStatus, DropboxStatus } from "@/lib/api";
+import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage, getSalesforceStatus, startSalesforceInstall, disconnectSalesforce, testSalesforceTask, getDropboxStatus, startDropboxInstall, disconnectDropbox, autoSyncDropbox, getJiraStatus, startJiraInstall, disconnectJira, listJiraProjects, selectJiraProject, testJiraIssue } from "@/lib/api";
+import type { SlackStatus, SalesforceStatus, DropboxStatus, JiraStatus, JiraProject } from "@/lib/api";
 import { orgSettingsSchema } from "@/lib/schemas";
 import { useBillingUsage } from "@/lib/hooks";
 import { useAuth } from "@/lib/auth-context";
@@ -92,6 +92,17 @@ export default function SettingsPage() {
   const [dbxSyncing, setDbxSyncing] = useState(false);
   const [dbxSyncResult, setDbxSyncResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
+  const [jira, setJira] = useState<JiraStatus>({ connected: false });
+  const [jiraLoading, setJiraLoading] = useState(true);
+  const [jiraConnecting, setJiraConnecting] = useState(false);
+  const [jiraDisconnecting, setJiraDisconnecting] = useState(false);
+  const [jiraTesting, setJiraTesting] = useState(false);
+  const [jiraTestResult, setJiraTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [jiraProjects, setJiraProjects] = useState<JiraProject[]>([]);
+  const [jiraProjectsOpen, setJiraProjectsOpen] = useState(false);
+  const [jiraSelectedProject, setJiraSelectedProject] = useState("");
+  const [jiraLoadingProjects, setJiraLoadingProjects] = useState(false);
+
   useEffect(() => {
     getOrgSettings()
       .then((res) => {
@@ -123,6 +134,11 @@ export default function SettingsPage() {
       .catch(() => {})
       .finally(() => setDbxLoading(false));
 
+    getJiraStatus()
+      .then(setJira)
+      .catch(() => {})
+      .finally(() => setJiraLoading(false));
+
     const params = new URLSearchParams(window.location.search);
     if (params.get("slack") === "connected") {
       getSlackStatus().then(setSlack).catch(() => {});
@@ -134,6 +150,10 @@ export default function SettingsPage() {
     }
     if (params.get("dropbox") === "connected") {
       getDropboxStatus().then(setDbx).catch(() => {});
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    if (params.get("jira") === "connected") {
+      getJiraStatus().then(setJira).catch(() => {});
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
@@ -351,6 +371,65 @@ export default function SettingsPage() {
       setDbxSyncResult({ ok: false, msg: e?.response?.data?.detail || "Sync failed" });
     } finally {
       setDbxSyncing(false);
+    }
+  };
+
+  const handleConnectJira = async () => {
+    setJiraConnecting(true);
+    try {
+      const { authorize_url } = await startJiraInstall();
+      window.location.href = authorize_url;
+    } catch {
+      setJiraConnecting(false);
+    }
+  };
+
+  const handleDisconnectJira = async () => {
+    setJiraDisconnecting(true);
+    try {
+      await disconnectJira();
+      setJira({ connected: false });
+      setJiraProjects([]);
+      setJiraTestResult(null);
+      setJiraProjectsOpen(false);
+    } catch {} finally {
+      setJiraDisconnecting(false);
+    }
+  };
+
+  const handleLoadJiraProjects = async () => {
+    setJiraLoadingProjects(true);
+    try {
+      const res = await listJiraProjects();
+      setJiraProjects(res.projects);
+      setJiraProjectsOpen(true);
+    } catch (e: any) {
+      setJiraTestResult({ ok: false, msg: e?.response?.data?.detail || "Failed to load projects" });
+    } finally {
+      setJiraLoadingProjects(false);
+    }
+  };
+
+  const handleSelectJiraProject = async () => {
+    if (!jiraSelectedProject) return;
+    try {
+      await selectJiraProject(jiraSelectedProject);
+      setJira(prev => ({ ...prev, project_key: jiraSelectedProject }));
+      setJiraProjectsOpen(false);
+    } catch {}
+  };
+
+  const handleTestJira = async () => {
+    setJiraTesting(true);
+    setJiraTestResult(null);
+    try {
+      const result = await testJiraIssue();
+      setJiraTestResult({ ok: true, msg: result.message });
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || "Failed to create test issue";
+      setJiraTestResult({ ok: false, msg: detail });
+    } finally {
+      setJiraTesting(false);
     }
   };
 
@@ -1005,8 +1084,163 @@ export default function SettingsPage() {
           </CardContent>
         </Card>
 
-        {/* Report Theme */}
+        {/* Jira Integration */}
         <Card className="opacity-0 animate-fade-up" style={{ animationFillMode: "forwards", animationDelay: "170ms" }}>
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center bg-secondary border border-border">
+                <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none">
+                  <path d="M11.53 2c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.97 4.35 4.35 4.35V2.84A.84.84 0 0 0 21.17 2H11.53z" fill="#2684FF"/>
+                  <path d="M8.77 4.92c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.97 4.35 4.35 4.35V5.76a.84.84 0 0 0-.84-.84H8.77z" fill="url(#jira-g1)" fillOpacity="0.7"/>
+                  <path d="M6 7.84c0 2.4 1.97 4.35 4.35 4.35h1.78v1.7c0 2.4 1.97 4.35 4.35 4.35V8.68a.84.84 0 0 0-.84-.84H6z" fill="url(#jira-g2)" fillOpacity="0.5"/>
+                  <defs>
+                    <linearGradient id="jira-g1" x1="18" y1="5" x2="10" y2="14" gradientUnits="userSpaceOnUse"><stop stopColor="#2684FF"/><stop offset="1" stopColor="#0052CC"/></linearGradient>
+                    <linearGradient id="jira-g2" x1="16" y1="8" x2="8" y2="17" gradientUnits="userSpaceOnUse"><stop stopColor="#2684FF"/><stop offset="1" stopColor="#0052CC"/></linearGradient>
+                  </defs>
+                </svg>
+              </div>
+              <div className="flex-1">
+                <CardTitle className="text-base">Jira Integration</CardTitle>
+                <CardDescription className="text-xs">
+                  Create Jira issues automatically from scan violations
+                </CardDescription>
+              </div>
+              {jira.connected && (
+                <span className="flex items-center gap-1.5 text-xs text-success font-medium">
+                  <span className="h-1.5 w-1.5 rounded-full bg-success" />
+                  Connected
+                </span>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {jiraLoading ? (
+              <div className="h-16 border border-border bg-secondary/20 animate-pulse" />
+            ) : jira.connected ? (
+              <>
+                <div className="flex items-center gap-4 p-4 border border-border bg-secondary/20">
+                  <div className="flex-1">
+                    <p className="text-sm font-medium">{jira.site_name || "Jira Site"}</p>
+                    {jira.project_key ? (
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        Project: <span className="font-mono">{jira.project_key}</span>
+                      </p>
+                    ) : (
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        No project selected — choose a project for violations
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleLoadJiraProjects}
+                      disabled={jiraLoadingProjects}
+                    >
+                      {jiraLoadingProjects ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
+                      )}
+                      {jira.project_key ? "Change Project" : "Pick Project"}
+                    </Button>
+                    {jira.project_key && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={handleTestJira}
+                        disabled={jiraTesting}
+                      >
+                        {jiraTesting ? (
+                          <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Send className="mr-1.5 h-3.5 w-3.5" />
+                        )}
+                        Test
+                      </Button>
+                    )}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-destructive hover:text-destructive hover:border-destructive/50"
+                      onClick={handleDisconnectJira}
+                      disabled={jiraDisconnecting}
+                    >
+                      <Unplug className="mr-1.5 h-3.5 w-3.5" />
+                      {jiraDisconnecting ? "Removing..." : "Disconnect"}
+                    </Button>
+                  </div>
+                </div>
+
+                {jiraProjectsOpen && (
+                  <div className="border border-border p-4 space-y-3">
+                    <p className="text-sm font-medium">Select a Jira project for violation issues:</p>
+                    <div className="flex gap-2">
+                      <select
+                        className="flex-1 text-sm border border-border bg-background px-3 py-1.5"
+                        value={jiraSelectedProject}
+                        onChange={(e) => setJiraSelectedProject(e.target.value)}
+                      >
+                        <option value="">Choose project…</option>
+                        {jiraProjects.map((p) => (
+                          <option key={p.key} value={p.key}>{p.name} ({p.key})</option>
+                        ))}
+                      </select>
+                      <Button
+                        size="sm"
+                        disabled={!jiraSelectedProject}
+                        onClick={handleSelectJiraProject}
+                      >
+                        Use This Project
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {jiraTestResult && (
+                  <div className={`flex items-center gap-2 ${jiraTestResult.ok ? "text-success" : "text-destructive"}`}>
+                    {jiraTestResult.ok ? <CheckCircle className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                    <span className="text-sm">{jiraTestResult.msg}</span>
+                  </div>
+                )}
+
+                <p className="text-2xs text-muted-foreground">
+                  Scan violations will be created as issues in the selected Jira project automatically after each scan.
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="border border-dashed border-border p-4 flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center bg-secondary/50 border border-border flex-shrink-0">
+                    <MessageSquare className="h-5 w-5 text-muted-foreground" />
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-sm text-muted-foreground">Jira is not connected</p>
+                    <p className="text-2xs text-muted-foreground mt-0.5">
+                      Connect Jira to automatically create issues from scan violations
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={handleConnectJira}
+                    disabled={jiraConnecting}
+                  >
+                    {jiraConnecting ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    {jiraConnecting ? "Connecting..." : "Connect Jira"}
+                  </Button>
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* Report Theme */}
+        <Card className="opacity-0 animate-fade-up" style={{ animationFillMode: "forwards", animationDelay: "190ms" }}>
           <CardHeader>
             <div className="flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center bg-secondary border border-border">

@@ -176,6 +176,13 @@ class Settings(BaseSettings):
     dropbox_client_id: str = Field(default="", description="Dropbox App Key")
     dropbox_client_secret: str = Field(default="", description="Dropbox App Secret")
     
+    # ===========================================
+    # Jira Integration (OAuth 2.0 3LO)
+    # ===========================================
+    
+    jira_client_id: str = Field(default="", description="Atlassian OAuth Client ID")
+    jira_client_secret: str = Field(default="", description="Atlassian OAuth Client Secret")
+    
     class Config:
         env_file = ".env"
         case_sensitive = False
@@ -240,6 +247,7 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
         "email_notifications": False,
         "slack_notifications": False,
         "salesforce_notifications": False,
+        "jira_notifications": False,
         "compliance_trends": False,
         "adaptive_calibration_active": False,
         "api_access": False,
@@ -266,6 +274,7 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
         "email_notifications": False,
         "slack_notifications": False,
         "salesforce_notifications": False,
+        "jira_notifications": False,
         "compliance_trends": False,
         "adaptive_calibration_active": False,
         "api_access": False,
@@ -292,6 +301,7 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
         "email_notifications": True,
         "slack_notifications": False,
         "salesforce_notifications": False,
+        "jira_notifications": False,
         "compliance_trends": False,
         "adaptive_calibration_active": True,
         "api_access": False,
@@ -318,6 +328,7 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
         "email_notifications": True,
         "slack_notifications": False,
         "salesforce_notifications": False,
+        "jira_notifications": False,
         "compliance_trends": True,
         "adaptive_calibration_active": True,
         "api_access": False,
@@ -344,6 +355,7 @@ PLAN_LIMITS: Dict[str, Dict[str, Any]] = {
         "email_notifications": True,
         "slack_notifications": True,
         "salesforce_notifications": True,
+        "jira_notifications": True,
         "compliance_trends": True,
         "adaptive_calibration_active": True,
         "api_access": True,
