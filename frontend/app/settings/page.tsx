@@ -351,6 +351,7 @@ export default function SettingsPage() {
 
   const handleBrowseDropbox = async (path = "") => {
     setDbxBrowsing(true);
+    setDbxSyncResult(null);
     try {
       const res = await listDropboxFolders(path);
       setDbxFolders(res.folders);
@@ -358,7 +359,10 @@ export default function SettingsPage() {
       setDbxImageCount(res.image_count);
       const campaigns = await getCampaigns();
       setDbxCampaigns(campaigns);
-    } catch {} finally {
+    } catch (e: any) {
+      const detail = e?.response?.data?.detail || "Failed to browse Dropbox folders";
+      setDbxSyncResult({ ok: false, msg: detail });
+    } finally {
       setDbxBrowsing(false);
     }
   };
