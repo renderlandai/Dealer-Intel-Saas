@@ -103,6 +103,21 @@ class _ImageCache:
 
 _image_cache = _ImageCache()
 
+_VALID_IMAGE_CONTENT_TYPES = frozenset({
+    "image/jpeg", "image/png", "image/gif", "image/webp",
+    "image/bmp", "image/tiff", "image/svg+xml",
+})
+
+
+def _is_valid_image(data: bytes) -> bool:
+    """Return True if Pillow can identify *data* as a supported image format."""
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.verify()
+        return True
+    except Exception:
+        return False
+
 
 async def download_image(url: str) -> bytes:
     """Download image from URL with caching, timeout, and error handling.
@@ -113,10 +128,13 @@ async def download_image(url: str) -> bytes:
     if url.startswith("data:"):
         try:
             header, encoded = url.split(",", 1)
-            return base64.b64decode(encoded)
+            data = base64.b64decode(encoded)
         except Exception as e:
             log.error("Error decoding base64 data URL: %s", e)
             raise
+        if not _is_valid_image(data):
+            raise ValueError("Data URL does not contain a valid image")
+        return data
 
     cached = _image_cache.get(url)
     if cached is not None:
@@ -126,6 +144,14 @@ async def download_image(url: str) -> bytes:
         try:
             response = await client.get(url, follow_redirects=True)
             response.raise_for_status()
+
+            if not _is_valid_image(response.content):
+                content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+                raise ValueError(
+                    f"Downloaded content is not a valid image "
+                    f"(content-type='{content_type}', {len(response.content)} bytes): {url[:100]}"
+                )
+
             _image_cache.put(url, response.content)
             return response.content
         except httpx.HTTPStatusError as e:
@@ -133,6 +159,8 @@ async def download_image(url: str) -> bytes:
             raise
         except httpx.TimeoutException:
             log.error("Timeout downloading image: %s", url[:100])
+            raise
+        except ValueError:
             raise
         except Exception as e:
             log.error("Error downloading image: %s - %s", e, url[:100])
@@ -157,7 +185,7 @@ def encode_image_base64(image_bytes: bytes) -> str:
 def optimize_image_for_api(
     image_bytes: bytes, 
     analysis_type: str = "default"
-) -> bytes:
+) -> Optional[bytes]:
     """
     Type-specific image optimization for better API performance and accuracy.
     
@@ -166,7 +194,7 @@ def optimize_image_for_api(
         analysis_type: One of 'screenshot', 'asset', 'default'
     
     Returns:
-        Optimized image bytes
+        Optimized image bytes, or None if the input is not a valid image.
     """
     try:
         img = Image.open(io.BytesIO(image_bytes))
@@ -237,8 +265,8 @@ def optimize_image_for_api(
         return optimized_bytes
         
     except Exception as e:
-        log.warning("Image optimization failed: %s, using original", e)
-        return image_bytes
+        log.warning("Image optimization failed (skipping image): %s", e)
+        return None
 
 
 async def compute_image_hashes(image_bytes: bytes) -> Dict[str, Any]:
@@ -344,10 +372,14 @@ async def call_anthropic_with_retry(
     use_model = model or CLAUDE_MODEL
     last_error = None
     
-    # Build message content with images
+    # Build message content with images, filtering out any None entries
+    valid_images = [img for img in images if img is not None]
+    if not valid_images:
+        raise ValueError("No valid images to send to API — all images failed validation or optimization")
+
     content = [{"type": "text", "text": prompt + "\n\nRespond ONLY with valid JSON matching the required schema. No markdown, no explanation outside the JSON."}]
     
-    for img_bytes in images:
+    for img_bytes in valid_images:
         img_b64 = encode_image_base64(img_bytes)
         content.append({
             "type": "image",
@@ -837,11 +869,18 @@ async def localize_assets_in_screenshot(
     prompt = get_localization_prompt()
     screenshot_optimized = optimize_image_for_api(screenshot_bytes, "screenshot")
 
+    if screenshot_optimized is None:
+        log.warning("Screenshot failed optimization — skipping localization")
+        return []
+
     all_locations: List[Dict[str, Any]] = []
 
     for asset_bytes, asset_id, asset_name in asset_bytes_list:
         try:
             asset_optimized = optimize_image_for_api(asset_bytes, "asset")
+            if asset_optimized is None:
+                log.warning("Asset '%s' failed optimization — skipping", asset_name)
+                continue
             response_text = await call_anthropic_with_retry(
                 prompt, [asset_optimized, screenshot_optimized]
             )
@@ -891,13 +930,17 @@ async def filter_image(
     try:
         image_bytes = await download_image(image_url)
         image_bytes = optimize_image_for_api(image_bytes, "default")
+        if image_bytes is None:
+            raise ValueError("Discovered image failed optimization/validation")
 
         if asset_urls:
             asset_images = []
             for url in asset_urls:
                 try:
                     ab = await download_image(url)
-                    asset_images.append(optimize_image_for_api(ab, "asset"))
+                    optimized = optimize_image_for_api(ab, "asset")
+                    if optimized is not None:
+                        asset_images.append(optimized)
                 except Exception as e:
                     log.warning("Could not download asset for filter: %s", e)
             if asset_images:
@@ -950,6 +993,17 @@ async def compare_images(
         source_bytes = optimize_image_for_api(source_bytes, "asset")
         target_bytes = optimize_image_for_api(target_bytes, "default")
         
+        if source_bytes is None or target_bytes is None:
+            failed = "source" if source_bytes is None else "target"
+            log.warning("Comparison skipped: %s image failed optimization", failed)
+            return {
+                "similarity_score": 0,
+                "is_match": False,
+                "match_type": "none",
+                "modifications": [],
+                "error": f"{failed} image failed validation"
+            }
+        
         prompt = get_comparison_prompt()
         
         response_text = await call_anthropic_with_retry(prompt, [source_bytes, target_bytes], model=ENSEMBLE_MODEL)
@@ -987,6 +1041,14 @@ async def detect_asset_in_screenshot(
         screenshot_bytes = await download_image(screenshot_url)
         asset_bytes = optimize_image_for_api(asset_bytes, "asset")
 
+        if asset_bytes is None:
+            log.warning("Asset image failed optimization — skipping detection")
+            return {
+                "asset_found": False, "similarity_score": 0,
+                "is_match": False, "match_type": "none",
+                "modifications": [], "error": "Asset image failed validation"
+            }
+
         if settings.enable_tiling_fallback:
             return await _detect_asset_tiled(asset_bytes, screenshot_bytes)
         else:
@@ -1010,6 +1072,12 @@ async def _detect_asset_single(
 ) -> Dict[str, Any]:
     """Original single-image detection (legacy path)."""
     screenshot_bytes = optimize_image_for_api(screenshot_bytes, "screenshot")
+    if screenshot_bytes is None:
+        return {
+            "asset_found": False, "similarity_score": 0,
+            "is_match": False, "match_type": "none",
+            "modifications": [], "error": "Screenshot failed validation"
+        }
     prompt = get_detection_prompt()
 
     response_text = await call_anthropic_with_retry(prompt, [asset_bytes, screenshot_bytes], model=ENSEMBLE_MODEL)
@@ -1075,6 +1143,9 @@ async def _detect_asset_tiled(
 
         for idx, tile_bytes in enumerate(tiles):
             tile_optimized = optimize_image_for_api(tile_bytes, "screenshot")
+            if tile_optimized is None:
+                log.debug("Tile %d/%d: skipped (optimization failed)", idx + 1, len(tiles))
+                continue
             response_text = await call_anthropic_with_retry(prompt, [asset_bytes, tile_optimized], model=ENSEMBLE_MODEL)
             result = extract_json_from_response(response_text)
 
@@ -1128,6 +1199,10 @@ async def verify_borderline_match(
         
         asset_bytes = optimize_image_for_api(asset_bytes, "asset")
         discovered_bytes = optimize_image_for_api(discovered_bytes, "default")
+        
+        if asset_bytes is None or discovered_bytes is None:
+            log.warning("Verification skipped: image failed optimization")
+            return {"verified_score": initial_score, "is_match": False, "error": "Image failed validation"}
         
         prompt = get_verification_prompt()
         
@@ -1187,6 +1262,16 @@ async def analyze_compliance(
         
         discovered_bytes = optimize_image_for_api(discovered_bytes, "default")
         asset_bytes = optimize_image_for_api(asset_bytes, "asset")
+        
+        if discovered_bytes is None or asset_bytes is None:
+            log.warning("Compliance skipped: image failed optimization")
+            return ComplianceCheckResult(
+                is_compliant=True,
+                issues=[],
+                brand_elements={},
+                zombie_ad=False,
+                analysis_summary="Skipped — image failed validation"
+            )
         
         # Build rules text
         rules_text = ""
