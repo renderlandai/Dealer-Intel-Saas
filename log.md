@@ -2194,3 +2194,98 @@ ALTER TABLE integrations ADD COLUMN IF NOT EXISTS salesforce_sync_filter TEXT;
 | `frontend/lib/api.ts` | Added `SalesforceFilters` type, `getSalesforceFilters`, `setSalesforceFilter`, `syncSalesforce`, `getSalesforceSyncStatus` functions |
 | `frontend/app/settings/page.tsx` | Salesforce card: Account filter picker (grouped dropdown), Sync Now button, linked dealer count + last sync time, updated descriptions for two-way sync |
 | `log.md` | This entry |
+
+---
+
+## 2026-04-09 — HubSpot Two-Way Sync Integration
+
+### Summary
+Built and deployed a full HubSpot CRM integration mirroring the Salesforce two-way sync architecture. OAuth connect, auto-provision custom Company properties, inbound dealer import with Company filter, outbound compliance push after scans, 30-minute scheduled sync, and full Settings UI card. Enterprise plan gated. Added HubSpot to the landing page integrations marquee.
+
+### What It Does
+
+- **Inbound (HubSpot → DI):** APScheduler job runs every 30 minutes, searches HubSpot Companies via the Search API (filtered by user-selected Company Type or Industry), upserts into `distributors` table. Links by `hubspot_id` or name match for existing dealers. Pulls company name, domain (→ website_url), and state (→ region).
+- **Outbound (DI → HubSpot):** After every scan, `push_compliance_to_hubspot()` patches compliance custom properties on each HubSpot-linked Company via `PATCH /crm/v3/objects/companies/{id}`.
+- **Auto-provisioning:** On OAuth connect, the Properties API auto-creates 5 custom properties on the HubSpot Company object — idempotent, skips existing properties.
+- **Token refresh:** Access tokens last 30 minutes. All API calls auto-refresh on 401 and store the new token pair.
+- **Sync filtering:** User must select which Companies to import (by Type or Industry) before sync runs. Prevents importing all CRM contacts as dealers.
+- **Manual sync:** "Sync Now" button on Settings page triggers an on-demand inbound pull.
+- **Frontend UI:** Filter picker dropdown (grouped by Company Type / Industry), sync button, test button, linked dealer count, last sync timestamp — all in a new HubSpot Settings card.
+
+### Custom Properties (auto-created on Company)
+
+| Property | API Name | Type | Direction |
+|----------|----------|------|-----------|
+| Dealer Intel ID | `dealer_intel_id` | string | Outbound (link key) |
+| Compliance Score | `compliance_score` | number | Outbound |
+| Open Violations | `open_violations` | number | Outbound |
+| Has Compliance Violation | `has_compliance_violation` | enumeration (boolean) | Outbound |
+| Last Scan Date | `last_scan_date` | datetime | Outbound |
+
+### Inbound Field Mapping (HubSpot Company → distributors)
+
+| HubSpot Property | Distributors Column |
+|-----------------|-------------------|
+| `name` | `name` |
+| `domain` | `website_url` |
+| `state` | `region` |
+
+### API Endpoints Added
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| GET | `/api/v1/integrations/hubspot/install` | Start HubSpot OAuth flow |
+| GET | `/api/v1/integrations/hubspot/callback` | OAuth callback — exchange code for tokens, auto-provision properties |
+| GET | `/api/v1/integrations/hubspot/status` | Connection status (portal name, portal ID) |
+| DELETE | `/api/v1/integrations/hubspot` | Disconnect HubSpot |
+| POST | `/api/v1/integrations/hubspot/test` | Test connection by querying Company count |
+| POST | `/api/v1/integrations/hubspot/sync` | Manual inbound sync trigger (3/min rate limit, Enterprise-gated) |
+| GET | `/api/v1/integrations/hubspot/sync/status` | Last sync timestamp + linked dealer count |
+| GET | `/api/v1/integrations/hubspot/filters` | Fetch Company Type + Industry picklist values |
+| PUT | `/api/v1/integrations/hubspot/filters` | Save the selected sync filter |
+
+### Architecture Notes
+
+- Mirrors the Salesforce sync architecture: same OAuth → store token → filter → inbound sync → outbound push pattern
+- HubSpot uses the Search API with JSON filter groups instead of Salesforce's SOQL
+- Properties API (`/crm/v3/properties/companies`) is simpler than Salesforce Tooling API — no DeveloperName lookups needed
+- Token refresh cycle is shorter (30 min vs ~2 hrs for Salesforce) — handled transparently by `_hs_api_request()` wrapper
+- Pagination via `after` cursor for search results (max 100 per page, up to 2000 per sync)
+- Filter format stored as `property=value` (e.g. `type=PARTNER`), parsed at sync time into HubSpot filter group JSON
+- `hubspot_id` on distributors links dealers to HubSpot Companies, analogous to `salesforce_id`
+
+### Database Migration (`026_hubspot_integration.sql`)
+
+```sql
+ALTER TABLE integrations DROP CONSTRAINT IF EXISTS integrations_provider_check;
+ALTER TABLE integrations ADD CONSTRAINT integrations_provider_check
+    CHECK (provider IN ('slack', 'salesforce', 'dropbox', 'google_drive', 'jira', 'hubspot'));
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS hubspot_portal_id TEXT;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS hubspot_sync_filter TEXT;
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS hubspot_id TEXT;
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS hubspot_synced_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_distributors_hubspot_id
+    ON distributors(hubspot_id) WHERE hubspot_id IS NOT NULL;
+```
+
+### Files Created
+
+| File | Purpose |
+|------|---------|
+| `backend/app/services/hubspot_sync_service.py` | Core sync engine: token refresh, API wrapper with auto-retry, property provisioning (5 properties), inbound dealer sync with Company filter, outbound compliance push, scheduled sync runner |
+| `supabase/migrations/026_hubspot_integration.sql` | Provider constraint update, `hubspot_portal_id` + `hubspot_sync_filter` on integrations, `hubspot_id` + `hubspot_synced_at` on distributors |
+
+### Files Modified
+
+| File | Change |
+|------|--------|
+| `backend/app/config.py` | Added `hubspot_client_id` + `hubspot_client_secret` settings, added `hubspot_notifications` flag to all 5 plan tiers (Enterprise-only) |
+| `backend/app/plan_enforcement.py` | Added `check_hubspot_notifications()` gate |
+| `backend/app/routers/integrations.py` | Full HubSpot OAuth flow (install/callback/status/disconnect), test endpoint, sync/status/filters endpoints — 10 new routes |
+| `backend/app/routers/scanning.py` | Wired `push_compliance_to_hubspot()` into post-scan notification pipeline |
+| `backend/app/services/scheduler_service.py` | Added 30-minute cron job for `run_hubspot_sync_all()` |
+| `frontend/lib/api.ts` | Added `HubSpotStatus`, `HubSpotFilters`, `HubSpotFilterOption` interfaces + 8 API functions |
+| `frontend/app/settings/page.tsx` | Full HubSpot integration card: connect/disconnect, Company filter picker (grouped by Type/Industry), Sync Now button, Test button, linked dealer count + last sync time |
+| `frontend/app/landing/page.tsx` | Added HubSpot logo to integrations marquee, marked HubSpot as live in integrations grid, updated description copy |
+| `backend/.env.example` | Added `HUBSPOT_CLIENT_ID` + `HUBSPOT_CLIENT_SECRET` placeholders |
+| `.do/app.yaml` | Added 2 new DigitalOcean env vars (secrets) |
