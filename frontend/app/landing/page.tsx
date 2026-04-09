@@ -109,7 +109,7 @@ const INTEGRATIONS = [
     icon: Database,
     items: [
       { name: "Salesforce", live: true },
-      { name: "HubSpot", live: false },
+      { name: "HubSpot", live: true },
     ],
   },
   {
@@ -339,6 +339,14 @@ export default function LandingPage() {
                 </svg>
                 <span className="text-lg font-semibold tracking-tight text-[#253858]">Jira</span>
               </div>
+
+              {/* HubSpot */}
+              <div className="flex items-center gap-2 shrink-0">
+                <svg width="28" height="28" viewBox="0 0 512 512" fill="none">
+                  <path d="M371.6 188.8v-56.3a46.5 46.5 0 0 0 27-42.1v-1.4c0-25.7-20.8-46.5-46.5-46.5h-1.4c-25.7 0-46.5 20.8-46.5 46.5v1.4a46.5 46.5 0 0 0 27 42.1v56.3a131.4 131.4 0 0 0-55.7 25.1l-147.5-114.9a47.1 47.1 0 0 0 1.3-11.2c0-26.2-21.2-47.4-47.4-47.4S34.5 61.6 34.5 87.8s21.2 47.4 47.4 47.4c6.6 0 12.9-1.4 18.6-3.8L246 243.8a131.6 131.6 0 0 0-22.2 73.1c0 61.2 41.7 112.6 98.2 127.6l-1.4 5.4v1.2c0 33.6 27.2 60.9 60.9 60.9s60.9-27.2 60.9-60.9-27.2-60.9-60.9-60.9a60.6 60.6 0 0 0-33.4 10l-6.8-4.2a131.2 131.2 0 0 0 50.8-103.8c0-57.3-36.6-106.1-87.5-124.4zM351.2 424c0 36.4-29.5 65.9-65.9 65.9S219.4 460.4 219.4 424c0-2.8.2-5.5.5-8.2l-.5.1c0-36.4 29.5-65.9 65.9-65.9 36.4 0 65.9 29.5 65.9 65.9z" fill="#FF7A59" transform="scale(0.8) translate(64, 64)"/>
+                </svg>
+                <span className="text-lg font-semibold tracking-tight text-[#FF7A59]">HubSpot</span>
+              </div>
             </div>
           ))}
         </div>
@@ -480,7 +488,7 @@ export default function LandingPage() {
               Connects to your existing stack
             </h2>
             <p className="mt-4 text-muted-foreground max-w-xl mx-auto leading-relaxed">
-              Push violations to Slack, sync dealers from Salesforce, auto-import
+              Push violations to Slack, sync dealers from Salesforce or HubSpot, auto-import
               assets from Dropbox, create Jira tickets — and more on the way.
             </p>
           </div>
