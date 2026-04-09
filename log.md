@@ -2135,16 +2135,28 @@ Built and deployed two major integrations: Dropbox (OAuth + auto-sync asset pipe
 |--------|------|---------|
 | POST | `/api/v1/integrations/salesforce/sync` | Manual inbound sync trigger (3/min rate limit, Enterprise-gated) |
 | GET | `/api/v1/integrations/salesforce/sync/status` | Last sync timestamp + linked dealer count |
+| GET | `/api/v1/integrations/salesforce/filters` | Fetch available Record Types + Account Type picklist values from SF |
+| PUT | `/api/v1/integrations/salesforce/filters` | Save the selected sync filter (e.g. `RecordType.Name = 'Dealer'`) |
+
+### Sync Filtering
+
+Salesforce orgs contain many Account types (customers, vendors, partners) — not just dealers. The sync filter lets users choose which Accounts to import:
+
+- `GET /salesforce/filters` calls the SF Account Describe API to discover available Record Types and Type picklist values
+- User picks a filter (e.g. "Record Type = Dealer") from the options
+- `PUT /salesforce/filters` saves it as `salesforce_sync_filter` on the `integrations` row
+- All subsequent inbound syncs (scheduled + manual) append the filter to the SOQL WHERE clause
+- If no filter is set, **no Accounts sync** until a filter is configured (prevents importing everything)
 
 ### Files Created
 | File | Purpose |
 |------|---------|
-| `backend/app/services/salesforce_sync_service.py` | Core sync engine: field provisioning, inbound dealer sync, outbound compliance push, scheduled sync runner |
-| `supabase/migrations/025_salesforce_two_way_sync.sql` | `salesforce_id` + `salesforce_synced_at` on distributors, `last_synced_at` on integrations |
+| `backend/app/services/salesforce_sync_service.py` | Core sync engine: field provisioning, inbound dealer sync, outbound compliance push, Account describe for filters, scheduled sync runner |
+| `supabase/migrations/025_salesforce_two_way_sync.sql` | `salesforce_id` + `salesforce_synced_at` on distributors, `last_synced_at` + `salesforce_sync_filter` on integrations |
 
 ### Files Modified
 | File | Change |
 |------|--------|
-| `backend/app/routers/integrations.py` | Auto-provision SF fields on OAuth callback, added `/salesforce/sync` and `/salesforce/sync/status` routes |
+| `backend/app/routers/integrations.py` | Auto-provision SF fields on OAuth callback, added sync/status/filters routes |
 | `backend/app/routers/scanning.py` | Wired `push_compliance_to_salesforce()` into post-scan notification pipeline |
 | `backend/app/services/scheduler_service.py` | Added 30-minute cron job for `run_salesforce_sync_all()` |

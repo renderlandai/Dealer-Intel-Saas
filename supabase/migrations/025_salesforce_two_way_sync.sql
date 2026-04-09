@@ -7,3 +7,6 @@ CREATE INDEX IF NOT EXISTS idx_distributors_sf_id
 
 -- Track last inbound sync timestamp on the integration row
 ALTER TABLE integrations ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
+
+-- Store the SOQL filter for Salesforce sync (e.g. "RecordType.Name = 'Dealer'")
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS salesforce_sync_filter TEXT;

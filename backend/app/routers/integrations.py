@@ -449,6 +449,49 @@ async def salesforce_sync_status(user: AuthUser = Depends(get_current_user)):
     }
 
 
+@router.get("/salesforce/filters", summary="Get available Salesforce Account filters")
+async def salesforce_filters(user: AuthUser = Depends(get_current_user)):
+    """Fetch Record Types and Type picklist values from the SF Account object."""
+    integration = supabase.table("integrations")\
+        .select("access_token, refresh_token, instance_url, salesforce_sync_filter")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "salesforce")\
+        .maybe_single()\
+        .execute()
+
+    if not integration.data:
+        raise HTTPException(400, "Salesforce is not connected.")
+
+    from ..services.salesforce_sync_service import fetch_account_filter_options
+
+    options = fetch_account_filter_options(
+        organization_id=user.org_id,
+        integration=integration.data,
+    )
+    options["current_filter"] = integration.data.get("salesforce_sync_filter") or ""
+    return options
+
+
+@router.put("/salesforce/filters", summary="Set Salesforce sync filter")
+async def salesforce_set_filter(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    """Save which Account filter to use for inbound dealer sync."""
+    check_salesforce_notifications(op)
+    body = await request.json()
+    sync_filter = body.get("filter", "")
+
+    supabase.table("integrations")\
+        .update({"salesforce_sync_filter": sync_filter})\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "salesforce")\
+        .execute()
+
+    return {"status": "saved", "filter": sync_filter}
+
+
 # ─── Dropbox ────────────────────────────────────────────────────
 
 

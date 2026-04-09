@@ -162,46 +162,93 @@ def provision_custom_fields(
     return results
 
 
+# ─── Discover filter options from SF Account describe ────────────
+
+
+def fetch_account_filter_options(
+    *,
+    organization_id: UUID,
+    integration: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Query SF Account describe to return Record Types and Type picklist values."""
+    resp = _sf_api_request(
+        organization_id=organization_id,
+        integration=integration,
+        method="GET",
+        path=f"/services/data/{SF_API_VERSION}/sobjects/Account/describe",
+    )
+
+    result: Dict[str, Any] = {"record_types": [], "account_types": []}
+
+    if not resp or resp.status_code != 200:
+        log.warning("SF Account describe failed: %s", resp.status_code if resp else "no response")
+        return result
+
+    data = resp.json()
+
+    for rt in data.get("recordTypeInfos", []):
+        if rt.get("available") and rt.get("name") != "Master":
+            result["record_types"].append({
+                "name": rt["name"],
+                "filter": f"RecordType.Name = '{rt['name']}'",
+            })
+
+    for field in data.get("fields", []):
+        if field.get("name") == "Type":
+            for pv in field.get("picklistValues", []):
+                if pv.get("active"):
+                    result["account_types"].append({
+                        "label": pv["label"],
+                        "value": pv["value"],
+                        "filter": f"Type = '{pv['value']}'",
+                    })
+            break
+
+    return result
+
+
 # ─── Inbound: Salesforce Accounts → distributors ────────────────
 
 
 def sync_dealers_from_salesforce(organization_id: UUID) -> Dict[str, Any]:
     """Pull Accounts from Salesforce and upsert into the distributors table.
 
+    Respects the salesforce_sync_filter saved on the integration row.
     Returns a summary dict with created/updated/skipped/error counts.
     """
     integration = _get_salesforce_integration(organization_id)
     if not integration:
         return {"error": "Salesforce not connected", "synced": 0}
 
-    # Get the last sync timestamp to do incremental sync
+    # Get the last sync timestamp and filter
     try:
         int_row = supabase.table("integrations")\
-            .select("last_synced_at")\
+            .select("last_synced_at, salesforce_sync_filter")\
             .eq("organization_id", str(organization_id))\
             .eq("provider", "salesforce")\
             .maybe_single()\
             .execute()
-        last_synced = (int_row.data or {}).get("last_synced_at")
+        row_data = int_row.data or {}
+        last_synced = row_data.get("last_synced_at")
+        sync_filter = row_data.get("salesforce_sync_filter") or ""
     except Exception:
         last_synced = None
+        sync_filter = ""
+
+    if not sync_filter:
+        log.info("No sync filter configured for org %s — skipping inbound sync", organization_id)
+        return {"synced": 0, "message": "No sync filter configured. Select which Accounts to import in Settings."}
+
+    # Build SOQL with filter and optional incremental timestamp
+    where_clauses: List[str] = [sync_filter]
+    if last_synced:
+        where_clauses.append(f"LastModifiedDate > {last_synced}")
 
     soql = f"SELECT {SF_SOQL_FIELDS} FROM Account"
-    if last_synced:
-        soql += f" WHERE LastModifiedDate > {last_synced}"
+    if where_clauses:
+        soql += " WHERE " + " AND ".join(where_clauses)
     soql += " ORDER BY LastModifiedDate ASC LIMIT 2000"
 
-    resp = _sf_api_request(
-        organization_id=organization_id,
-        integration=integration,
-        method="GET",
-        path=f"/services/data/{SF_API_VERSION}/query",
-        json_body=None,
-    )
-    if not resp:
-        return {"error": "Salesforce API unreachable", "synced": 0}
-
-    # The SOQL query goes as a query param, not in json_body
     instance_url = integration["instance_url"]
     token = integration["access_token"]
 
