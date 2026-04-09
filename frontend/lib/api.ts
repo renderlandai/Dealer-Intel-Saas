@@ -833,6 +833,46 @@ export const testSalesforceTask = async (): Promise<{ success: boolean; message:
   return data;
 };
 
+export interface SalesforceFilterOption {
+  name?: string;
+  label?: string;
+  value?: string;
+  filter: string;
+}
+
+export interface SalesforceFilters {
+  record_types: SalesforceFilterOption[];
+  account_types: SalesforceFilterOption[];
+  current_filter: string;
+}
+
+export const getSalesforceFilters = async (): Promise<SalesforceFilters> => {
+  const { data } = await api.get("/integrations/salesforce/filters");
+  return data;
+};
+
+export const setSalesforceFilter = async (filter: string): Promise<{ status: string; filter: string }> => {
+  const { data } = await api.put("/integrations/salesforce/filters", { filter });
+  return data;
+};
+
+export const syncSalesforce = async (): Promise<{ synced: number; created: number; updated: number; errors: number; message?: string }> => {
+  const { data } = await api.post("/integrations/salesforce/sync");
+  return data;
+};
+
+export const getSalesforceSyncStatus = async (): Promise<{
+  connected: boolean;
+  org_name?: string;
+  instance_url?: string;
+  connected_at?: string;
+  last_synced_at?: string;
+  linked_dealers?: number;
+}> => {
+  const { data } = await api.get("/integrations/salesforce/sync/status");
+  return data;
+};
+
 export interface DropboxStatus {
   connected: boolean;
   account_name?: string;

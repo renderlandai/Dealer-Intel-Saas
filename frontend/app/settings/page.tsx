@@ -29,8 +29,8 @@ import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage, getSalesforceStatus, startSalesforceInstall, disconnectSalesforce, testSalesforceTask, getDropboxStatus, startDropboxInstall, disconnectDropbox, autoSyncDropbox, getJiraStatus, startJiraInstall, disconnectJira, listJiraProjects, selectJiraProject, testJiraIssue } from "@/lib/api";
-import type { SlackStatus, SalesforceStatus, DropboxStatus, JiraStatus, JiraProject } from "@/lib/api";
+import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage, getSalesforceStatus, startSalesforceInstall, disconnectSalesforce, testSalesforceTask, getSalesforceFilters, setSalesforceFilter, syncSalesforce, getSalesforceSyncStatus, getDropboxStatus, startDropboxInstall, disconnectDropbox, autoSyncDropbox, getJiraStatus, startJiraInstall, disconnectJira, listJiraProjects, selectJiraProject, testJiraIssue } from "@/lib/api";
+import type { SlackStatus, SalesforceStatus, SalesforceFilters, DropboxStatus, JiraStatus, JiraProject } from "@/lib/api";
 import { orgSettingsSchema } from "@/lib/schemas";
 import { useBillingUsage } from "@/lib/hooks";
 import { useAuth } from "@/lib/auth-context";
@@ -84,6 +84,13 @@ export default function SettingsPage() {
   const [sfDisconnecting, setSfDisconnecting] = useState(false);
   const [sfTesting, setSfTesting] = useState(false);
   const [sfTestResult, setSfTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [sfFilters, setSfFilters] = useState<SalesforceFilters | null>(null);
+  const [sfFiltersOpen, setSfFiltersOpen] = useState(false);
+  const [sfLoadingFilters, setSfLoadingFilters] = useState(false);
+  const [sfSelectedFilter, setSfSelectedFilter] = useState("");
+  const [sfSyncing, setSfSyncing] = useState(false);
+  const [sfSyncResult, setSfSyncResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [sfSyncStatus, setSfSyncStatus] = useState<{ last_synced_at?: string; linked_dealers?: number } | null>(null);
 
   const [dbx, setDbx] = useState<DropboxStatus>({ connected: false });
   const [dbxLoading, setDbxLoading] = useState(true);
@@ -125,7 +132,17 @@ export default function SettingsPage() {
       .finally(() => setSlackLoading(false));
 
     getSalesforceStatus()
-      .then(setSf)
+      .then((status) => {
+        setSf(status);
+        if (status.connected) {
+          getSalesforceSyncStatus()
+            .then((s) => setSfSyncStatus({ last_synced_at: s.last_synced_at, linked_dealers: s.linked_dealers }))
+            .catch(() => {});
+          getSalesforceFilters()
+            .then((f) => { setSfFilters(f); setSfSelectedFilter(f.current_filter || ""); })
+            .catch(() => {});
+        }
+      })
       .catch(() => {})
       .finally(() => setSfLoading(false));
 
@@ -145,7 +162,17 @@ export default function SettingsPage() {
       window.history.replaceState({}, "", window.location.pathname);
     }
     if (params.get("salesforce") === "connected") {
-      getSalesforceStatus().then(setSf).catch(() => {});
+      getSalesforceStatus().then((status) => {
+        setSf(status);
+        if (status.connected) {
+          getSalesforceSyncStatus()
+            .then((s) => setSfSyncStatus({ last_synced_at: s.last_synced_at, linked_dealers: s.linked_dealers }))
+            .catch(() => {});
+          getSalesforceFilters()
+            .then((f) => { setSfFilters(f); setSfSelectedFilter(f.current_filter || ""); })
+            .catch(() => {});
+        }
+      }).catch(() => {});
       window.history.replaceState({}, "", window.location.pathname);
     }
     if (params.get("dropbox") === "connected") {
@@ -336,6 +363,53 @@ export default function SettingsPage() {
       setSfTestResult({ ok: false, msg: detail });
     } finally {
       setSfTesting(false);
+    }
+  };
+
+  const handleLoadSfFilters = async () => {
+    setSfFiltersOpen(true);
+    if (sfFilters) return;
+    setSfLoadingFilters(true);
+    try {
+      const f = await getSalesforceFilters();
+      setSfFilters(f);
+      setSfSelectedFilter(f.current_filter || "");
+    } catch {
+      setSfFilters({ record_types: [], account_types: [], current_filter: "" });
+    } finally {
+      setSfLoadingFilters(false);
+    }
+  };
+
+  const handleSaveSfFilter = async () => {
+    try {
+      await setSalesforceFilter(sfSelectedFilter);
+      setSfFilters((prev) => prev ? { ...prev, current_filter: sfSelectedFilter } : prev);
+      setSfFiltersOpen(false);
+      setSfSyncResult({ ok: true, msg: sfSelectedFilter ? "Filter saved" : "Filter cleared — sync paused" });
+    } catch {
+      setSfSyncResult({ ok: false, msg: "Failed to save filter" });
+    }
+  };
+
+  const handleSyncSalesforce = async () => {
+    setSfSyncing(true);
+    setSfSyncResult(null);
+    try {
+      const result = await syncSalesforce();
+      if (result.message) {
+        setSfSyncResult({ ok: false, msg: result.message });
+      } else {
+        setSfSyncResult({ ok: true, msg: `Synced ${result.synced} dealer${result.synced !== 1 ? "s" : ""} (${result.created} new, ${result.updated} updated)` });
+        getSalesforceSyncStatus()
+          .then((s) => setSfSyncStatus({ last_synced_at: s.last_synced_at, linked_dealers: s.linked_dealers }))
+          .catch(() => {});
+      }
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || "Sync failed";
+      setSfSyncResult({ ok: false, msg: detail });
+    } finally {
+      setSfSyncing(false);
     }
   };
 
@@ -880,7 +954,7 @@ export default function SettingsPage() {
               <div className="flex-1">
                 <CardTitle className="text-base">Salesforce Integration</CardTitle>
                 <CardDescription className="text-xs">
-                  Push scan violations as Tasks into your Salesforce CRM
+                  Two-way sync — import dealers from Salesforce, push compliance scores back
                 </CardDescription>
               </div>
               {sf.connected && (
@@ -900,10 +974,28 @@ export default function SettingsPage() {
                   <div className="flex-1">
                     <p className="text-sm font-medium">{sf.org_name || "Salesforce Org"}</p>
                     <p className="text-xs text-muted-foreground mt-0.5">
-                      Violations synced as Tasks
+                      {sfSyncStatus?.linked_dealers
+                        ? `${sfSyncStatus.linked_dealers} dealer${sfSyncStatus.linked_dealers !== 1 ? "s" : ""} linked`
+                        : "No dealers synced yet"}
+                      {sfSyncStatus?.last_synced_at && (
+                        <> &middot; Last sync {new Date(sfSyncStatus.last_synced_at).toLocaleString()}</>
+                      )}
                     </p>
                   </div>
                   <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleSyncSalesforce}
+                      disabled={sfSyncing}
+                    >
+                      {sfSyncing ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                      )}
+                      {sfSyncing ? "Syncing..." : "Sync Now"}
+                    </Button>
                     <Button
                       variant="outline"
                       size="sm"
@@ -930,15 +1022,73 @@ export default function SettingsPage() {
                   </div>
                 </div>
 
-                {sfTestResult && (
-                  <div className={`flex items-center gap-2 ${sfTestResult.ok ? "text-success" : "text-destructive"}`}>
-                    {sfTestResult.ok ? <CheckCircle className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
-                    <span className="text-sm">{sfTestResult.msg}</span>
+                {/* Sync Filter */}
+                <div className="border border-border p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-medium">Account Filter</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        {sfFilters?.current_filter
+                          ? `Syncing: ${sfFilters.current_filter}`
+                          : "No filter set — select which Accounts to import as dealers"}
+                      </p>
+                    </div>
+                    <Button variant="outline" size="sm" onClick={handleLoadSfFilters}>
+                      {sfFiltersOpen ? "Close" : "Configure"}
+                    </Button>
+                  </div>
+
+                  {sfFiltersOpen && (
+                    <div className="space-y-3 pt-2 border-t border-border">
+                      {sfLoadingFilters ? (
+                        <div className="h-10 bg-secondary/20 animate-pulse" />
+                      ) : (
+                        <>
+                          <select
+                            className="w-full text-sm border border-border bg-background px-3 py-1.5"
+                            value={sfSelectedFilter}
+                            onChange={(e) => setSfSelectedFilter(e.target.value)}
+                          >
+                            <option value="">Choose a filter...</option>
+                            {(sfFilters?.record_types || []).length > 0 && (
+                              <optgroup label="Record Type">
+                                {sfFilters!.record_types.map((rt) => (
+                                  <option key={rt.filter} value={rt.filter}>{rt.name}</option>
+                                ))}
+                              </optgroup>
+                            )}
+                            {(sfFilters?.account_types || []).length > 0 && (
+                              <optgroup label="Account Type">
+                                {sfFilters!.account_types.map((at) => (
+                                  <option key={at.filter} value={at.filter}>{at.label}</option>
+                                ))}
+                              </optgroup>
+                            )}
+                          </select>
+                          <div className="flex justify-end">
+                            <Button
+                              size="sm"
+                              disabled={sfSelectedFilter === (sfFilters?.current_filter || "")}
+                              onClick={handleSaveSfFilter}
+                            >
+                              Save Filter
+                            </Button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {(sfTestResult || sfSyncResult) && (
+                  <div className={`flex items-center gap-2 ${(sfSyncResult || sfTestResult)?.ok ? "text-success" : "text-destructive"}`}>
+                    {(sfSyncResult || sfTestResult)?.ok ? <CheckCircle className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                    <span className="text-sm">{(sfSyncResult || sfTestResult)?.msg}</span>
                   </div>
                 )}
 
                 <p className="text-2xs text-muted-foreground">
-                  Scan violations will be created as Tasks in Salesforce automatically after each scan.
+                  Dealers sync from Salesforce every 30 minutes. Compliance scores push back to Salesforce after each scan.
                 </p>
               </>
             ) : (
@@ -950,7 +1100,7 @@ export default function SettingsPage() {
                   <div className="flex-1">
                     <p className="text-sm text-muted-foreground">Salesforce is not connected</p>
                     <p className="text-2xs text-muted-foreground mt-0.5">
-                      Connect Salesforce to push violation alerts as Tasks into your CRM
+                      Connect to import dealers and sync compliance scores back to your CRM
                     </p>
                   </div>
                   <Button

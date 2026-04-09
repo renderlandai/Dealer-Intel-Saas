@@ -2154,9 +2154,19 @@ Salesforce orgs contain many Account types (customers, vendors, partners) — no
 | `backend/app/services/salesforce_sync_service.py` | Core sync engine: field provisioning, inbound dealer sync, outbound compliance push, Account describe for filters, scheduled sync runner |
 | `supabase/migrations/025_salesforce_two_way_sync.sql` | `salesforce_id` + `salesforce_synced_at` on distributors, `last_synced_at` + `salesforce_sync_filter` on integrations |
 
+### Frontend
+
+The Salesforce Settings card now includes:
+- **Sync status** — linked dealer count + last sync timestamp
+- **Sync Now button** — manual trigger for inbound dealer import
+- **Account Filter picker** — dropdown populated from SF Account describe (Record Types + Type picklist), saved via PUT endpoint
+- **Updated copy** — reflects two-way sync instead of one-way Task push
+
 ### Files Modified
 | File | Change |
 |------|--------|
 | `backend/app/routers/integrations.py` | Auto-provision SF fields on OAuth callback, added sync/status/filters routes |
 | `backend/app/routers/scanning.py` | Wired `push_compliance_to_salesforce()` into post-scan notification pipeline |
 | `backend/app/services/scheduler_service.py` | Added 30-minute cron job for `run_salesforce_sync_all()` |
+| `frontend/lib/api.ts` | Added SF filter types, `getSalesforceFilters`, `setSalesforceFilter`, `syncSalesforce`, `getSalesforceSyncStatus` |
+| `frontend/app/settings/page.tsx` | SF card: filter picker, sync button, sync status, updated descriptions |
