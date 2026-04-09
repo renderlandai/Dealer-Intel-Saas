@@ -372,7 +372,7 @@ async def _cleanup_stale_scans() -> None:
         stale_running = supabase.table("scan_jobs") \
             .select("id") \
             .in_("status", ["running", "analyzing"]) \
-            .lt("updated_at", running_cutoff) \
+            .lt("started_at", running_cutoff) \
             .execute()
 
         all_stale = (stale_pending.data or []) + (stale_running.data or [])

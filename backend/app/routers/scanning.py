@@ -30,10 +30,10 @@ def _utc_now() -> str:
 
 
 def _heartbeat(scan_job_id) -> None:
-    """Touch the scan job's updated_at so the cleanup job knows we're alive."""
+    """Touch the scan job's started_at so the cleanup job knows we're alive."""
     try:
         supabase.table("scan_jobs").update({
-            "updated_at": _utc_now(),
+            "started_at": _utc_now(),
         }).eq("id", str(scan_job_id)).execute()
     except Exception:
         pass
