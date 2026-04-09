@@ -12,10 +12,15 @@ import {
   Upload,
   Users,
   Radar,
-  Shield,
   ChevronRight,
   Check,
   Zap,
+  MessageSquare,
+  Database,
+  FolderSync,
+  Megaphone,
+  MonitorPlay,
+  KanbanSquare,
 } from "lucide-react";
 import { MarketingNav } from "@/components/marketing/navbar";
 import { MarketingFooter } from "@/components/marketing/footer";
@@ -88,6 +93,67 @@ const CHANNELS = [
   { name: "Google Ads", color: "bg-amber-500" },
   { name: "Facebook", color: "bg-blue-500" },
   { name: "Instagram", color: "bg-pink-500" },
+];
+
+const INTEGRATIONS = [
+  {
+    category: "Communication",
+    icon: MessageSquare,
+    items: [
+      { name: "Slack", live: true },
+      { name: "Microsoft Teams", live: false },
+    ],
+  },
+  {
+    category: "CRM & Dealers",
+    icon: Database,
+    items: [
+      { name: "Salesforce", live: true },
+      { name: "HubSpot", live: false },
+    ],
+  },
+  {
+    category: "Asset Storage & DAM",
+    icon: FolderSync,
+    items: [
+      { name: "Dropbox", live: true },
+      { name: "Google Drive", live: false },
+      { name: "SharePoint", live: false },
+      { name: "Bynder", live: false },
+      { name: "Brandfolder", live: false },
+      { name: "Adobe Experience Manager", live: false },
+      { name: "Frontify", live: false },
+    ],
+  },
+  {
+    category: "Project Management",
+    icon: KanbanSquare,
+    items: [
+      { name: "Jira", live: true },
+      { name: "Asana", live: false },
+      { name: "Monday.com", live: false },
+    ],
+  },
+  {
+    category: "Co-op & Channel Marketing",
+    icon: Megaphone,
+    items: [
+      { name: "Ansira", live: false },
+      { name: "SproutLoud", live: false },
+      { name: "BrandMuscle", live: false },
+    ],
+  },
+  {
+    category: "Ad Platforms",
+    icon: MonitorPlay,
+    items: [
+      { name: "Google Ads", live: false },
+      { name: "Meta Ads", live: false },
+      { name: "YouTube", live: false },
+      { name: "Microsoft Ads", live: false },
+      { name: "TikTok Ads", live: false },
+    ],
+  },
 ];
 
 const TIERS_PREVIEW = [
@@ -216,6 +282,68 @@ export default function LandingPage() {
         </div>
       </section>
 
+      {/* ─── Connections Marquee ─── */}
+      <section className="py-14 overflow-hidden">
+        <p className="text-center text-2xs font-semibold uppercase tracking-wider text-muted-foreground mb-10">
+          Connects to the tools you already use
+        </p>
+        <div
+          className="flex w-max hover:[animation-play-state:paused]"
+          style={{ animation: "marquee 20s linear infinite" }}
+        >
+          {[0, 1].map((copy) => (
+            <div key={copy} className="flex items-center gap-16 px-8" aria-hidden={copy === 1}>
+              {/* Slack */}
+              <div className="flex items-center gap-2.5 text-[#4A154B] shrink-0">
+                <svg width="28" height="28" viewBox="0 0 128 128" fill="none">
+                  <path d="M26.9 80.4c0 7.4-6.1 13.4-13.4 13.4S0 87.8 0 80.4c0-7.4 6.1-13.4 13.4-13.4h13.4v13.4zm6.8 0c0-7.4 6.1-13.4 13.4-13.4s13.4 6.1 13.4 13.4v33.6c0 7.4-6.1 13.4-13.4 13.4s-13.4-6.1-13.4-13.4V80.4z" fill="#E01E5A"/>
+                  <path d="M47.1 26.9c-7.4 0-13.4-6.1-13.4-13.4S39.7 0 47.1 0s13.4 6.1 13.4 13.4v13.4H47.1zm0 6.8c7.4 0 13.4 6.1 13.4 13.4s-6.1 13.4-13.4 13.4H13.4C6.1 60.5 0 54.5 0 47.1s6.1-13.4 13.4-13.4h33.7z" fill="#36C5F0"/>
+                  <path d="M100.9 47.1c0-7.4 6.1-13.4 13.4-13.4 7.4 0 13.4 6.1 13.4 13.4s-6.1 13.4-13.4 13.4h-13.4V47.1zm-6.8 0c0 7.4-6.1 13.4-13.4 13.4-7.4 0-13.4-6.1-13.4-13.4V13.4C67.3 6.1 73.4 0 80.7 0c7.4 0 13.4 6.1 13.4 13.4v33.7z" fill="#2EB67D"/>
+                  <path d="M80.7 100.9c7.4 0 13.4 6.1 13.4 13.4 0 7.4-6.1 13.4-13.4 13.4-7.4 0-13.4-6.1-13.4-13.4v-13.4h13.4zm0-6.8c-7.4 0-13.4-6.1-13.4-13.4 0-7.4 6.1-13.4 13.4-13.4h33.6c7.4 0 13.4 6.1 13.4 13.4 0 7.4-6.1 13.4-13.4 13.4H80.7z" fill="#ECB22E"/>
+                </svg>
+                <span className="text-lg font-semibold tracking-tight">Slack</span>
+              </div>
+
+              {/* Salesforce */}
+              <div className="flex items-center gap-2 shrink-0">
+                <svg width="36" height="25" viewBox="0 0 60 42" fill="none">
+                  <path d="M24.9 4.8c2.4-2.5 5.8-4 9.5-4 5 0 9.3 2.7 11.7 6.7 2.1-0.9 4.3-1.5 6.7-1.5C60.6 6 67 12.4 67 20.2S60.6 34.4 52.8 34.4c-1 0-2-.1-3-.3-2.1 3.5-5.9 5.8-10.3 5.8-2 0-3.9-.5-5.5-1.4-2.1 3.9-6.2 6.5-10.9 6.5-5.2 0-9.6-3.2-11.5-7.7-1 .3-2.1.4-3.2.4C3.7 37.7 0 30.5 0 25.7 0 20 4.7 15 10.5 14.4c-.1-.8-.2-1.6-.2-2.4 0-6.6 5.4-12 12-12 4 0 7.5 2 9.7 5z" fill="#00A1E0" transform="scale(0.85) translate(2,2)"/>
+                </svg>
+                <span className="text-lg font-semibold tracking-tight text-[#00A1E0]">Salesforce</span>
+              </div>
+
+              {/* Dropbox */}
+              <div className="flex items-center gap-2 text-[#0061FF] shrink-0">
+                <svg width="26" height="24" viewBox="0 0 43 40" fill="currentColor">
+                  <path d="M12.6 0L0 8.1l8.7 7 12.8-7.9L12.6 0zM0 22.1l12.6 8.1 8.9-6.9-12.8-7.9L0 22.1zM21.5 23.3l8.9 6.9 12.6-8.1-8.7-7-12.8 8.2zM43 8.1L30.4 0l-8.9 7.2 12.8 7.9L43 8.1zM21.5 25.4l-8.9 6.9-3.7-2.4v2.7l12.6 7.5 12.6-7.5v-2.7l-3.7 2.4-8.9-6.9z"/>
+                </svg>
+                <span className="text-lg font-semibold tracking-tight">Dropbox</span>
+              </div>
+
+              {/* Jira */}
+              <div className="flex items-center gap-2.5 shrink-0">
+                <svg width="28" height="28" viewBox="0 0 256 256" fill="none">
+                  <defs>
+                    <linearGradient id={`jira-a-${copy}`} x1="102.4" y1="218.2" x2="56.6" y2="172.4">
+                      <stop stopColor="#0052CC"/>
+                      <stop offset="0.92" stopColor="#2684FF"/>
+                    </linearGradient>
+                    <linearGradient id={`jira-b-${copy}`} x1="114.7" y1="85.8" x2="160.5" y2="131.7">
+                      <stop stopColor="#0052CC"/>
+                      <stop offset="0.92" stopColor="#2684FF"/>
+                    </linearGradient>
+                  </defs>
+                  <path d="M244.7 0H121.3c0 34.2 27.8 61.9 62 61.9h20.3v19.6c0 34.2 27.7 62 61.9 62V11.2A11.2 11.2 0 00244.7 0z" fill="#2684FF"/>
+                  <path d="M183 62.9H59.7C59.7 97 87.4 124.8 121.6 124.8h20.4v19.6c0 34.1 27.7 61.9 61.9 61.9V74.1A11.2 11.2 0 00183 62.9z" fill={`url(#jira-b-${copy})`}/>
+                  <path d="M121.3 125.7H-2c0 34.2 27.7 62 61.9 62h20.4v19.6c0 34.1 27.7 61.9 61.9 61.9V136.9a11.2 11.2 0 00-10.9-11.2z" fill={`url(#jira-a-${copy})`}/>
+                </svg>
+                <span className="text-lg font-semibold tracking-tight text-[#253858]">Jira</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
       {/* ─── Features ─── */}
       <section id="features" className="py-24">
         <div className="mx-auto max-w-7xl px-6">
@@ -306,10 +434,10 @@ export default function LandingPage() {
           <div className="grid gap-6 md:grid-cols-3">
             {[
               {
-                icon: Shield,
-                title: "Enterprise-Grade Security",
+                icon: Clock,
+                title: "Set It and Forget It",
                 description:
-                  "TLS-encrypted connections, role-based access control, and isolated tenant data. Built for teams that take security seriously.",
+                  "Schedule scans on any cadence — daily, weekly, or monthly. Violations trigger alerts to Slack, Jira, and email automatically. You only see problems that need your attention.",
               },
               {
                 icon: Zap,
@@ -341,8 +469,59 @@ export default function LandingPage() {
         </div>
       </section>
 
+      {/* ─── Integrations ─── */}
+      <section id="integrations" className="py-24 border-y border-border bg-card/30">
+        <div className="mx-auto max-w-7xl px-6">
+          <div className="text-center mb-16">
+            <p className="text-2xs font-semibold uppercase tracking-wider text-accent mb-3">
+              Integrations
+            </p>
+            <h2 className="font-display text-3xl md:text-4xl font-bold tracking-[-0.025em]">
+              Connects to your existing stack
+            </h2>
+            <p className="mt-4 text-muted-foreground max-w-xl mx-auto leading-relaxed">
+              Push violations to Slack, sync dealers from Salesforce, auto-import
+              assets from Dropbox, create Jira tickets — and more on the way.
+            </p>
+          </div>
+
+          <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            {INTEGRATIONS.map((group) => (
+              <div
+                key={group.category}
+                className="p-5 border border-border bg-background rounded-md"
+              >
+                <div className="flex items-center gap-2.5 mb-4">
+                  <div className="flex h-8 w-8 items-center justify-center bg-primary/10 border border-primary/20 rounded-md">
+                    <group.icon className="h-4 w-4 text-primary" />
+                  </div>
+                  <h3 className="text-sm font-semibold">{group.category}</h3>
+                </div>
+                <ul className="space-y-2">
+                  {group.items.map((item) => (
+                    <li key={item.name} className="flex items-center justify-between">
+                      <span className="text-sm text-foreground/80">{item.name}</span>
+                      {item.live ? (
+                        <span className="inline-flex items-center gap-1 text-2xs font-medium text-emerald-600">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                          Live
+                        </span>
+                      ) : (
+                        <span className="text-2xs text-muted-foreground">
+                          Coming soon
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
       {/* ─── Pricing Preview ─── */}
-      <section className="py-24 border-y border-border bg-card/30">
+      <section className="py-24">
         <div className="mx-auto max-w-7xl px-6">
           <div className="text-center mb-16">
             <h2 className="font-display text-3xl md:text-4xl font-bold tracking-[-0.025em]">

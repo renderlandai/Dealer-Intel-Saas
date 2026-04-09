@@ -73,6 +73,43 @@ CUSTOM_FIELDS: List[Dict[str, Any]] = [
             "description": "When Dealer Intel last scanned this dealer.",
         },
     },
+    {
+        "FullName": "Account.Facebook_URL__c",
+        "Metadata": {
+            "label": "Facebook URL",
+            "type": "Url",
+            "required": False,
+            "description": "Facebook page URL for Dealer Intel scanning.",
+        },
+    },
+    {
+        "FullName": "Account.Instagram_URL__c",
+        "Metadata": {
+            "label": "Instagram URL",
+            "type": "Url",
+            "required": False,
+            "description": "Instagram profile URL for Dealer Intel scanning.",
+        },
+    },
+    {
+        "FullName": "Account.YouTube_URL__c",
+        "Metadata": {
+            "label": "YouTube URL",
+            "type": "Url",
+            "required": False,
+            "description": "YouTube channel URL for Dealer Intel scanning.",
+        },
+    },
+    {
+        "FullName": "Account.Google_Ads_Advertiser_ID__c",
+        "Metadata": {
+            "label": "Google Ads Advertiser ID",
+            "type": "Text",
+            "length": 50,
+            "required": False,
+            "description": "Google Ads advertiser ID for Dealer Intel scanning.",
+        },
+    },
 ]
 
 # SF Account field → distributors column
@@ -81,6 +118,10 @@ INBOUND_FIELD_MAP: Dict[str, str] = {
     "Website": "website_url",
     "AccountNumber": "code",
     "BillingState": "region",
+    "Facebook_URL__c": "facebook_url",
+    "Instagram_URL__c": "instagram_url",
+    "YouTube_URL__c": "youtube_url",
+    "Google_Ads_Advertiser_ID__c": "google_ads_advertiser_id",
 }
 
 SF_SOQL_FIELDS = "Id, " + ", ".join(INBOUND_FIELD_MAP.keys())

@@ -309,6 +309,11 @@
   100% { transform: translateY(0); opacity: 1; }
 }
 
+@keyframes marquee {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
 /* Animation utilities */
 .animate-fade-up {
   animation: fade-up 0.4s ease-out forwards;
