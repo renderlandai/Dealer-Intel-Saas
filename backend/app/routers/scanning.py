@@ -10,6 +10,7 @@ from ..models import ScanJobCreate, ScanJob, ScanSource
 from ..services import screenshot_service, extraction_service, ai_service, serpapi_service, apify_meta_service, apify_instagram_service
 from ..services.notification_service import notify_scan_complete, notify_slack_scan_complete, notify_salesforce_scan_complete, notify_jira_scan_complete
 from ..services.salesforce_sync_service import push_compliance_to_salesforce
+from ..services.hubspot_sync_service import push_compliance_to_hubspot
 from ..plan_enforcement import (
     OrgPlan, get_org_plan,
     check_scan_quota, check_concurrent_scans, check_channel_allowed,
@@ -144,6 +145,10 @@ def _send_scan_notifications(
             summary=summary,
             violations=violations_formatted,
         )
+        try:
+            push_compliance_to_hubspot(organization_id=UUID(org_id))
+        except Exception as hs_push_err:
+            log.warning("HubSpot compliance push failed for %s: %s", org_id, hs_push_err)
     except Exception as e:
         log.warning("Failed to send scan notifications for %s: %s", scan_job_id, e)
 

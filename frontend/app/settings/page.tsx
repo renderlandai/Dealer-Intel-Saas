@@ -29,8 +29,8 @@ import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage, getSalesforceStatus, startSalesforceInstall, disconnectSalesforce, testSalesforceTask, getSalesforceFilters, setSalesforceFilter, syncSalesforce, getSalesforceSyncStatus, getDropboxStatus, startDropboxInstall, disconnectDropbox, autoSyncDropbox, getJiraStatus, startJiraInstall, disconnectJira, listJiraProjects, selectJiraProject, testJiraIssue } from "@/lib/api";
-import type { SlackStatus, SalesforceStatus, SalesforceFilters, DropboxStatus, JiraStatus, JiraProject } from "@/lib/api";
+import { getOrgSettings, updateOrgSettings, uploadOrgLogo, deleteOrgLogo, sendTestEmail, createPortalSession, getSlackStatus, startSlackInstall, disconnectSlack, testSlackMessage, getSalesforceStatus, startSalesforceInstall, disconnectSalesforce, testSalesforceTask, getSalesforceFilters, setSalesforceFilter, syncSalesforce, getSalesforceSyncStatus, getDropboxStatus, startDropboxInstall, disconnectDropbox, autoSyncDropbox, getJiraStatus, startJiraInstall, disconnectJira, listJiraProjects, selectJiraProject, testJiraIssue, getHubSpotStatus, startHubSpotInstall, disconnectHubSpot, testHubSpotConnection, getHubSpotFilters, setHubSpotFilter, syncHubSpot, getHubSpotSyncStatus } from "@/lib/api";
+import type { SlackStatus, SalesforceStatus, SalesforceFilters, DropboxStatus, JiraStatus, JiraProject, HubSpotStatus, HubSpotFilters } from "@/lib/api";
 import { orgSettingsSchema } from "@/lib/schemas";
 import { useBillingUsage } from "@/lib/hooks";
 import { useAuth } from "@/lib/auth-context";
@@ -110,6 +110,20 @@ export default function SettingsPage() {
   const [jiraSelectedProject, setJiraSelectedProject] = useState("");
   const [jiraLoadingProjects, setJiraLoadingProjects] = useState(false);
 
+  const [hs, setHs] = useState<HubSpotStatus>({ connected: false });
+  const [hsLoading, setHsLoading] = useState(true);
+  const [hsConnecting, setHsConnecting] = useState(false);
+  const [hsDisconnecting, setHsDisconnecting] = useState(false);
+  const [hsTesting, setHsTesting] = useState(false);
+  const [hsTestResult, setHsTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [hsFilters, setHsFilters] = useState<HubSpotFilters | null>(null);
+  const [hsFiltersOpen, setHsFiltersOpen] = useState(false);
+  const [hsLoadingFilters, setHsLoadingFilters] = useState(false);
+  const [hsSelectedFilter, setHsSelectedFilter] = useState("");
+  const [hsSyncing, setHsSyncing] = useState(false);
+  const [hsSyncResult, setHsSyncResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [hsSyncStatus, setHsSyncStatus] = useState<{ last_synced_at?: string; linked_dealers?: number } | null>(null);
+
   useEffect(() => {
     getOrgSettings()
       .then((res) => {
@@ -156,6 +170,21 @@ export default function SettingsPage() {
       .catch(() => {})
       .finally(() => setJiraLoading(false));
 
+    getHubSpotStatus()
+      .then((status) => {
+        setHs(status);
+        if (status.connected) {
+          getHubSpotSyncStatus()
+            .then((s) => setHsSyncStatus({ last_synced_at: s.last_synced_at, linked_dealers: s.linked_dealers }))
+            .catch(() => {});
+          getHubSpotFilters()
+            .then((f) => { setHsFilters(f); setHsSelectedFilter(f.current_filter || ""); })
+            .catch(() => {});
+        }
+      })
+      .catch(() => {})
+      .finally(() => setHsLoading(false));
+
     const params = new URLSearchParams(window.location.search);
     if (params.get("slack") === "connected") {
       getSlackStatus().then(setSlack).catch(() => {});
@@ -181,6 +210,20 @@ export default function SettingsPage() {
     }
     if (params.get("jira") === "connected") {
       getJiraStatus().then(setJira).catch(() => {});
+      window.history.replaceState({}, "", window.location.pathname);
+    }
+    if (params.get("hubspot") === "connected") {
+      getHubSpotStatus().then((status) => {
+        setHs(status);
+        if (status.connected) {
+          getHubSpotSyncStatus()
+            .then((s) => setHsSyncStatus({ last_synced_at: s.last_synced_at, linked_dealers: s.linked_dealers }))
+            .catch(() => {});
+          getHubSpotFilters()
+            .then((f) => { setHsFilters(f); setHsSelectedFilter(f.current_filter || ""); })
+            .catch(() => {});
+        }
+      }).catch(() => {});
       window.history.replaceState({}, "", window.location.pathname);
     }
   }, []);
@@ -410,6 +453,93 @@ export default function SettingsPage() {
       setSfSyncResult({ ok: false, msg: detail });
     } finally {
       setSfSyncing(false);
+    }
+  };
+
+  const handleConnectHubSpot = async () => {
+    setHsConnecting(true);
+    try {
+      const { authorize_url } = await startHubSpotInstall();
+      window.location.href = authorize_url;
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || "Failed to start HubSpot connection";
+      alert(detail);
+      setHsConnecting(false);
+    }
+  };
+
+  const handleDisconnectHubSpot = async () => {
+    if (!confirm("Disconnect HubSpot? Dealer sync will stop.")) return;
+    setHsDisconnecting(true);
+    try {
+      await disconnectHubSpot();
+      setHs({ connected: false });
+      setHsTestResult(null);
+    } catch {
+      alert("Failed to disconnect HubSpot.");
+    } finally {
+      setHsDisconnecting(false);
+    }
+  };
+
+  const handleTestHubSpot = async () => {
+    setHsTesting(true);
+    setHsTestResult(null);
+    try {
+      const result = await testHubSpotConnection();
+      setHsTestResult({ ok: true, msg: result.message });
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || "Failed to test connection";
+      setHsTestResult({ ok: false, msg: detail });
+    } finally {
+      setHsTesting(false);
+    }
+  };
+
+  const handleLoadHsFilters = async () => {
+    setHsFiltersOpen(true);
+    if (hsFilters) return;
+    setHsLoadingFilters(true);
+    try {
+      const f = await getHubSpotFilters();
+      setHsFilters(f);
+      setHsSelectedFilter(f.current_filter || "");
+    } catch {
+      setHsFilters({ company_types: [], industries: [], current_filter: "" });
+    } finally {
+      setHsLoadingFilters(false);
+    }
+  };
+
+  const handleSaveHsFilter = async () => {
+    try {
+      await setHubSpotFilter(hsSelectedFilter);
+      setHsFilters((prev) => prev ? { ...prev, current_filter: hsSelectedFilter } : prev);
+      setHsFiltersOpen(false);
+      setHsSyncResult({ ok: true, msg: hsSelectedFilter ? "Filter saved" : "Filter cleared — sync paused" });
+    } catch {
+      setHsSyncResult({ ok: false, msg: "Failed to save filter" });
+    }
+  };
+
+  const handleSyncHubSpot = async () => {
+    setHsSyncing(true);
+    setHsSyncResult(null);
+    try {
+      const result = await syncHubSpot();
+      if (result.message) {
+        setHsSyncResult({ ok: false, msg: result.message });
+      } else {
+        setHsSyncResult({ ok: true, msg: `Synced ${result.synced} dealer${result.synced !== 1 ? "s" : ""} (${result.created} new, ${result.updated} updated)` });
+        getHubSpotSyncStatus()
+          .then((s) => setHsSyncStatus({ last_synced_at: s.last_synced_at, linked_dealers: s.linked_dealers }))
+          .catch(() => {});
+      }
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail || "Sync failed";
+      setHsSyncResult({ ok: false, msg: detail });
+    } finally {
+      setHsSyncing(false);
     }
   };
 
@@ -1114,6 +1244,185 @@ export default function SettingsPage() {
                       <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
                     )}
                     {sfConnecting ? "Connecting..." : "Connect Salesforce"}
+                  </Button>
+                </div>
+              </>
+            )}
+          </CardContent>
+        </Card>
+
+        {/* HubSpot Integration */}
+        <Card className="opacity-0 animate-fade-up" style={{ animationFillMode: "forwards", animationDelay: "140ms" }}>
+          <CardHeader>
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center bg-secondary border border-border">
+                <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none">
+                  <path d="M17.01 13.27V9.88c.59-.35 1-1 1-1.73V8.1c0-1.1-.9-2-2-2h-.05c-.74 0-1.38.4-1.73 1H10.5c-.35-.6-1-1-1.73-1H8.72c-1.1 0-2 .9-2 2v.05c0 .73.41 1.38 1 1.73v3.39c-.59.35-1 1-1 1.73v.05c0 1.1.9 2 2 2h.05c.5 0 .95-.19 1.3-.5l1.43 1.43c-.2.36-.32.76-.32 1.2 0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5-1.12-2.5-2.5-2.5c-.44 0-.84.12-1.2.32l-1.43-1.43c.31-.35.5-.8.5-1.3v-.05c0-.73-.41-1.38-1-1.73V9.88c.28-.17.52-.4.7-.67h3.54c.18.27.42.5.7.67v3.39c-.59.35-1 1-1 1.73v.05c0 1.1.9 2 2 2h.05c1.1 0 2-.9 2-2V15c0-.73-.41-1.38-1-1.73z" fill="#FF7A59"/>
+                </svg>
+              </div>
+              <div className="flex-1">
+                <CardTitle className="text-base">HubSpot Integration</CardTitle>
+                <CardDescription className="text-xs">
+                  Two-way sync — import dealers from HubSpot, push compliance scores back
+                </CardDescription>
+              </div>
+              {hs.connected && (
+                <span className="flex items-center gap-1.5 text-xs text-success font-medium">
+                  <span className="h-1.5 w-1.5 rounded-full bg-success" />
+                  Connected
+                </span>
+              )}
+            </div>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {hsLoading ? (
+              <div className="h-16 border border-border bg-secondary/20 animate-pulse" />
+            ) : hs.connected ? (
+              <>
+                <div className="flex items-center gap-4 p-4 border border-border bg-secondary/20">
+                  <div className="flex-1">
+                    <p className="text-sm font-medium">{hs.portal_name || "HubSpot Portal"}</p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {hsSyncStatus?.linked_dealers
+                        ? `${hsSyncStatus.linked_dealers} dealer${hsSyncStatus.linked_dealers !== 1 ? "s" : ""} linked`
+                        : "No dealers synced yet"}
+                      {hsSyncStatus?.last_synced_at && (
+                        <> &middot; Last sync {new Date(hsSyncStatus.last_synced_at).toLocaleString()}</>
+                      )}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleSyncHubSpot}
+                      disabled={hsSyncing}
+                    >
+                      {hsSyncing ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <RefreshCw className="mr-1.5 h-3.5 w-3.5" />
+                      )}
+                      {hsSyncing ? "Syncing..." : "Sync Now"}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleTestHubSpot}
+                      disabled={hsTesting}
+                    >
+                      {hsTesting ? (
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Send className="mr-1.5 h-3.5 w-3.5" />
+                      )}
+                      Test
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-destructive hover:text-destructive hover:border-destructive/50"
+                      onClick={handleDisconnectHubSpot}
+                      disabled={hsDisconnecting}
+                    >
+                      <Unplug className="mr-1.5 h-3.5 w-3.5" />
+                      {hsDisconnecting ? "Removing..." : "Disconnect"}
+                    </Button>
+                  </div>
+                </div>
+
+                {/* Company Filter */}
+                <div className="border border-border p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm font-medium">Company Filter</p>
+                      <p className="text-xs text-muted-foreground mt-0.5">
+                        {hsFilters?.current_filter
+                          ? `Syncing: ${hsFilters.current_filter}`
+                          : "No filter set — select which Companies to import as dealers"}
+                      </p>
+                    </div>
+                    <Button variant="outline" size="sm" onClick={handleLoadHsFilters}>
+                      {hsFiltersOpen ? "Close" : "Configure"}
+                    </Button>
+                  </div>
+
+                  {hsFiltersOpen && (
+                    <div className="space-y-3 pt-2 border-t border-border">
+                      {hsLoadingFilters ? (
+                        <div className="h-10 bg-secondary/20 animate-pulse" />
+                      ) : (
+                        <>
+                          <select
+                            className="w-full text-sm border border-border bg-background px-3 py-1.5"
+                            value={hsSelectedFilter}
+                            onChange={(e) => setHsSelectedFilter(e.target.value)}
+                          >
+                            <option value="">Choose a filter...</option>
+                            {(hsFilters?.company_types || []).length > 0 && (
+                              <optgroup label="Company Type">
+                                {hsFilters!.company_types.map((ct) => (
+                                  <option key={ct.filter} value={ct.filter}>{ct.label}</option>
+                                ))}
+                              </optgroup>
+                            )}
+                            {(hsFilters?.industries || []).length > 0 && (
+                              <optgroup label="Industry">
+                                {hsFilters!.industries.map((ind) => (
+                                  <option key={ind.filter} value={ind.filter}>{ind.label}</option>
+                                ))}
+                              </optgroup>
+                            )}
+                          </select>
+                          <div className="flex justify-end">
+                            <Button
+                              size="sm"
+                              disabled={hsSelectedFilter === (hsFilters?.current_filter || "")}
+                              onClick={handleSaveHsFilter}
+                            >
+                              Save Filter
+                            </Button>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {(hsTestResult || hsSyncResult) && (
+                  <div className={`flex items-center gap-2 ${(hsSyncResult || hsTestResult)?.ok ? "text-success" : "text-destructive"}`}>
+                    {(hsSyncResult || hsTestResult)?.ok ? <CheckCircle className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                    <span className="text-sm">{(hsSyncResult || hsTestResult)?.msg}</span>
+                  </div>
+                )}
+
+                <p className="text-2xs text-muted-foreground">
+                  Dealers sync from HubSpot every 30 minutes. Compliance scores push back to HubSpot after each scan.
+                </p>
+              </>
+            ) : (
+              <>
+                <div className="border border-dashed border-border p-4 flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center bg-secondary/50 border border-border flex-shrink-0">
+                    <MessageSquare className="h-5 w-5 text-muted-foreground" />
+                  </div>
+                  <div className="flex-1">
+                    <p className="text-sm text-muted-foreground">HubSpot is not connected</p>
+                    <p className="text-2xs text-muted-foreground mt-0.5">
+                      Connect to import dealers and sync compliance scores back to your CRM
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    onClick={handleConnectHubSpot}
+                    disabled={hsConnecting}
+                  >
+                    {hsConnecting ? (
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <ExternalLink className="mr-1.5 h-3.5 w-3.5" />
+                    )}
+                    {hsConnecting ? "Connecting..." : "Connect HubSpot"}
                   </Button>
                 </div>
               </>

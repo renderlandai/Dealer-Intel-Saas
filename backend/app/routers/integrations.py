@@ -15,7 +15,7 @@ from slowapi.util import get_remote_address
 from ..auth import AuthUser, get_current_user
 from ..config import get_settings
 from ..database import supabase
-from ..plan_enforcement import OrgPlan, get_org_plan, check_slack_notifications, check_salesforce_notifications
+from ..plan_enforcement import OrgPlan, get_org_plan, check_slack_notifications, check_salesforce_notifications, check_hubspot_notifications
 
 log = logging.getLogger("dealer_intel.integrations")
 
@@ -1109,3 +1109,279 @@ def _refresh_jira_token(org_id, refresh_token: str):
         return new_token
     except Exception:
         return None
+
+
+# ─── HubSpot ────────────────────────────────────────────────────
+
+HS_OAUTH_AUTHORIZE = "https://app.hubspot.com/oauth/authorize"
+HS_OAUTH_TOKEN = "https://api.hubapi.com/oauth/v1/token"
+HS_SCOPES = "crm.objects.companies.read crm.objects.companies.write crm.schemas.companies.read crm.schemas.companies.write"
+
+
+def _hs_redirect_uri() -> str:
+    return _get_backend_base() + "/api/v1/integrations/hubspot/callback"
+
+
+@router.get("/hubspot/install", summary="Start HubSpot OAuth flow")
+async def hubspot_install(
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    check_hubspot_notifications(op)
+    settings = get_settings()
+    if not settings.hubspot_client_id:
+        raise HTTPException(500, "HubSpot integration is not configured")
+
+    state = _sign_state(str(user.org_id))
+    params = urlencode({
+        "client_id": settings.hubspot_client_id,
+        "scope": HS_SCOPES,
+        "redirect_uri": _hs_redirect_uri(),
+        "state": state,
+    })
+    return {"authorize_url": f"{HS_OAUTH_AUTHORIZE}?{params}"}
+
+
+@router.get("/hubspot/callback", summary="HubSpot OAuth callback")
+async def hubspot_callback(code: str, state: str):
+    org_id = _verify_state(state)
+    settings = get_settings()
+
+    try:
+        resp = httpx.post(HS_OAUTH_TOKEN, data={
+            "grant_type": "authorization_code",
+            "client_id": settings.hubspot_client_id,
+            "client_secret": settings.hubspot_client_secret,
+            "redirect_uri": _hs_redirect_uri(),
+            "code": code,
+        }, timeout=15)
+        data = resp.json()
+    except Exception as e:
+        log.error("HubSpot OAuth token exchange failed: %s", e)
+        return RedirectResponse(f"{settings.frontend_url}/settings?hubspot=error")
+
+    if "error" in data or not data.get("access_token"):
+        log.error("HubSpot OAuth error: %s", data.get("message", data.get("error", "")))
+        return RedirectResponse(f"{settings.frontend_url}/settings?hubspot=error")
+
+    access_token = data.get("access_token", "")
+    refresh_token = data.get("refresh_token", "")
+
+    # Fetch portal info
+    portal_name = ""
+    portal_id = ""
+    try:
+        info_resp = httpx.get(
+            "https://api.hubapi.com/oauth/v1/access-tokens/" + access_token,
+            timeout=10,
+        )
+        info = info_resp.json()
+        portal_id = str(info.get("hub_id", ""))
+        portal_name = info.get("hub_domain", "")
+        if not portal_name:
+            portal_name = f"Portal {portal_id}" if portal_id else ""
+    except Exception:
+        pass
+
+    supabase.table("integrations").upsert({
+        "organization_id": org_id,
+        "provider": "hubspot",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "workspace_name": portal_name,
+        "hubspot_portal_id": portal_id,
+        "connected_at": "now()",
+    }, on_conflict="organization_id,provider").execute()
+
+    log.info("HubSpot connected for org %s — portal '%s' (id %s)", org_id, portal_name, portal_id)
+
+    # Auto-provision Dealer Intel custom properties on the HubSpot Company object
+    try:
+        from ..services.hubspot_sync_service import provision_custom_properties
+        integration = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+        }
+        prov_result = provision_custom_properties(
+            organization_id=UUID(org_id),
+            integration=integration,
+        )
+        log.info("HubSpot property provisioning result: %s", prov_result)
+    except Exception as e:
+        log.warning("HubSpot property provisioning failed (non-blocking): %s", e)
+
+    return RedirectResponse(f"{settings.frontend_url}/settings?hubspot=connected")
+
+
+@router.get("/hubspot/status", summary="Get HubSpot integration status")
+async def hubspot_status(user: AuthUser = Depends(get_current_user)):
+    try:
+        result = supabase.table("integrations")\
+            .select("workspace_name, hubspot_portal_id, connected_at")\
+            .eq("organization_id", str(user.org_id))\
+            .eq("provider", "hubspot")\
+            .maybe_single()\
+            .execute()
+    except Exception:
+        return {"connected": False}
+
+    if not result.data:
+        return {"connected": False}
+
+    return {
+        "connected": True,
+        "portal_name": result.data.get("workspace_name", ""),
+        "portal_id": result.data.get("hubspot_portal_id", ""),
+        "connected_at": result.data.get("connected_at"),
+    }
+
+
+@router.delete("/hubspot", summary="Disconnect HubSpot")
+async def hubspot_disconnect(user: AuthUser = Depends(get_current_user)):
+    supabase.table("integrations")\
+        .delete()\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "hubspot")\
+        .execute()
+
+    log.info("HubSpot disconnected for org %s", user.org_id)
+    return {"status": "disconnected"}
+
+
+@router.post("/hubspot/test", summary="Test HubSpot connection")
+@limiter.limit("5/minute")
+async def hubspot_test(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    """Test the HubSpot connection by reading the Company count."""
+    check_hubspot_notifications(op)
+
+    result = supabase.table("integrations")\
+        .select("access_token, refresh_token")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "hubspot")\
+        .maybe_single()\
+        .execute()
+
+    if not result.data:
+        raise HTTPException(400, "HubSpot is not connected. Connect HubSpot first.")
+
+    from ..services.hubspot_sync_service import _hs_api_request
+
+    resp = _hs_api_request(
+        organization_id=user.org_id,
+        integration=result.data,
+        method="POST",
+        path="/crm/v3/objects/companies/search",
+        json_body={"filterGroups": [], "limit": 1},
+    )
+
+    if resp and resp.status_code == 200:
+        total = resp.json().get("total", 0)
+        return {"success": True, "message": f"Connected — {total} companies in HubSpot"}
+    raise HTTPException(500, "Failed to reach HubSpot API. Check the connection.")
+
+
+@router.post("/hubspot/sync", summary="Trigger HubSpot dealer sync")
+@limiter.limit("3/minute")
+async def hubspot_sync(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    check_hubspot_notifications(op)
+
+    result = supabase.table("integrations")\
+        .select("access_token")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "hubspot")\
+        .maybe_single()\
+        .execute()
+
+    if not result.data:
+        raise HTTPException(400, "HubSpot is not connected.")
+
+    from ..services.hubspot_sync_service import sync_dealers_from_hubspot
+
+    sync_result = sync_dealers_from_hubspot(user.org_id)
+    if sync_result.get("error"):
+        raise HTTPException(502, sync_result["error"])
+    return sync_result
+
+
+@router.get("/hubspot/sync/status", summary="Get HubSpot sync status")
+async def hubspot_sync_status(user: AuthUser = Depends(get_current_user)):
+    try:
+        integration = supabase.table("integrations")\
+            .select("last_synced_at, workspace_name, hubspot_portal_id, connected_at")\
+            .eq("organization_id", str(user.org_id))\
+            .eq("provider", "hubspot")\
+            .maybe_single()\
+            .execute()
+    except Exception:
+        return {"connected": False}
+
+    if not integration.data:
+        return {"connected": False}
+
+    try:
+        linked = supabase.table("distributors")\
+            .select("id", count="exact")\
+            .eq("organization_id", str(user.org_id))\
+            .not_.is_("hubspot_id", "null")\
+            .execute()
+        linked_count = linked.count or 0
+    except Exception:
+        linked_count = 0
+
+    return {
+        "connected": True,
+        "portal_name": integration.data.get("workspace_name", ""),
+        "portal_id": integration.data.get("hubspot_portal_id", ""),
+        "connected_at": integration.data.get("connected_at"),
+        "last_synced_at": integration.data.get("last_synced_at"),
+        "linked_dealers": linked_count,
+    }
+
+
+@router.get("/hubspot/filters", summary="Get available HubSpot Company filters")
+async def hubspot_filters(user: AuthUser = Depends(get_current_user)):
+    integration = supabase.table("integrations")\
+        .select("access_token, refresh_token, hubspot_sync_filter")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "hubspot")\
+        .maybe_single()\
+        .execute()
+
+    if not integration.data:
+        raise HTTPException(400, "HubSpot is not connected.")
+
+    from ..services.hubspot_sync_service import fetch_company_filter_options
+
+    options = fetch_company_filter_options(
+        organization_id=user.org_id,
+        integration=integration.data,
+    )
+    options["current_filter"] = integration.data.get("hubspot_sync_filter") or ""
+    return options
+
+
+@router.put("/hubspot/filters", summary="Set HubSpot sync filter")
+async def hubspot_set_filter(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    check_hubspot_notifications(op)
+    body = await request.json()
+    sync_filter = body.get("filter", "")
+
+    supabase.table("integrations")\
+        .update({"hubspot_sync_filter": sync_filter})\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "hubspot")\
+        .execute()
+
+    return {"status": "saved", "filter": sync_filter}

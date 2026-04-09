@@ -1140,3 +1140,71 @@ export const deleteComplianceRule = async (id: string): Promise<{ status: string
   const { data } = await api.delete(`/compliance-rules/${id}`);
   return data;
 };
+
+// ── HubSpot Integration ──────────────────────────────────────
+
+export interface HubSpotStatus {
+  connected: boolean;
+  portal_name?: string;
+  portal_id?: string;
+  connected_at?: string;
+}
+
+export const getHubSpotStatus = async (): Promise<HubSpotStatus> => {
+  const { data } = await api.get("/integrations/hubspot/status");
+  return data;
+};
+
+export const startHubSpotInstall = async (): Promise<{ authorize_url: string }> => {
+  const { data } = await api.get("/integrations/hubspot/install");
+  return data;
+};
+
+export const disconnectHubSpot = async (): Promise<{ status: string }> => {
+  const { data } = await api.delete("/integrations/hubspot");
+  return data;
+};
+
+export const testHubSpotConnection = async (): Promise<{ success: boolean; message: string }> => {
+  const { data } = await api.post("/integrations/hubspot/test");
+  return data;
+};
+
+export interface HubSpotFilterOption {
+  label: string;
+  value: string;
+  filter: string;
+}
+
+export interface HubSpotFilters {
+  company_types: HubSpotFilterOption[];
+  industries: HubSpotFilterOption[];
+  current_filter: string;
+}
+
+export const getHubSpotFilters = async (): Promise<HubSpotFilters> => {
+  const { data } = await api.get("/integrations/hubspot/filters");
+  return data;
+};
+
+export const setHubSpotFilter = async (filter: string): Promise<{ status: string; filter: string }> => {
+  const { data } = await api.put("/integrations/hubspot/filters", { filter });
+  return data;
+};
+
+export const syncHubSpot = async (): Promise<{ synced: number; created: number; updated: number; errors: number; message?: string }> => {
+  const { data } = await api.post("/integrations/hubspot/sync");
+  return data;
+};
+
+export const getHubSpotSyncStatus = async (): Promise<{
+  connected: boolean;
+  portal_name?: string;
+  portal_id?: string;
+  connected_at?: string;
+  last_synced_at?: string;
+  linked_dealers?: number;
+}> => {
+  const { data } = await api.get("/integrations/hubspot/sync/status");
+  return data;
+};

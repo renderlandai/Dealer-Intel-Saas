@@ -323,6 +323,16 @@ def check_jira_notifications(op: OrgPlan) -> None:
         )
 
 
+def check_hubspot_notifications(op: OrgPlan) -> None:
+    """Raise 403 if HubSpot integration is not included in the plan."""
+    if not op.limits.get("hubspot_notifications"):
+        raise HTTPException(
+            403,
+            f"HubSpot integration is not available on your {op.plan} plan. "
+            f"Upgrade to Enterprise to enable HubSpot.",
+        )
+
+
 def check_compliance_rules_limit(op: OrgPlan) -> None:
     """Raise 403 if the org has reached its compliance rules cap."""
     max_rules = op.limits.get("max_compliance_rules")

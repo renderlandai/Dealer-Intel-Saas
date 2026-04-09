@@ -448,6 +448,16 @@ async def start() -> None:
     )
     log.info("Salesforce inbound sync scheduled every 30 minutes")
 
+    from .hubspot_sync_service import run_hubspot_sync_all
+
+    _scheduler.add_job(
+        run_hubspot_sync_all,
+        trigger=CronTrigger(minute="*/30", timezone="UTC"),
+        id="hubspot_inbound_sync",
+        replace_existing=True,
+    )
+    log.info("HubSpot inbound sync scheduled every 30 minutes")
+
     await load_schedules()
 
 
