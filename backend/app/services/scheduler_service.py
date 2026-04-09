@@ -367,12 +367,14 @@ async def _cleanup_stale_scans() -> None:
             .lt("created_at", pending_cutoff) \
             .execute()
 
-        # Running/analyzing scans with no heartbeat for 30 min are presumed dead.
-        running_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
+        # Running/analyzing scans older than 60 min are presumed dead.
+        # Large scans (30+ pages) can take 45+ min legitimately;
+        # the hard limit is the 2-hour asyncio timeout in tasks.py.
+        running_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
         stale_running = supabase.table("scan_jobs") \
             .select("id") \
             .in_("status", ["running", "analyzing"]) \
-            .lt("started_at", running_cutoff) \
+            .lt("created_at", running_cutoff) \
             .execute()
 
         all_stale = (stale_pending.data or []) + (stale_running.data or [])

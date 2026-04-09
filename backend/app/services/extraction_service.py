@@ -36,6 +36,33 @@ log = logging.getLogger("dealer_intel.extraction")
 
 settings = get_settings()
 
+
+def _safe_insert_discovered_image(data: dict) -> bool:
+    """Insert a discovered_image row, gracefully handling deleted distributors.
+
+    If the distributor was deleted mid-scan (FK violation 23503), the row is
+    re-inserted with distributor_id=None so the scan keeps running.
+    Returns True on success, False on failure.
+    """
+    try:
+        supabase.table("discovered_images").insert(data).execute()
+        return True
+    except Exception as e:
+        if "23503" in str(e) and data.get("distributor_id"):
+            log.warning(
+                "Distributor %s deleted mid-scan — saving image without distributor",
+                data["distributor_id"],
+            )
+            data["distributor_id"] = None
+            try:
+                supabase.table("discovered_images").insert(data).execute()
+                return True
+            except Exception as retry_err:
+                log.error("Insert still failed after clearing distributor_id: %s", retry_err)
+                return False
+        raise
+
+
 # Shared browser instance to avoid repeated cold starts
 _browser: Optional[Browser] = None
 _pw_instance = None
@@ -506,7 +533,7 @@ async def _extract_from_viewport(
             seen_srcs.add(img["src"])
 
             location = _classify_location(img["y"], page_height)
-            supabase.table("discovered_images").insert({
+            if _safe_insert_discovered_image({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
                 "source_url": url,
@@ -525,8 +552,8 @@ async def _extract_from_viewport(
                     "css_classes": img["classes"],
                     "evidence_screenshot_url": evidence_url,
                 },
-            }).execute()
-            extracted_count += 1
+            }):
+                extracted_count += 1
 
     except PlaywrightTimeout:
         log.error("Timeout loading %s (%s) — will retry with fresh browser", url, viewport_label)
@@ -594,7 +621,7 @@ async def _extract_from_viewport(
                     continue
                 seen_srcs.add(img["src"])
                 location = _classify_location(img["y"], page_height)
-                supabase.table("discovered_images").insert({
+                if _safe_insert_discovered_image({
                     "scan_job_id": str(scan_job_id),
                     "distributor_id": str(distributor_id) if distributor_id else None,
                     "source_url": url,
@@ -613,8 +640,8 @@ async def _extract_from_viewport(
                         "css_classes": img["classes"],
                         "evidence_screenshot_url": evidence_url,
                     },
-                }).execute()
-                extracted_count += 1
+                }):
+                    extracted_count += 1
 
         except PlaywrightTimeout:
             log.error("Retry also timed out for %s (%s)", url, viewport_label)
@@ -749,7 +776,7 @@ async def scan_dealer_websites(
 
             if count == 0 and settings.enable_tiling_fallback and evidence_url:
                 log.info("Zero images extracted from %s — inserting screenshot for tiling fallback", url)
-                supabase.table("discovered_images").insert({
+                _safe_insert_discovered_image({
                     "scan_job_id": str(scan_job_id),
                     "distributor_id": str(distributor_id) if distributor_id else None,
                     "source_url": url,
@@ -761,7 +788,7 @@ async def scan_dealer_websites(
                         "full_page": True,
                         "reason": "no_images_extracted",
                     },
-                }).execute()
+                })
                 return 1
             return count
 
@@ -846,7 +873,7 @@ async def _extract_ads_from_viewport(
             if extra_metadata:
                 meta.update(extra_metadata)
 
-            supabase.table("discovered_images").insert({
+            if _safe_insert_discovered_image({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
                 "source_url": target_url,
@@ -854,8 +881,8 @@ async def _extract_ads_from_viewport(
                 "source_type": "extracted_image",
                 "channel": channel,
                 "metadata": meta,
-            }).execute()
-            extracted_count += 1
+            }):
+                extracted_count += 1
 
     except PlaywrightTimeout:
         log.error("Timeout loading %s (%s)", target_url[:60], viewport_label)
@@ -942,7 +969,7 @@ async def scan_google_ads(
 
         if count == 0 and settings.enable_tiling_fallback and evidence_url:
             log.info("Zero images for %s — inserting screenshot for tiling fallback", adv_id)
-            supabase.table("discovered_images").insert({
+            _safe_insert_discovered_image({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
                 "source_url": f"https://adstransparency.google.com/advertiser/{adv_id}?region=anywhere",
@@ -954,7 +981,7 @@ async def scan_google_ads(
                     "capture_method": "playwright_fallback",
                     "reason": "no_images_extracted",
                 },
-            }).execute()
+            })
             total += 1
         else:
             total += count
@@ -1066,7 +1093,7 @@ async def scan_facebook_ads(
                 f"?active_status=active&ad_type=all"
                 f"&country=US&q={quote(page_name)}&media_type=all"
             )
-            supabase.table("discovered_images").insert({
+            _safe_insert_discovered_image({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
                 "source_url": ad_library_url,
@@ -1079,7 +1106,7 @@ async def scan_facebook_ads(
                     "capture_method": "playwright_fallback",
                     "reason": "no_images_extracted",
                 },
-            }).execute()
+            })
             total += 1
         else:
             total += count

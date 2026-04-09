@@ -8,6 +8,7 @@ from ..auth import AuthUser, get_current_user
 from ..database import supabase
 from ..models import ScanJobCreate, ScanJob, ScanSource
 from ..services import screenshot_service, extraction_service, ai_service, serpapi_service, apify_meta_service, apify_instagram_service
+from ..services.extraction_service import _safe_insert_discovered_image
 from ..services.notification_service import notify_scan_complete, notify_slack_scan_complete, notify_salesforce_scan_complete, notify_jira_scan_complete
 from ..services.salesforce_sync_service import push_compliance_to_salesforce
 from ..services.hubspot_sync_service import push_compliance_to_hubspot
@@ -30,13 +31,12 @@ def _utc_now() -> str:
 
 
 def _heartbeat(scan_job_id) -> None:
-    """Touch the scan job's started_at so the cleanup job knows we're alive."""
-    try:
-        supabase.table("scan_jobs").update({
-            "started_at": _utc_now(),
-        }).eq("id", str(scan_job_id)).execute()
-    except Exception:
-        pass
+    """No-op — heartbeat removed to avoid clobbering started_at.
+
+    The cleanup job uses created_at with a generous timeout instead.
+    The hard limit is the 2-hour asyncio timeout in tasks.py.
+    """
+    pass
 
 
 def _send_scan_notifications(
@@ -708,7 +708,7 @@ async def run_website_scan(
                     campaign_assets=campaign_assets,
                 )
                 if count == 0 and _settings.enable_tiling_fallback and evidence_url:
-                    supabase.table("discovered_images").insert({
+                    _safe_insert_discovered_image({
                         "scan_job_id": str(scan_job_id),
                         "distributor_id": str(distributor_id) if distributor_id else None,
                         "source_url": page_url,
@@ -716,7 +716,7 @@ async def run_website_scan(
                         "source_type": "page_screenshot",
                         "channel": "website",
                         "metadata": {"capture_method": "playwright_fallback", "full_page": True},
-                    }).execute()
+                    })
                     count = 1
 
                 total_discovered += count
@@ -805,7 +805,7 @@ async def run_website_scan(
 
                 if count == 0 and _settings.enable_tiling_fallback and evidence_url:
                     log.info("Zero images from %s — inserting screenshot for tiling", page_url)
-                    supabase.table("discovered_images").insert({
+                    _safe_insert_discovered_image({
                         "scan_job_id": str(scan_job_id),
                         "distributor_id": str(distributor_id) if distributor_id else None,
                         "source_url": page_url,
@@ -817,7 +817,7 @@ async def run_website_scan(
                             "full_page": True,
                             "reason": "no_images_extracted",
                         },
-                    }).execute()
+                    })
                     count = 1
 
                 total_discovered += count
