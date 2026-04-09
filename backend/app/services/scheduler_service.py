@@ -438,6 +438,16 @@ async def start() -> None:
     )
     log.info("Stale scan cleanup scheduled every 5 minutes")
 
+    from .salesforce_sync_service import run_salesforce_sync_all
+
+    _scheduler.add_job(
+        run_salesforce_sync_all,
+        trigger=CronTrigger(minute="*/30", timezone="UTC"),
+        id="salesforce_inbound_sync",
+        replace_existing=True,
+    )
+    log.info("Salesforce inbound sync scheduled every 30 minutes")
+
     await load_schedules()
 
 

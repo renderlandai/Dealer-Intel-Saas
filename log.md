@@ -1910,7 +1910,7 @@ Planned integrations to extend the platform's reach, reduce setup friction, and 
 1. ~~**Slack / Teams** — fastest to ship (webhooks), instant demo value, daily stickiness~~ ✅ Slack done
 2. ~~**Salesforce** — eliminates dealer onboarding friction, signals enterprise readiness~~ ✅ Done
 3. **Bynder or Brandfolder** — eliminates asset upload friction, makes setup near-zero
-4. **Jira** — closes the violation-to-resolution loop, critical for proving ROI
+4. ~~**Jira** — closes the violation-to-resolution loop, critical for proving ROI~~ ✅ Done
 5. **Ansira** — ties compliance to co-op dollars, the core business case
 
 ---
@@ -1991,3 +1991,160 @@ Built and deployed two full third-party integrations: Slack (OAuth + scan notifi
 | `.do/app.yaml` | 5 new DigitalOcean env vars |
 | `frontend/lib/api.ts` | Slack + Salesforce API functions and types |
 | `frontend/app/settings/page.tsx` | Two integration cards with full connect/disconnect/test UI |
+
+---
+
+## 2026-04-08 — Dropbox Auto-Sync & Jira Integration
+
+### Summary
+Built and deployed two major integrations: Dropbox (OAuth + auto-sync asset pipeline) and Jira (OAuth + automatic issue creation from scan violations). Fixed a deploy-blocking indentation bug in the scan notification pipeline. Both integrations are live in production, verified end-to-end, and gated to the Enterprise plan tier.
+
+### Changes
+
+**Database**
+- `022_dropbox_integration.sql` — Extended `integrations` provider constraint to include `dropbox` and `google_drive`, added `folder_path`, `folder_name`, `campaign_id`, `last_synced_at` columns
+- `023_dropbox_auto_sync.sql` — Added `external_account_id` column for Dropbox webhook matching, created `dropbox_folder_mappings` table (tracks subfolder-to-campaign relationships with unique constraint on integration + path)
+- `024_jira_integration.sql` — Extended provider constraint to include `jira`, added `cloud_id` and `project_key` columns
+
+**Backend — Dropbox Integration**
+- New routes in `integrations.py`:
+  - `GET /integrations/dropbox/install` — Dropbox OAuth consent redirect
+  - `GET /integrations/dropbox/callback` — exchanges code for tokens, stores `external_account_id`
+  - `GET /integrations/dropbox/status` — returns connection status
+  - `DELETE /integrations/dropbox` — disconnects
+  - `GET /integrations/dropbox/folders` — lists subfolders at a given path
+  - `POST /integrations/dropbox/select-folder` — links a Dropbox folder to a campaign
+  - `POST /integrations/dropbox/sync` — manual sync trigger
+  - `GET /integrations/dropbox/webhook` — Dropbox webhook verification (returns challenge)
+  - `POST /integrations/dropbox/webhook` — receives change notifications, triggers auto-sync
+  - `POST /integrations/dropbox/auto-sync` — manual auto-sync trigger
+- New `services/dropbox_service.py`:
+  - `_refresh_token()` — automatic token refresh
+  - `_dbx_request()` — Dropbox API request wrapper with retry on 401
+  - `_list_folder()` — paginated folder listing via `/files/list_folder`
+  - `_import_image()` — downloads images via `/files/download`, uploads to Supabase storage, creates asset record
+  - `auto_sync_org()` — full auto-sync: ensures `/Dealer Intel/` root folder exists, auto-creates campaigns from subfolders, imports new images as assets
+  - Unicode fix: uses `json.dumps(ensure_ascii=True)` for `Dropbox-API-Arg` header to handle macOS special characters in filenames
+
+**Backend — Jira Integration**
+- New routes in `integrations.py`:
+  - `GET /integrations/jira/install` — Atlassian OAuth 2.0 3LO consent redirect
+  - `GET /integrations/jira/callback` — exchanges code for tokens, fetches accessible Jira cloud sites, stores `cloud_id`
+  - `GET /integrations/jira/status` — returns connection status with site name and selected project
+  - `DELETE /integrations/jira` — disconnects
+  - `GET /integrations/jira/projects` — lists available Jira projects
+  - `POST /integrations/jira/select-project` — stores selected project key
+  - `POST /integrations/jira/test` — creates a test issue in the selected project
+  - `_refresh_jira_token()` — automatic token refresh via Atlassian OAuth
+- `notification_service.py` — Added Jira notification pipeline:
+  - `_get_jira_integration()` — fetches Jira integration row
+  - `_refresh_jira_token()` — refreshes expired tokens
+  - `_jira_api_request()` — API wrapper with auto-refresh on 401
+  - `_create_jira_issue()` — creates issues with Atlassian Document Format description, configurable priority and issue type
+  - `notify_jira_scan_complete()` — formats scan violations into a Jira issue (summary with violation count + compliance rate, detailed description with top 20 violations, High priority if 5+ violations)
+  - `send_jira_test()` — creates a test issue
+
+**Backend — Shared Infrastructure**
+- `config.py` — Added `DROPBOX_CLIENT_ID`, `DROPBOX_CLIENT_SECRET`, `JIRA_CLIENT_ID`, `JIRA_CLIENT_SECRET` settings; added `jira_notifications` to plan limits (Enterprise-only)
+- `plan_enforcement.py` — Added `check_jira_notifications()` gate
+- `scanning.py` — Wired `notify_salesforce_scan_complete()` and `notify_jira_scan_complete()` into `_send_scan_notifications()` post-scan hook; fixed indentation bug that caused deploy failure
+- `.env.example` — Added 4 new env var placeholders
+- `.do/app.yaml` — Added 4 new DigitalOcean env vars (secrets)
+
+**Frontend**
+- `api.ts` — Added `DropboxStatus`, `DropboxFolder`, `JiraStatus`, `JiraProject` interfaces and full API functions for both integrations
+- `settings/page.tsx` — Two new integration cards:
+  - **Dropbox Integration** card: connect/disconnect, auto-sync status showing "Watching: /Dealer Intel/", Sync Now button, "How it works" guide, last synced timestamp, sync result display
+  - **Jira Integration** card: connect/disconnect, project picker dropdown, test button, site name + selected project display, test result feedback
+  - Removed unused `FolderOpen` and `ChevronRight` Lucide icon imports
+
+### Dropbox Auto-Sync Architecture
+- Users connect Dropbox OAuth → system auto-creates `/Dealer Intel/` root folder
+- Each subfolder inside `/Dealer Intel/` becomes a campaign automatically
+- Images dropped into subfolders are imported as campaign assets
+- Dropbox webhooks trigger real-time sync on file changes
+- `dropbox_folder_mappings` table tracks which subfolders map to which campaigns
+- Goal: near-zero app work — clients manage assets in Dropbox, campaigns self-create
+
+### Bug Fixes
+- **Deploy failure (IndentationError)** — `notify_salesforce_scan_complete()` and `notify_jira_scan_complete()` had incorrect indentation in `scanning.py`, breaking the outer `try/except` in `_send_scan_notifications()`. Fixed indentation to align all four notification calls inside the same try block.
+- **Dropbox `NoneType` error** — Changed `.maybe_single()` to `.execute()` with list handling on Dropbox status/folders/sync endpoints
+- **Dropbox JSON decode error** — Added response logging before JSON parsing to diagnose empty Dropbox API responses
+- **Dropbox silent frontend failures** — Added error display to frontend sync handlers (previously had empty `catch {}` blocks)
+- **Dropbox Unicode filename error** — macOS screenshot filenames contained Unicode narrow no-break space (`\u202f`), causing `ascii` codec error in Dropbox API header; fixed with `json.dumps(ensure_ascii=True)`
+
+### Files Created
+| File | Purpose |
+|------|---------|
+| `backend/app/services/dropbox_service.py` | Auto-sync engine: folder listing, image import, campaign creation |
+| `supabase/migrations/022_dropbox_integration.sql` | Dropbox columns + provider constraint |
+| `supabase/migrations/023_dropbox_auto_sync.sql` | `dropbox_folder_mappings` table + `external_account_id` |
+| `supabase/migrations/024_jira_integration.sql` | Jira columns + provider constraint |
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `backend/app/config.py` | Dropbox + Jira env vars, `jira_notifications` plan flag |
+| `backend/app/plan_enforcement.py` | `check_jira_notifications()` |
+| `backend/app/services/notification_service.py` | Jira issue creator with token refresh + scan violation formatter |
+| `backend/app/routers/integrations.py` | Dropbox OAuth + webhook + auto-sync routes, Jira OAuth + project selection routes |
+| `backend/app/routers/scanning.py` | Wired Salesforce + Jira into post-scan hook, fixed indentation bug |
+| `backend/.env.example` | 4 new env vars |
+| `.do/app.yaml` | 4 new DigitalOcean env vars |
+| `frontend/lib/api.ts` | Dropbox + Jira API functions and types |
+| `frontend/app/settings/page.tsx` | Two new integration cards (Dropbox auto-sync + Jira project picker) |
+
+### Future Enhancement
+- **Jira issue auto-assignment to dealer contacts** — Currently Jira issues are created unassigned. To auto-assign violations to the responsible dealer contact: (1) add `contact_name` and `contact_email` fields to the `distributors` table with UI for entering contacts, (2) use Jira's user search API (`/rest/api/3/user/search?query=email`) to resolve the dealer's Jira `accountId`, (3) set the `assignee` field on issue creation. Requires dealer contacts to have Jira accounts in the org's Atlassian workspace. Alternative: create one issue per violating distributor (instead of one summary per scan) with dealer name in the title for manual assignment.
+
+---
+
+## Salesforce Two-Way Sync
+
+**Goal:** Eliminate manual dealer onboarding, keep dealer metadata current via Salesforce, and push compliance status back as Account properties.
+
+### Architecture
+
+- **Inbound (SF → DI):** APScheduler job runs every 30 minutes, queries SF Accounts via SOQL (`WHERE LastModifiedDate > last_sync`), upserts into `distributors` table. Links by `salesforce_id` or name match for existing dealers.
+- **Outbound (DI → SF):** After every scan, `push_compliance_to_salesforce()` patches 4 custom fields on each SF-linked Account using the External ID upsert pattern (`PATCH .../Account/Dealer_Intel_ID__c/{distributor_id}`).
+- **Auto-provisioning:** On first OAuth connect, the callback uses the Tooling API to create 5 custom fields on the SF Account object — idempotent, no manual SF admin steps needed.
+- **Manual sync:** `POST /api/v1/integrations/salesforce/sync` triggers an on-demand inbound pull. `GET .../sync/status` returns last sync time and linked dealer count.
+
+### Custom Fields (auto-created on Account)
+
+| Field | API Name | Type |
+|-------|----------|------|
+| Dealer Intel ID | `Dealer_Intel_ID__c` | Text(36), External ID, Unique |
+| Compliance Score | `Compliance_Score__c` | Percent |
+| Open Violations | `Open_Violations__c` | Number |
+| Has Compliance Violation | `Has_Compliance_Violation__c` | Checkbox |
+| Last Scan Date | `Last_Scan_Date__c` | DateTime |
+
+### Inbound Field Mapping (SF Account → distributors)
+
+| Salesforce Field | Distributors Column |
+|-----------------|-------------------|
+| `Name` | `name` |
+| `Website` | `website_url` |
+| `AccountNumber` | `code` |
+| `BillingState` | `region` |
+
+### API Endpoints Added
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/api/v1/integrations/salesforce/sync` | Manual inbound sync trigger (3/min rate limit, Enterprise-gated) |
+| GET | `/api/v1/integrations/salesforce/sync/status` | Last sync timestamp + linked dealer count |
+
+### Files Created
+| File | Purpose |
+|------|---------|
+| `backend/app/services/salesforce_sync_service.py` | Core sync engine: field provisioning, inbound dealer sync, outbound compliance push, scheduled sync runner |
+| `supabase/migrations/025_salesforce_two_way_sync.sql` | `salesforce_id` + `salesforce_synced_at` on distributors, `last_synced_at` on integrations |
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `backend/app/routers/integrations.py` | Auto-provision SF fields on OAuth callback, added `/salesforce/sync` and `/salesforce/sync/status` routes |
+| `backend/app/routers/scanning.py` | Wired `push_compliance_to_salesforce()` into post-scan notification pipeline |
+| `backend/app/services/scheduler_service.py` | Added 30-minute cron job for `run_salesforce_sync_all()` |

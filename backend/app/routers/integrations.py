@@ -301,6 +301,22 @@ async def salesforce_callback(code: str, state: str):
     log.info("Salesforce connected for org %s — instance '%s', sf_org '%s'",
              org_id, instance_url, sf_org_name)
 
+    # Auto-provision Dealer Intel custom fields on the SF Account object
+    try:
+        from ..services.salesforce_sync_service import provision_custom_fields
+        integration = {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "instance_url": instance_url,
+        }
+        prov_result = provision_custom_fields(
+            organization_id=UUID(org_id),
+            integration=integration,
+        )
+        log.info("SF field provisioning result: %s", prov_result)
+    except Exception as e:
+        log.warning("SF field provisioning failed (non-blocking): %s", e)
+
     return RedirectResponse(f"{settings.frontend_url}/settings?salesforce=connected")
 
 
@@ -367,6 +383,70 @@ async def salesforce_test(
     if success:
         return {"success": True, "message": "Test task created in Salesforce"}
     raise HTTPException(500, "Failed to create test task. Check the Salesforce connection.")
+
+
+@router.post("/salesforce/sync", summary="Trigger Salesforce dealer sync")
+@limiter.limit("3/minute")
+async def salesforce_sync(
+    request: Request,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    """Manually trigger an inbound sync of Accounts from Salesforce."""
+    check_salesforce_notifications(op)
+
+    result = supabase.table("integrations")\
+        .select("access_token")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("provider", "salesforce")\
+        .maybe_single()\
+        .execute()
+
+    if not result.data:
+        raise HTTPException(400, "Salesforce is not connected.")
+
+    from ..services.salesforce_sync_service import sync_dealers_from_salesforce
+
+    sync_result = sync_dealers_from_salesforce(user.org_id)
+    if sync_result.get("error"):
+        raise HTTPException(502, sync_result["error"])
+    return sync_result
+
+
+@router.get("/salesforce/sync/status", summary="Get Salesforce sync status")
+async def salesforce_sync_status(user: AuthUser = Depends(get_current_user)):
+    """Return the last sync timestamp and linked dealer count."""
+    try:
+        integration = supabase.table("integrations")\
+            .select("last_synced_at, workspace_name, instance_url, connected_at")\
+            .eq("organization_id", str(user.org_id))\
+            .eq("provider", "salesforce")\
+            .maybe_single()\
+            .execute()
+    except Exception:
+        return {"connected": False}
+
+    if not integration.data:
+        return {"connected": False}
+
+    try:
+        linked = supabase.table("distributors")\
+            .select("id", count="exact")\
+            .eq("organization_id", str(user.org_id))\
+            .not_.is_("salesforce_id", "null")\
+            .execute()
+        linked_count = linked.count or 0
+    except Exception:
+        linked_count = 0
+
+    return {
+        "connected": True,
+        "org_name": integration.data.get("workspace_name", ""),
+        "instance_url": integration.data.get("instance_url", ""),
+        "connected_at": integration.data.get("connected_at"),
+        "last_synced_at": integration.data.get("last_synced_at"),
+        "linked_dealers": linked_count,
+    }
 
 
 # ─── Dropbox ────────────────────────────────────────────────────

@@ -9,6 +9,7 @@ from ..database import supabase
 from ..models import ScanJobCreate, ScanJob, ScanSource
 from ..services import screenshot_service, extraction_service, ai_service, serpapi_service, apify_meta_service, apify_instagram_service
 from ..services.notification_service import notify_scan_complete, notify_slack_scan_complete, notify_salesforce_scan_complete, notify_jira_scan_complete
+from ..services.salesforce_sync_service import push_compliance_to_salesforce
 from ..plan_enforcement import (
     OrgPlan, get_org_plan,
     check_scan_quota, check_concurrent_scans, check_channel_allowed,
@@ -96,7 +97,7 @@ def _send_scan_notifications(
         if violation_count > 0 and img_ids:
             try:
                 v_matches = supabase.table("matches")\
-                    .select("*")\
+                    .select("*, assets(name), distributors(name)")\
                     .eq("compliance_status", "violation")\
                     .in_("discovered_image_id", img_ids)\
                     .execute()
@@ -106,8 +107,8 @@ def _send_scan_notifications(
                     if isinstance(analysis, dict):
                         comp_summary = analysis.get("compliance", {}).get("summary", "")
                     violations_formatted.append({
-                        "asset_name": m.get("asset_name", "Unknown"),
-                        "distributor_name": m.get("distributor_name", "Unknown"),
+                        "asset_name": (m.get("assets") or {}).get("name", "Unknown"),
+                        "distributor_name": (m.get("distributors") or {}).get("name", "Unknown"),
                         "channel": m.get("channel", scan_source),
                         "confidence_score": m.get("confidence_score", 0),
                         "compliance_summary": comp_summary,
@@ -133,6 +134,10 @@ def _send_scan_notifications(
             summary=summary,
             violations=violations_formatted,
         )
+        try:
+            push_compliance_to_salesforce(organization_id=UUID(org_id))
+        except Exception as sf_push_err:
+            log.warning("SF compliance push failed for %s: %s", org_id, sf_push_err)
         notify_jira_scan_complete(
             organization_id=UUID(org_id),
             scan_source=scan_source,
