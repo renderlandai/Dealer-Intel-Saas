@@ -2099,26 +2099,32 @@ Built and deployed two major integrations: Dropbox (OAuth + auto-sync asset pipe
 
 ---
 
-## Salesforce Two-Way Sync
+## April 8, 2026 — Salesforce Two-Way Sync
 
-**Goal:** Eliminate manual dealer onboarding, keep dealer metadata current via Salesforce, and push compliance status back as Account properties.
+**Goal:** Eliminate manual dealer onboarding, keep dealer metadata current via Salesforce, and push compliance status back as Account properties. Zero manual work in Dealer Intel beyond initial connect + filter selection.
 
-### Architecture
+### What It Does
 
-- **Inbound (SF → DI):** APScheduler job runs every 30 minutes, queries SF Accounts via SOQL (`WHERE LastModifiedDate > last_sync`), upserts into `distributors` table. Links by `salesforce_id` or name match for existing dealers.
-- **Outbound (DI → SF):** After every scan, `push_compliance_to_salesforce()` patches 4 custom fields on each SF-linked Account using the External ID upsert pattern (`PATCH .../Account/Dealer_Intel_ID__c/{distributor_id}`).
-- **Auto-provisioning:** On first OAuth connect, the callback uses the Tooling API to create 5 custom fields on the SF Account object — idempotent, no manual SF admin steps needed.
-- **Manual sync:** `POST /api/v1/integrations/salesforce/sync` triggers an on-demand inbound pull. `GET .../sync/status` returns last sync time and linked dealer count.
+- **Inbound (SF → DI):** APScheduler job runs every 30 minutes, queries SF Accounts via SOQL (filtered by user-selected Record Type or Account Type), upserts into `distributors` table. Links by `salesforce_id` or name match for existing dealers. Pulls name, website, region, social URLs, and Google Ads ID.
+- **Outbound (DI → SF):** After every scan, `push_compliance_to_salesforce()` patches compliance custom fields on each SF-linked Account using the External ID upsert pattern (`PATCH .../Account/Dealer_Intel_ID__c/{distributor_id}`).
+- **Auto-provisioning:** On OAuth connect, the Tooling API auto-creates 9 custom fields on the SF Account object — idempotent, no manual SF admin steps needed.
+- **Sync filtering:** User must select which Accounts to import (by Record Type or Account Type) before sync runs. Prevents importing all CRM contacts as dealers.
+- **Manual sync:** "Sync Now" button on Settings page triggers an on-demand inbound pull.
+- **Frontend UI:** Filter picker dropdown, sync button, linked dealer count, last sync timestamp — all in the Salesforce Settings card.
 
 ### Custom Fields (auto-created on Account)
 
-| Field | API Name | Type |
-|-------|----------|------|
-| Dealer Intel ID | `Dealer_Intel_ID__c` | Text(36), External ID, Unique |
-| Compliance Score | `Compliance_Score__c` | Percent |
-| Open Violations | `Open_Violations__c` | Number |
-| Has Compliance Violation | `Has_Compliance_Violation__c` | Checkbox |
-| Last Scan Date | `Last_Scan_Date__c` | DateTime |
+| Field | API Name | Type | Direction |
+|-------|----------|------|-----------|
+| Dealer Intel ID | `Dealer_Intel_ID__c` | Text(36), External ID, Unique | Outbound (link key) |
+| Compliance Score | `Compliance_Score__c` | Percent | Outbound |
+| Open Violations | `Open_Violations__c` | Number | Outbound |
+| Has Compliance Violation | `Has_Compliance_Violation__c` | Checkbox | Outbound |
+| Last Scan Date | `Last_Scan_Date__c` | DateTime | Outbound |
+| Facebook URL | `Facebook_URL__c` | URL | Inbound |
+| Instagram URL | `Instagram_URL__c` | URL | Inbound |
+| YouTube URL | `YouTube_URL__c` | URL | Inbound |
+| Google Ads Advertiser ID | `Google_Ads_Advertiser_ID__c` | Text(50) | Inbound |
 
 ### Inbound Field Mapping (SF Account → distributors)
 
@@ -2128,6 +2134,10 @@ Built and deployed two major integrations: Dropbox (OAuth + auto-sync asset pipe
 | `Website` | `website_url` |
 | `AccountNumber` | `code` |
 | `BillingState` | `region` |
+| `Facebook_URL__c` | `facebook_url` |
+| `Instagram_URL__c` | `instagram_url` |
+| `YouTube_URL__c` | `youtube_url` |
+| `Google_Ads_Advertiser_ID__c` | `google_ads_advertiser_id` |
 
 ### API Endpoints Added
 
@@ -2140,33 +2150,47 @@ Built and deployed two major integrations: Dropbox (OAuth + auto-sync asset pipe
 
 ### Sync Filtering
 
-Salesforce orgs contain many Account types (customers, vendors, partners) — not just dealers. The sync filter lets users choose which Accounts to import:
+Salesforce orgs contain many Account types (customers, vendors, partners) — not just dealers. The sync filter prevents importing everything:
 
-- `GET /salesforce/filters` calls the SF Account Describe API to discover available Record Types and Type picklist values
-- User picks a filter (e.g. "Record Type = Dealer") from the options
+- `GET /salesforce/filters` calls the SF Account Describe API to discover Record Types and Type picklist values
+- User picks a filter from the dropdown on the Settings page (grouped by Record Type / Account Type)
 - `PUT /salesforce/filters` saves it as `salesforce_sync_filter` on the `integrations` row
-- All subsequent inbound syncs (scheduled + manual) append the filter to the SOQL WHERE clause
-- If no filter is set, **no Accounts sync** until a filter is configured (prevents importing everything)
+- All subsequent inbound syncs (scheduled + manual) use the filter in the SOQL WHERE clause
+- If no filter is set, sync is blocked with a message to configure it first
+
+### User Flow
+
+1. Connect Salesforce from Settings (existing OAuth flow)
+2. 9 custom fields auto-created on the SF Account object (no SF admin work)
+3. Click "Configure" on the Account Filter, pick which Accounts are dealers (e.g. "Channel Partner / Reseller")
+4. Click "Sync Now" or wait 30 minutes — matching Accounts appear as dealers with all URLs populated
+5. Users manage dealer info entirely in Salesforce — changes sync automatically
+6. After each scan, compliance scores push back to SF Account fields — visible in the CRM
+
+### Database Migration (`025_salesforce_two_way_sync.sql`)
+
+```sql
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS salesforce_id TEXT;
+ALTER TABLE distributors ADD COLUMN IF NOT EXISTS salesforce_synced_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_distributors_sf_id ON distributors(salesforce_id) WHERE salesforce_id IS NOT NULL;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ;
+ALTER TABLE integrations ADD COLUMN IF NOT EXISTS salesforce_sync_filter TEXT;
+```
 
 ### Files Created
+
 | File | Purpose |
 |------|---------|
-| `backend/app/services/salesforce_sync_service.py` | Core sync engine: field provisioning, inbound dealer sync, outbound compliance push, Account describe for filters, scheduled sync runner |
+| `backend/app/services/salesforce_sync_service.py` | Core sync engine: field provisioning (9 fields), inbound dealer sync with SOQL filtering, outbound compliance push, Account describe for filter options, scheduled sync runner |
 | `supabase/migrations/025_salesforce_two_way_sync.sql` | `salesforce_id` + `salesforce_synced_at` on distributors, `last_synced_at` + `salesforce_sync_filter` on integrations |
 
-### Frontend
-
-The Salesforce Settings card now includes:
-- **Sync status** — linked dealer count + last sync timestamp
-- **Sync Now button** — manual trigger for inbound dealer import
-- **Account Filter picker** — dropdown populated from SF Account describe (Record Types + Type picklist), saved via PUT endpoint
-- **Updated copy** — reflects two-way sync instead of one-way Task push
-
 ### Files Modified
+
 | File | Change |
 |------|--------|
-| `backend/app/routers/integrations.py` | Auto-provision SF fields on OAuth callback, added sync/status/filters routes |
+| `backend/app/routers/integrations.py` | Auto-provision SF fields on OAuth callback, added `/salesforce/sync`, `/salesforce/sync/status`, `/salesforce/filters` (GET + PUT) routes |
 | `backend/app/routers/scanning.py` | Wired `push_compliance_to_salesforce()` into post-scan notification pipeline |
 | `backend/app/services/scheduler_service.py` | Added 30-minute cron job for `run_salesforce_sync_all()` |
-| `frontend/lib/api.ts` | Added SF filter types, `getSalesforceFilters`, `setSalesforceFilter`, `syncSalesforce`, `getSalesforceSyncStatus` |
-| `frontend/app/settings/page.tsx` | SF card: filter picker, sync button, sync status, updated descriptions |
+| `frontend/lib/api.ts` | Added `SalesforceFilters` type, `getSalesforceFilters`, `setSalesforceFilter`, `syncSalesforce`, `getSalesforceSyncStatus` functions |
+| `frontend/app/settings/page.tsx` | Salesforce card: Account filter picker (grouped dropdown), Sync Now button, linked dealer count + last sync time, updated descriptions for two-way sync |
+| `log.md` | This entry |
