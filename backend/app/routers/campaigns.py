@@ -399,7 +399,15 @@ async def start_campaign_scan(
 
     elif source == ScanSource.FACEBOOK:
         urls = [d["facebook_url"] for d in distributor_list if d.get("facebook_url")]
-        mapping = {d["name"].lower(): d["id"] for d in distributor_list}
+        mapping = {}
+        for d in distributor_list:
+            mapping[d["name"].lower()] = d["id"]
+            fb_url = d.get("facebook_url")
+            if fb_url:
+                from urllib.parse import urlparse
+                slug = urlparse(fb_url).path.strip("/").split("/")[0].lower()
+                if slug:
+                    mapping[slug] = d["id"]
         log.info("Starting Facebook scan for %d pages, job=%s", len(urls), scan_job_id)
         dispatched = await dispatch_task("run_facebook_scan_task", [urls, scan_job_id, mapping, campaign_id_str, "facebook"], scan_job_id, "facebook")
         
@@ -416,6 +424,99 @@ async def start_campaign_scan(
         raise HTTPException(status_code=503, detail="Failed to start scan task. Please try again.")
     
     return scan_job
+
+
+@router.post("/{campaign_id}/scans/batch", summary="Batch scan all channels for a campaign")
+@limiter.limit("2/minute")
+async def batch_campaign_scan(
+    request: Request,
+    campaign_id: UUID,
+    user: AuthUser = Depends(get_current_user),
+    op: OrgPlan = Depends(get_org_plan),
+):
+    """Start scans across all plan-allowed channels for a specific campaign."""
+    check_scan_quota(op)
+    from ..tasks import dispatch_task
+    from ..services import apify_instagram_service
+
+    campaign = supabase.table("campaigns")\
+        .select("id")\
+        .eq("id", str(campaign_id))\
+        .eq("organization_id", str(user.org_id))\
+        .single()\
+        .execute()
+    if not campaign.data:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    distributors = supabase.table("distributors")\
+        .select("*")\
+        .eq("organization_id", str(user.org_id))\
+        .eq("status", "active")\
+        .execute()
+    dist_list = distributors.data or []
+    if not dist_list:
+        raise HTTPException(400, "No active distributors found. Add dealers first.")
+
+    allowed_channels = op.limits.get("allowed_channels", [])
+    campaign_id_str = str(campaign_id)
+    created_jobs: list[dict] = []
+
+    for channel in allowed_channels:
+        job = supabase.table("scan_jobs").insert({
+            "organization_id": str(user.org_id),
+            "campaign_id": campaign_id_str,
+            "source": channel,
+            "status": "pending",
+        }).execute()
+        job_id = job.data[0]["id"]
+
+        if channel == "google_ads":
+            names = [d.get("google_ads_advertiser_id") or d["name"] for d in dist_list]
+            mapping = {(d.get("google_ads_advertiser_id") or d["name"]).lower(): d["id"] for d in dist_list}
+            await dispatch_task("run_google_ads_scan_task", [names, job_id, mapping, campaign_id_str], job_id, "google_ads")
+        elif channel == "instagram":
+            urls = [d["instagram_url"] for d in dist_list if d.get("instagram_url")]
+            mapping = {}
+            for d in dist_list:
+                ig_url = d.get("instagram_url")
+                if ig_url:
+                    username = apify_instagram_service._extract_username(ig_url)
+                    if username:
+                        mapping[username.lower()] = d["id"]
+                    mapping[d["name"].lower()] = d["id"]
+            if urls:
+                await dispatch_task("run_instagram_scan_task", [urls, job_id, mapping, campaign_id_str], job_id, "instagram")
+        elif channel == "facebook":
+            urls = [d["facebook_url"] for d in dist_list if d.get("facebook_url")]
+            mapping = {}
+            for d in dist_list:
+                mapping[d["name"].lower()] = d["id"]
+                fb_url = d.get("facebook_url")
+                if fb_url:
+                    from urllib.parse import urlparse
+                    slug = urlparse(fb_url).path.strip("/").split("/")[0].lower()
+                    if slug:
+                        mapping[slug] = d["id"]
+            if urls:
+                await dispatch_task("run_facebook_scan_task", [urls, job_id, mapping, campaign_id_str, "facebook"], job_id, "facebook")
+        elif channel == "website":
+            urls = [d["website_url"] for d in dist_list if d.get("website_url")]
+            mapping = {
+                d["website_url"].replace("https://", "").replace("http://", "").split("/")[0]: d["id"]
+                for d in dist_list if d.get("website_url")
+            }
+            if urls:
+                await dispatch_task("run_website_scan_task", [urls, job_id, mapping, campaign_id_str], job_id, "website")
+
+        created_jobs.append(job.data[0])
+
+    log.info("Campaign batch scan started for campaign %s, org %s: %d jobs",
+             campaign_id, user.org_id, len(created_jobs))
+
+    return {
+        "message": f"Batch scan started — {len(created_jobs)} scan(s) queued",
+        "jobs": created_jobs,
+    }
 
 
 @router.get("/{campaign_id}/scans", response_model=List[ScanJob], summary="List campaign scans")

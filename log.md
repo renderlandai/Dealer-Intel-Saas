@@ -2289,3 +2289,226 @@ CREATE INDEX IF NOT EXISTS idx_distributors_hubspot_id
 | `frontend/app/landing/page.tsx` | Added HubSpot logo to integrations marquee, marked HubSpot as live in integrations grid, updated description copy |
 | `backend/.env.example` | Added `HUBSPOT_CLIENT_ID` + `HUBSPOT_CLIENT_SECRET` placeholders |
 | `.do/app.yaml` | Added 2 new DigitalOcean env vars (secrets) |
+
+---
+
+## 2026-04-10 — Scan All Channels, Batch Endpoint & Scan Reliability Fixes
+
+### Summary
+
+Added a "Scan All Channels" button to the campaign page, built a dedicated campaign batch scan endpoint, fixed scan error handling so analysis failures don't mark successful scans as failed, fixed the global matches page to show matches with NULL distributor_id, improved Facebook distributor mapping, and installed Playwright browser binaries.
+
+### Changes
+
+**Backend**
+
+- **New endpoint: `POST /campaigns/{campaign_id}/scans/batch`** — Creates scan jobs for all plan-allowed channels in a single request, scoped to a specific campaign. Avoids the concurrent scan limit race condition that occurred when firing 4 parallel `startCampaignScan` calls from the frontend. Rate-limited to 2/minute. (`campaigns.py`)
+- **Scan error handling** — Wrapped `auto_analyze_scan()` in its own try/catch for all four scan types (Google Ads, Facebook, Instagram, Website). Previously, if AI analysis crashed mid-way, the entire scan was marked "failed" even though the Apify scraper succeeded and images were already discovered. Now the scan completes and notifications still send. (`scanning.py`)
+- **Global matches page fix** — Added `_org_asset_ids()` helper and updated `list_matches` and `get_match_stats` to query matches by both `distributor_id` (existing) and `asset_id` (new). Matches with NULL `distributor_id` — e.g., from Facebook/Instagram where the page name didn't resolve to a dealer — now appear on the matches page as long as the asset belongs to the org's campaigns. (`matches.py`)
+- **Facebook distributor mapping** — All three places that build the Facebook mapping (single scan, campaign batch, org batch) now include the Facebook URL slug alongside the dealer name. For example, `facebook.com/yanceybrosco` adds both `"yancey bros" → id` and `"yanceybrosco" → id` to the mapping, improving Apify page name resolution. (`campaigns.py`, `scanning.py`)
+- **Playwright install** — Ran `playwright install` to download Chromium browser binaries. Website scans were failing with `BrowserType.launch: Executable doesn't exist`.
+
+**Frontend**
+
+- **"Scan All Channels" button** — Full-width primary button on the campaign Scans tab, placed above the individual channel buttons. Calls the new `POST /campaigns/{campaign_id}/scans/batch` endpoint. Shows loading spinner during operation, disables individual channel buttons, switches to Scans tab on completion, and surfaces backend error messages directly. (`campaigns/[id]/page.tsx`)
+- **API client** — Added `startCampaignBatchScan(campaignId)` function. (`api.ts`)
+
+### Known Issues / TODO
+
+- **"Scan All Channels" still needs work and testing** — The batch button works end-to-end but needs further testing with different plan tiers, edge cases (no assets, no distributors, partial channel failures), and UI feedback refinement. The polling only tracks the first scan job; ideally it should track all jobs from the batch.
+- **Old matches with NULL distributor_id** — Existing Facebook/Instagram matches created before the mapping fix still show "Unknown" as the distributor. These won't self-heal; they need a re-scan or a database backfill.
+- **Asset uploads store as base64** — Campaign assets are being stored as base64 data URLs instead of Supabase Storage URLs because filenames with special characters (spaces, non-breaking spaces) cause `InvalidKey` errors on upload. This bloats the database and slows AI analysis.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `backend/app/routers/campaigns.py` | Added `POST /{campaign_id}/scans/batch` endpoint; improved Facebook mapping with URL slug |
+| `backend/app/routers/scanning.py` | Wrapped `auto_analyze_scan` in try/catch for all 4 scan types; improved Facebook mapping in org batch |
+| `backend/app/routers/matches.py` | Added `_org_asset_ids()`; updated `list_matches` and `get_match_stats` to include NULL distributor_id matches |
+| `frontend/app/campaigns/[id]/page.tsx` | Added "Scan All Channels" button, `scanningAll` state, `handleScanAllChannels` using batch endpoint |
+| `frontend/lib/api.ts` | Added `startCampaignBatchScan()` |
+
+---
+
+## 2026-04-10 — Scaling Roadmap: 150+ Dealer OEM Support
+
+### Context
+
+Architecture review identified that the current engine cannot reliably handle 40+ dealers per scan — and the product goal is 150+ dealers for large OEM clients. This roadmap captures every change needed, prioritized by impact, to get from the current ceiling (~15–20 dealers) to 150+ without crashing, timing out, or bankrupting the Anthropic bill.
+
+### Completed (this session)
+
+- **Upgraded AI models from Opus 4 → Opus 4.6** — Changed `CLAUDE_MODEL` and `ENSEMBLE_MODEL` in `ai_service.py` from `claude-opus-4-20250514` to `claude-opus-4-6`. Opus 4.6 is strictly better on every benchmark and **67% cheaper** ($5/$25 per MTok vs $15/$75). This single change cuts the Anthropic bill by ~2/3 with zero quality tradeoff.
+
+### Current Bottlenecks
+
+1. **In-process execution** — Scans run as `asyncio.create_task()` inside the API worker. No isolation — a scan OOM crashes the API for all users.
+2. **Sequential dealer processing** — 150 dealers × 15 pages = 2,250 pages processed one at a time in a `for` loop.
+3. **Timeout conflicts** — Gunicorn timeout (30m) vs scan timeout (2h) vs stale cleanup (60m) fight each other.
+4. **Memory ceiling** — Chromium (~250MB) + CLIP (~200MB) + image cache (200MB) + Python baseline (~100MB) = ~750MB before scan work starts. On a 1–2GB instance, no room for 150-dealer payloads.
+5. **Database write storm** — Individual HTTP INSERT per discovered image/match. 150 dealers = ~12,000+ round-trips to Supabase.
+6. **Single shared browser** — One Chromium instance recycled every 10 minutes, causing mid-scan disruptions.
+7. **O(images × assets) Opus calls** — Every surviving image is compared against every campaign asset. With 10 assets, the multiplier is 10x on the most expensive API call.
+
+### Why Not Redis/ARQ as Task Queue
+
+Previously attempted twice (Celery + Kombu, then ARQ) with DigitalOcean Managed Valkey — both failed in production due to SSL transport bugs, missing auth parameters, and stale in-progress keys from rolling deploys. Every production outage traced back to the API→Redis→Worker hand-off. Full history documented in the 2026-03-28 log entry.
+
+Redis stays for what it already does well (scheduler lock via `SET NX`), but scan dispatch uses **HTTP-triggered workers** instead — no message broker in the critical path. The API and workers communicate over HTTP and coordinate via Supabase (the shared source of truth that has never failed).
+
+### COG Model (150 Dealers, 1 Client, Weekly Scans)
+
+| Cost Item | Opus 4 (old) | Opus 4.6 (current) | Fully Optimized |
+|-----------|-------------|-------------------|-----------------|
+| Anthropic Claude | ~$5,200 | ~$1,730 | ~$400–600 |
+| SerpApi | $75–150 | $75–150 | $75–150 |
+| Apify (Meta + IG) | $29–49 | $29–49 | $29–49 |
+| DO App Platform (API) | $49 | $49 | $49 |
+| DO Worker Instance(s) | — | — | $49–98 |
+| DO Redis (scheduler lock) | $15 | $15 | $15 |
+| Supabase Pro | $25–50 | $25–50 | $25–50 |
+| Vercel | $0–20 | $0–20 | $0–20 |
+| **Monthly Total** | **~$5,500** | **~$2,050** | **~$750–1,050** |
+
+Anthropic is ~85% of the bill. Every optimization that reduces Opus calls has outsized impact.
+
+### Scaling Plan — Phased
+
+---
+
+#### Phase 1: Cost Optimization (no architecture changes)
+
+| # | Change | Impact | Effort |
+|---|--------|--------|--------|
+| 1.1 | ~~Upgrade to Opus 4.6~~ | ~~67% cost reduction~~ | ~~Done~~ |
+| 1.2 | Switch `ENSEMBLE_MODEL` to Sonnet 4 for compare/detect calls | Additional 40% reduction on ensemble ($3/$15 vs $5/$25). Keep Opus 4.6 for compliance only. | Small |
+| 1.3 | CLIP-based asset preselection | Use CLIP cosine similarity to select top 2–3 most similar assets per image instead of comparing against all N. Cuts Opus calls by 50–70%. | Medium |
+| 1.4 | Anthropic Batch API | 50% off input+output for non-real-time analysis. Scans already take minutes. | Medium |
+| 1.5 | Prompt caching | Cache system prompt + asset image prefix across calls within a scan. 50% off cached input tokens. | Medium |
+| 1.6 | Cross-dealer image deduplication | Hash-dedup discovered images across dealers within a scan — analyze once, attribute to all. | Medium |
+
+**Phase 1 target:** Monthly COG drops from ~$2,050 to ~$750–1,050.
+
+---
+
+#### Phase 2: HTTP-Triggered Worker Separation
+
+**Approach:** The API dispatches scan work to a separate worker service via HTTP POST — no message broker, no Redis queue, no pub/sub. The worker is a standalone FastAPI app on its own DO App Platform instance that receives scan parameters directly, executes the scan pipeline, and writes results to Supabase. Both API and workers share Supabase as the single source of truth.
+
+| # | Change | Impact | Effort |
+|---|--------|--------|--------|
+| 2.1 | Build worker service (`worker/`) | Standalone FastAPI app with `POST /scan/run` endpoint. Receives scan params (channel, dealer URLs, distributor mapping, campaign ID, chunk info). Runs the existing scan pipeline functions. Updates `scan_jobs` in Supabase directly. | Large |
+| 2.2 | Separate API and worker Docker images | API image: no Playwright, no CLIP (~200MB RAM). Worker image: Playwright + CLIP + full scan deps (~1.2GB). API no longer loads memory-heavy scan dependencies. | Medium |
+| 2.3 | Update `dispatch_task` to HTTP POST | Replace `asyncio.create_task()` with `httpx.AsyncClient.post()` to worker service. Fire-and-forget with timeout. If worker returns non-200, mark job as failed immediately. | Medium |
+| 2.4 | Add worker instance(s) to DO App Platform | 1–2 dedicated 4GB worker instances. Each runs the worker FastAPI app. Scale horizontally by adding instances. API round-robins or uses least-loaded selection via `scan_jobs` table. | Small |
+| 2.5 | Worker health check + discovery | Worker exposes `GET /health`. API checks worker availability before dispatching. If worker is down, POST returns 503 and API marks job failed with clear error. No silent message drops. | Small |
+
+**Phase 2 target:** Scans execute in isolated workers. API process drops to ~200MB. A crashed worker doesn't crash the API. Every failure is an explicit HTTP error — no silent drops.
+
+---
+
+#### Phase 3: Chunked Dealer Processing
+
+| # | Change | Impact | Effort |
+|---|--------|--------|--------|
+| 3.1 | Parent/child job model | 150-dealer scan creates a parent `scan_job` that spawns child chunk jobs (10–15 dealers each). API POSTs one HTTP request per chunk to the worker pool. Parent aggregates status from children via Supabase. | Large |
+| 3.2 | Per-chunk timeouts | Each chunk has a 30 min execution timeout on the worker side. Parent job has a 4 hour overall timeout. Stale cleanup operates on chunks, not the parent. | Medium |
+| 3.3 | Parallel chunk execution | API dispatches multiple chunks concurrently to available workers. 10 chunks across 2 workers = ~5 sequential rounds. Wall-clock: ~2.5 hours. Workers process one chunk at a time (simple, predictable memory). | Small |
+| 3.4 | Progress tracking per chunk | Each chunk updates its `scan_job` row in Supabase as it progresses. Frontend polls parent job and sees aggregated progress: "Chunk 3/10 complete — 45 dealers scanned, 12 matches." | Medium |
+| 3.5 | Partial failure resilience | If chunk 4's HTTP call fails or the worker crashes, chunks 1–3 and 5–10 still complete. Parent reports partial success with details on which dealers failed. API can retry individual chunks via POST. | Medium |
+
+**Phase 3 target:** 150 dealers complete in ~2–3 hours wall-clock with parallel workers. Failures are isolated and retryable at the chunk level.
+
+---
+
+#### Phase 4: Database & I/O Optimization
+
+| # | Change | Impact | Effort |
+|---|--------|--------|--------|
+| 4.1 | Bulk inserts for `discovered_images` | Buffer 50–100 rows, insert via `.insert([...])`. Reduces ~12,000 HTTP calls to ~120. | Small |
+| 4.2 | Bulk inserts for `matches` | Same pattern for match creation. | Small |
+| 4.3 | Batch deletes for duplicate pruning | Replace per-row delete loop with `.in_("id", [...])`. | Small |
+| 4.4 | Supabase connection pooling (pgBouncer) | Reduce connection overhead under concurrent chunk processing. Config change in Supabase dashboard. | Small |
+| 4.5 | Streaming progress writes | Batch status updates every 30s or every 10 pages instead of per-page. | Small |
+
+**Phase 4 target:** DB writes drop from ~12,000 individual calls to ~100–200 batched calls per scan.
+
+---
+
+#### Phase 5: Browser & Extraction Scaling
+
+| # | Change | Impact | Effort |
+|---|--------|--------|--------|
+| 5.1 | Per-worker browser instance | Each worker instance manages its own Chromium browser. Natural outcome of Phase 2 — no shared global `_browser` across processes. | Free |
+| 5.2 | Browser pool within worker | 2–3 browser contexts for intra-chunk parallelism (3 dealers simultaneously per chunk). | Medium |
+| 5.3 | Extend browser max age | Increase `_BROWSER_MAX_AGE_SECONDS` from 600 to 1800–3600 for workers (chunks complete in ~30 min, no need for aggressive recycling). | Small |
+| 5.4 | Graceful browser recovery | Catch browser crash mid-page, relaunch, retry that page — don't fail the chunk. | Medium |
+
+---
+
+#### Phase 6: Timeout & Cleanup Coherence
+
+| Mechanism | Current | After Scaling |
+|-----------|---------|---------------|
+| Gunicorn worker timeout (API) | 1,800s (30 min) | 120s (API-only, no scans in process) |
+| Gunicorn worker timeout (Worker) | N/A | 2,400s (40 min, covers 30 min chunk + buffer) |
+| Scan task timeout | 7,200s (2h) monolithic | Per-chunk: 1,800s (30 min). Parent: 14,400s (4h). |
+| Stale scan cleanup | 60 min running, 15 min pending | Per-chunk: 45 min. Parent: 5h. Heartbeat-based. |
+| Heartbeat | No-op | Per-chunk heartbeat every 60s via Supabase update. Cleanup checks heartbeat, not just `created_at`. |
+| HTTP dispatch timeout | N/A | 5s connect, fire-and-forget (worker reports status to Supabase, API doesn't hold connection open). |
+
+---
+
+### Implementation Priority
+
+| Order | Phase | Why |
+|-------|-------|-----|
+| 1st | Phase 1 (cost optimization) | Reduces bill risk during development. Most changes are small and independent. |
+| 2nd | Phase 4 (bulk DB writes) | Quick wins, small effort, reduces I/O pressure that compounds at scale. |
+| 3rd | Phase 2 (HTTP workers) | Core architecture change. Everything after depends on workers existing. |
+| 4th | Phase 3 (chunked processing) | The actual scale unlock. Requires Phase 2. |
+| 5th | Phase 6 (timeouts) | Clean up during Phase 2–3 implementation. |
+| 6th | Phase 5 (browser scaling) | Polish. Per-worker browsers come free with Phase 2. |
+
+### Target Architecture
+
+```
+CURRENT (ceiling: ~15-20 dealers)
+┌─────────────────────────────────────────┐
+│  Gunicorn Worker (API + Scans)          │
+│  ├── FastAPI HTTP handlers              │
+│  ├── asyncio.create_task(scan)          │
+│  ├── Shared Playwright browser (1)      │
+│  ├── CLIP model in memory              │
+│  └── Image cache (200MB)               │
+│       ~800MB–1.2GB total               │
+└─────────────────────────────────────────┘
+         │
+    Redis (scheduler lock only)
+
+TARGET (150+ dealers)
+┌──────────────────┐  POST /scan/run  ┌──────────────────────┐
+│  API Instance     │────────────────▶│  Worker Instance(s)  │
+│  FastAPI only     │                 │  ├── FastAPI (worker) │
+│  ~200MB RAM       │                 │  ├── Playwright (2x) │
+│  No Playwright    │                 │  ├── CLIP model      │
+│  No CLIP          │                 │  └── Scan pipeline   │
+│  120s timeout     │                 │  4GB RAM, 30m/chunk  │
+└──────────────────┘                 └──────────────────────┘
+         │                                    │
+    Redis (lock only)                         │
+         │                                    │
+         └──────────── Supabase ──────────────┘
+              (shared source of truth)
+              (scan_jobs, progress, results)
+              (no broker — HTTP + DB only)
+```
+
+**Key design decision:** No message broker in the scan critical path. The API→Worker hand-off is a plain HTTP POST. Coordination happens through Supabase (status, progress, results). Redis stays for scheduler lock only — the one thing it already does reliably. This avoids repeating the Celery/ARQ/Valkey SSL transport failures documented in the 2026-03-28 session.
+
+### Files Changed (this session)
+
+| File | Change |
+|------|--------|
+| `backend/app/services/ai_service.py` | Updated `CLAUDE_MODEL` and `ENSEMBLE_MODEL` from `claude-opus-4-20250514` to `claude-opus-4-6` (67% cost reduction, better model) |

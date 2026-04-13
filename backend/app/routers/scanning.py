@@ -302,7 +302,10 @@ async def run_google_ads_scan(
             )
 
         if campaign_id and discovered_count > 0:
-            await auto_analyze_scan(scan_job_id, campaign_id)
+            try:
+                await auto_analyze_scan(scan_job_id, campaign_id)
+            except Exception as analyze_err:
+                log.error("Google Ads auto-analysis failed (scan still completed): %s", analyze_err, exc_info=True)
 
         supabase.table("scan_jobs").update({
             "status": "completed",
@@ -353,7 +356,10 @@ async def run_facebook_scan(
             )
 
         if campaign_id and discovered_count > 0:
-            await auto_analyze_scan(scan_job_id, campaign_id)
+            try:
+                await auto_analyze_scan(scan_job_id, campaign_id)
+            except Exception as analyze_err:
+                log.error("Facebook auto-analysis failed (scan still completed): %s", analyze_err, exc_info=True)
 
         supabase.table("scan_jobs").update({
             "status": "completed",
@@ -391,7 +397,10 @@ async def run_instagram_scan(
         )
 
         if campaign_id and discovered_count > 0:
-            await auto_analyze_scan(scan_job_id, campaign_id)
+            try:
+                await auto_analyze_scan(scan_job_id, campaign_id)
+            except Exception as analyze_err:
+                log.error("Instagram auto-analysis failed (scan still completed): %s", analyze_err, exc_info=True)
 
         supabase.table("scan_jobs").update({
             "status": "completed",
@@ -857,7 +866,10 @@ async def run_website_scan(
 
         if not can_early_stop and campaign_id and total_discovered > 0:
             log.info("Starting batch analysis for campaign %s", campaign_id)
-            await auto_analyze_scan(scan_job_id, campaign_id)
+            try:
+                await auto_analyze_scan(scan_job_id, campaign_id)
+            except Exception as analyze_err:
+                log.error("Website auto-analysis failed (scan still completed): %s", analyze_err, exc_info=True)
 
         # ---- Deduplicate: keep only the best match per asset per distributor ----
         pruned = await _prune_duplicate_matches(scan_job_id)
@@ -1428,7 +1440,15 @@ async def batch_scan(
                 await dispatch_task("run_instagram_scan_task", [urls, job_id, mapping, campaign_id_str], job_id, "instagram")
         elif channel == "facebook":
             urls = [d["facebook_url"] for d in dist_list if d.get("facebook_url")]
-            mapping = {d["name"].lower(): d["id"] for d in dist_list}
+            mapping = {}
+            for d in dist_list:
+                mapping[d["name"].lower()] = d["id"]
+                fb_url = d.get("facebook_url")
+                if fb_url:
+                    from urllib.parse import urlparse
+                    slug = urlparse(fb_url).path.strip("/").split("/")[0].lower()
+                    if slug:
+                        mapping[slug] = d["id"]
             if urls:
                 await dispatch_task("run_facebook_scan_task", [urls, job_id, mapping, campaign_id_str, "facebook"], job_id, "facebook")
         elif channel == "website":

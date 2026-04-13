@@ -702,6 +702,13 @@ export const startCampaignScan = async (
   return data;
 };
 
+export const startCampaignBatchScan = async (
+  campaignId: string
+): Promise<{ message: string; jobs: ScanJob[] }> => {
+  const { data } = await api.post(`/campaigns/${campaignId}/scans/batch`);
+  return data;
+};
+
 export const getCampaignScans = async (campaignId: string, status?: string): Promise<ScanJob[]> => {
   const params = status ? `?status=${status}` : "";
   const { data } = await api.get(`/campaigns/${campaignId}/scans${params}`);

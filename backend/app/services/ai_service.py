@@ -40,8 +40,8 @@ settings = get_settings()
 
 # Configure Anthropic client
 anthropic_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
-CLAUDE_MODEL = "claude-opus-4-20250514"
-ENSEMBLE_MODEL = "claude-opus-4-20250514"
+CLAUDE_MODEL = "claude-opus-4-6"
+ENSEMBLE_MODEL = "claude-opus-4-6"
 FILTER_MODEL = settings.filter_model
 
 

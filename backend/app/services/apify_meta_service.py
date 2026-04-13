@@ -7,8 +7,14 @@ from Meta's Ad Library via GraphQL interception (more reliable than DOM scraping
 Each discovered ad image is inserted as a discovered_image so the existing
 matching pipeline (hash → CLIP → Haiku → Opus) processes it like any other
 discovered image.
+
+Image URL resolution follows a 3-tier fallback:
+  1. imageUrls from Apify (fastest, but Meta often omits them)
+  2. videoUrls from Apify (sometimes contains thumbnail/poster)
+  3. Playwright visits the Ad Library page and extracts the rendered creative
 """
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
@@ -31,6 +37,10 @@ ACTOR_ID = "nourishing_courier~meta-ads-scraper-pro"
 _TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
 _POLL_INTERVAL_SEC = 5
 _MAX_POLL_TIME_SEC = 300  # 5 minute ceiling per run
+
+# Playwright fallback settings
+_PW_AD_LIBRARY_TIMEOUT = 20_000  # 20s page load timeout
+_PW_CONCURRENCY = 3  # max parallel browser pages for fallback
 
 
 def _normalize_fb_url(url: str) -> str:
@@ -162,6 +172,139 @@ def _resolve_distributor(
     return None
 
 
+def _collect_media_urls(ad: Dict[str, Any]) -> List[str]:
+    """
+    Tier 1+2: collect image URLs from Apify response, falling back to
+    videoUrls if imageUrls is empty.
+    """
+    urls: List[str] = []
+
+    for img_url in (ad.get("imageUrls") or []):
+        if img_url and img_url.startswith("http"):
+            urls.append(img_url)
+
+    if not urls:
+        for vid_url in (ad.get("videoUrls") or []):
+            if vid_url and vid_url.startswith("http"):
+                urls.append(vid_url)
+
+    return urls
+
+
+async def _extract_image_from_ad_library(ad_library_url: str) -> List[str]:
+    """
+    Tier 3: visit the Meta Ad Library page in Playwright and extract the
+    rendered ad creative image URL(s) from the DOM.
+
+    The Ad Library is public — no login required.
+    """
+    from .extraction_service import _get_browser, _new_page
+
+    extracted: List[str] = []
+    browser = await _get_browser()
+    page = await _new_page(browser, mobile=False)
+
+    try:
+        await page.goto(ad_library_url, wait_until="domcontentloaded", timeout=_PW_AD_LIBRARY_TIMEOUT)
+        await asyncio.sleep(4)
+
+        # Meta Ad Library renders creatives inside specific containers.
+        # We look for large images inside the ad card area.
+        image_urls = await page.evaluate("""() => {
+            const seen = new Set();
+            const results = [];
+
+            // Primary: images inside the ad creative container
+            const adImages = document.querySelectorAll(
+                'img[src*="scontent"], img[src*="fbcdn"], img[src*="facebook"]'
+            );
+            for (const img of adImages) {
+                const src = img.currentSrc || img.src;
+                if (!src || seen.has(src) || src.startsWith('data:')) continue;
+                const w = img.naturalWidth || img.width;
+                const h = img.naturalHeight || img.height;
+                if (w < 100 || h < 100) continue;
+                seen.add(src);
+                results.push(src);
+            }
+
+            // Fallback: any large image on the page
+            if (results.length === 0) {
+                for (const img of document.querySelectorAll('img')) {
+                    const src = img.currentSrc || img.src;
+                    if (!src || seen.has(src) || src.startsWith('data:')) continue;
+                    const w = img.naturalWidth || img.width;
+                    const h = img.naturalHeight || img.height;
+                    if (w < 150 || h < 150) continue;
+                    seen.add(src);
+                    results.push(src);
+                }
+            }
+
+            return results;
+        }""")
+
+        extracted = [u for u in image_urls if u and u.startswith("http")]
+        log.info(
+            "Playwright extracted %d image(s) from Ad Library page: %s",
+            len(extracted), ad_library_url[:80],
+        )
+
+    except Exception as e:
+        log.warning(
+            "Playwright fallback failed for %s: %s", ad_library_url[:80], e,
+        )
+    finally:
+        try:
+            await page.context.close()
+        except Exception:
+            pass
+
+    return extracted
+
+
+async def _resolve_images_for_ads(
+    ads: List[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    """
+    For every ad that has no imageUrls/videoUrls, use Playwright to visit the
+    Ad Library page and extract the creative. Returns {adId: [url, ...]}.
+
+    Runs up to _PW_CONCURRENCY pages in parallel via a semaphore.
+    """
+    sem = asyncio.Semaphore(_PW_CONCURRENCY)
+    results: Dict[str, List[str]] = {}
+
+    async def _resolve_one(ad: Dict[str, Any]):
+        ad_id = ad.get("adId", "")
+        ad_url = ad.get("adUrl") or f"https://www.facebook.com/ads/library/?id={ad_id}"
+        if not ad_id:
+            return
+        async with sem:
+            urls = await _extract_image_from_ad_library(ad_url)
+            if urls:
+                results[ad_id] = urls
+
+    needs_fallback = [
+        ad for ad in ads
+        if ad.get("type") != "pageInsight"
+        and not _collect_media_urls(ad)
+        and (ad.get("adId") or ad.get("adUrl"))
+    ]
+
+    if not needs_fallback:
+        return results
+
+    log.info(
+        "Playwright fallback needed for %d/%d ads with missing image URLs",
+        len(needs_fallback), len(ads),
+    )
+
+    await asyncio.gather(*[_resolve_one(ad) for ad in needs_fallback])
+    log.info("Playwright fallback resolved images for %d ads", len(results))
+    return results
+
+
 async def scan_meta_ads(
     page_urls: List[str],
     scan_job_id: UUID,
@@ -175,7 +318,8 @@ async def scan_meta_ads(
 
     1. Starts the Apify actor with the supplied Facebook page URLs
     2. Polls until the run completes
-    3. Inserts each ad image as a discovered_image for the matching pipeline
+    3. Resolves image URLs via 3-tier fallback (imageUrls → videoUrls → Playwright)
+    4. Inserts each ad image as a discovered_image for the matching pipeline
 
     Returns total number of discovered images inserted.
     """
@@ -230,6 +374,17 @@ async def scan_meta_ads(
     ads = await _fetch_dataset_items(dataset_id)
     log.info("Apify returned %d ad item(s)", len(ads))
 
+    # Log raw payload keys for debugging (first ad only)
+    if ads:
+        sample = ads[0]
+        log.info(
+            "Sample ad payload keys: %s | imageUrls=%d, videoUrls=%d",
+            list(sample.keys()),
+            len(sample.get("imageUrls") or []),
+            len(sample.get("videoUrls") or []),
+        )
+        log.debug("Full sample ad payload: %s", json.dumps(sample, default=str)[:2000])
+
     if not ads:
         supabase.table("scan_jobs").update({
             "status": "completed",
@@ -239,29 +394,48 @@ async def scan_meta_ads(
         log.warning("No ads found for the provided pages")
         return 0
 
-    # 4. Build lookup for distributor resolution
+    # 4. Playwright fallback: resolve images for ads missing URLs
+    pw_resolved = await _resolve_images_for_ads(ads)
+
+    # 5. Build lookup for distributor resolution
     slug_map = _build_url_to_distributor_map(page_urls, distributor_mapping)
 
-    # 5. Insert each ad image as a discovered_image
+    # 6. Insert each ad image as a discovered_image
     total_inserted = 0
+    ads_with_images = 0
+    ads_skipped = 0
+
     for ad in ads:
         ad_type = ad.get("type", "")
         if ad_type == "pageInsight":
-            continue
-
-        image_urls = ad.get("imageUrls") or []
-        if not image_urls:
             continue
 
         ad_id = ad.get("adId", "")
         ad_url = ad.get("adUrl", "")
         page_name = ad.get("pageName", "")
         platforms = ad.get("platforms") or []
-        status = ad.get("status", "")
+        ad_status = ad.get("status", "")
         start_date = ad.get("startDate")
         media_type = ad.get("mediaType", "")
 
-        # Determine channel from platforms reported by Meta
+        # 3-tier image resolution
+        image_urls = _collect_media_urls(ad)
+        extraction_method = "apify_meta"
+
+        if not image_urls and ad_id in pw_resolved:
+            image_urls = pw_resolved[ad_id]
+            extraction_method = "apify_meta+playwright_fallback"
+
+        if not image_urls:
+            log.warning(
+                "No images resolved for ad %s (%s) — skipping",
+                ad_id, page_name,
+            )
+            ads_skipped += 1
+            continue
+
+        ads_with_images += 1
+
         ad_channel = channel
         if "instagram" in platforms and "facebook" not in platforms:
             ad_channel = "instagram"
@@ -269,9 +443,6 @@ async def scan_meta_ads(
         distributor_id = _resolve_distributor(ad, slug_map)
 
         for img_url in image_urls:
-            if not img_url or not img_url.startswith("http"):
-                continue
-
             supabase.table("discovered_images").insert({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
@@ -280,12 +451,12 @@ async def scan_meta_ads(
                 "source_type": "extracted_image",
                 "channel": ad_channel,
                 "metadata": {
-                    "extraction_method": "apify_meta",
+                    "extraction_method": extraction_method,
                     "apify_actor": ACTOR_ID,
                     "ad_id": ad_id,
                     "page_name": page_name,
                     "page_id": str(ad.get("pageId", "")),
-                    "ad_status": status,
+                    "ad_status": ad_status,
                     "media_type": media_type,
                     "platforms": platforms,
                     "start_date": start_date,
@@ -301,7 +472,8 @@ async def scan_meta_ads(
     }).eq("id", str(scan_job_id)).execute()
 
     log.info(
-        "Apify Meta Ads scan complete: %d images from %d ads inserted",
-        total_inserted, len(ads),
+        "Apify Meta Ads scan complete: %d images from %d ads "
+        "(%d skipped, %d resolved via Playwright)",
+        total_inserted, ads_with_images, ads_skipped, len(pw_resolved),
     )
     return total_inserted

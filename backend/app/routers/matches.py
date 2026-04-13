@@ -37,12 +37,21 @@ def _org_distributor_ids(org_id: str) -> List[str]:
     return [d["id"] for d in (result.data or [])]
 
 
+def _org_asset_ids(org_id: str) -> List[str]:
+    """Return all asset IDs belonging to an organization's campaigns."""
+    result = supabase.table("assets") \
+        .select("id, campaigns!inner(organization_id)") \
+        .eq("campaigns.organization_id", org_id) \
+        .execute()
+    return [a["id"] for a in (result.data or [])]
+
+
 def _verify_match_ownership(match_id: str, org_distributor_ids: List[str]) -> dict:
     """Fetch a match and verify it belongs to the org's distributors."""
     result = supabase.table("matches") \
         .select("*") \
         .eq("id", match_id) \
-        .single() \
+        .maybe_single() \
         .execute()
 
     if not result.data:
@@ -66,14 +75,22 @@ async def list_matches(
 ):
     """List matches scoped to the user's organization."""
     dist_ids = _org_distributor_ids(str(user.org_id))
-    if not dist_ids:
+    asset_ids = _org_asset_ids(str(user.org_id))
+    if not dist_ids and not asset_ids:
         return []
 
     q = supabase.table("recent_matches").select("*")
-    q = q.in_("distributor_id", dist_ids)
 
     if distributor_id:
         q = q.eq("distributor_id", str(distributor_id))
+    else:
+        or_clauses = []
+        if dist_ids:
+            or_clauses.append(f"distributor_id.in.({','.join(dist_ids)})")
+        if asset_ids:
+            or_clauses.append(f"asset_id.in.({','.join(asset_ids)})")
+        q = q.or_(",".join(or_clauses))
+
     if compliance_status:
         q = q.eq("compliance_status", compliance_status.value)
     if match_type:
@@ -89,7 +106,8 @@ async def list_matches(
 async def get_match_stats(user: AuthUser = Depends(get_current_user)):
     """Get match statistics scoped to the user's organization."""
     dist_ids = _org_distributor_ids(str(user.org_id))
-    if not dist_ids:
+    asset_ids = _org_asset_ids(str(user.org_id))
+    if not dist_ids and not asset_ids:
         return {
             "total_matches": 0,
             "compliant": 0,
@@ -100,9 +118,15 @@ async def get_match_stats(user: AuthUser = Depends(get_current_user)):
             "compliance_rate": 0.0,
         }
 
+    or_clauses = []
+    if dist_ids:
+        or_clauses.append(f"distributor_id.in.({','.join(dist_ids)})")
+    if asset_ids:
+        or_clauses.append(f"asset_id.in.({','.join(asset_ids)})")
+
     result = supabase.table("matches") \
         .select("compliance_status, match_type, confidence_score") \
-        .in_("distributor_id", dist_ids) \
+        .or_(",".join(or_clauses)) \
         .execute()
 
     total = len(result.data) if result.data else 0
@@ -148,7 +172,7 @@ async def get_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
         .select("*") \
         .eq("id", str(match_id)) \
         .in_("distributor_id", dist_ids) \
-        .single() \
+        .maybe_single() \
         .execute()
 
     if not result.data:
@@ -221,7 +245,7 @@ async def flag_match(
         current = supabase.table("matches") \
             .select("compliance_issues") \
             .eq("id", str(match_id)) \
-            .single() \
+            .maybe_single() \
             .execute()
         issues = current.data.get("compliance_issues", []) if current.data else []
         issues.append({"type": "manual_flag", "reason": reason})
@@ -376,7 +400,7 @@ async def submit_match_feedback(
     match_result = supabase.table("matches") \
         .select("id, confidence_score, match_type, channel, ai_analysis") \
         .eq("id", str(match_id)) \
-        .single() \
+        .maybe_single() \
         .execute()
 
     match_data = match_result.data

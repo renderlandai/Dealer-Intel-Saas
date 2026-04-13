@@ -23,7 +23,8 @@ import {
   CalendarClock,
   Plus,
   Power,
-  PowerOff
+  PowerOff,
+  Layers
 } from "lucide-react";
 import Link from "next/link";
 import { Header } from "@/components/layout/header";
@@ -38,6 +39,7 @@ import {
   deleteAsset, 
   deleteCampaign,
   startCampaignScan,
+  startCampaignBatchScan,
   getCampaignScans,
   getCampaignMatches,
   getCampaignScanStats,
@@ -144,6 +146,7 @@ export default function CampaignDetailPage() {
   const [deleting, setDeleting] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [scanning, setScanning] = useState(false);
+  const [scanningAll, setScanningAll] = useState(false);
   const [selectedSource, setSelectedSource] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState(initialTab);
   const [pollingScanId, setPollingScanId] = useState<string | null>(null);
@@ -315,6 +318,36 @@ export default function CampaignDetailPage() {
     } finally {
       setScanning(false);
       setSelectedSource(null);
+    }
+  };
+
+  const handleScanAllChannels = async () => {
+    if (assets.length === 0) {
+      alert("Please upload at least one asset before starting a scan.");
+      return;
+    }
+
+    setScanningAll(true);
+    try {
+      const result = await startCampaignBatchScan(campaignId);
+      const jobs = result.jobs || [];
+
+      if (jobs.length > 0) {
+        setPollingScanId(jobs[0].id);
+      }
+
+      await Promise.all([loadScans(), loadCampaign()]);
+      setActiveTab("scans");
+    } catch (error: any) {
+      console.error("Failed to start batch scan:", error);
+      const detail = error?.response?.data?.detail;
+      if (detail) {
+        alert(detail);
+      } else {
+        alert("Failed to start scans. Please try again.");
+      }
+    } finally {
+      setScanningAll(false);
     }
   };
 
@@ -695,23 +728,39 @@ export default function CampaignDetailPage() {
                     </p>
                   </div>
                 ) : (
-                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                    {SCAN_SOURCES.map((source) => (
-                      <Button
-                        key={source.value}
-                        variant="outline"
-                        className="h-auto py-4 flex flex-col items-center gap-2 hover:border-primary hover:bg-primary/5"
-                        onClick={() => handleStartScan(source.value)}
-                        disabled={scanning}
-                      >
-                        <img src={source.logo} alt={source.label} className="h-8 w-8 object-contain" />
-                        <span className="font-medium">{source.label}</span>
-                        <span className="text-2xs text-muted-foreground">{source.desc}</span>
-                        {scanning && selectedSource === source.value && (
-                          <RefreshCw className="h-4 w-4 animate-spin" />
-                        )}
-                      </Button>
-                    ))}
+                  <div className="space-y-4">
+                    <Button
+                      className="w-full h-auto py-3 flex items-center justify-center gap-2"
+                      onClick={handleScanAllChannels}
+                      disabled={scanning || scanningAll}
+                    >
+                      {scanningAll ? (
+                        <Loader2 className="h-5 w-5 animate-spin" />
+                      ) : (
+                        <Layers className="h-5 w-5" />
+                      )}
+                      <span className="font-semibold">
+                        {scanningAll ? "Starting All Scans..." : "Scan All Channels"}
+                      </span>
+                    </Button>
+                    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                      {SCAN_SOURCES.map((source) => (
+                        <Button
+                          key={source.value}
+                          variant="outline"
+                          className="h-auto py-4 flex flex-col items-center gap-2 hover:border-primary hover:bg-primary/5"
+                          onClick={() => handleStartScan(source.value)}
+                          disabled={scanning || scanningAll}
+                        >
+                          <img src={source.logo} alt={source.label} className="h-8 w-8 object-contain" />
+                          <span className="font-medium">{source.label}</span>
+                          <span className="text-2xs text-muted-foreground">{source.desc}</span>
+                          {scanning && selectedSource === source.value && (
+                            <RefreshCw className="h-4 w-4 animate-spin" />
+                          )}
+                        </Button>
+                      ))}
+                    </div>
                   </div>
                 )}
               </CardContent>
