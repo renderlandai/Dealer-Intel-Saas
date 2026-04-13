@@ -10,7 +10,7 @@ from cachetools import TTLCache
 from ..auth import AuthUser, get_current_user
 from ..database import supabase
 from ..models import DashboardStats
-from ..org_cache import get_org_distributor_ids, get_org_campaign_ids
+from ..org_cache import get_org_distributor_ids, get_org_campaign_ids, get_org_asset_ids
 from ..plan_enforcement import OrgPlan, get_org_plan
 
 log = logging.getLogger("dealer_intel.dashboard")
@@ -57,6 +57,7 @@ async def _get_dashboard_stats_fallback(org_id: str) -> DashboardStats:
     today = datetime.utcnow().date().isoformat()
 
     distributor_ids = get_org_distributor_ids(org_id)
+    asset_ids = get_org_asset_ids(org_id)
     campaign_ids = get_org_campaign_ids(org_id)
 
     campaigns = supabase.table("campaigns") \
@@ -82,21 +83,28 @@ async def _get_dashboard_stats_fallback(org_id: str) -> DashboardStats:
         .eq("organization_id", org_id) \
         .eq("is_read", False).execute()
 
+    or_clauses = []
     if distributor_ids:
+        or_clauses.append(f"distributor_id.in.({','.join(distributor_ids)})")
+    if asset_ids:
+        or_clauses.append(f"asset_id.in.({','.join(asset_ids)})")
+
+    if or_clauses:
+        or_filter = ",".join(or_clauses)
         matches = supabase.table("matches") \
             .select("id", count="exact") \
-            .in_("distributor_id", distributor_ids).execute()
+            .or_(or_filter).execute()
         compliant = supabase.table("matches") \
             .select("id", count="exact") \
-            .in_("distributor_id", distributor_ids) \
+            .or_(or_filter) \
             .eq("compliance_status", "compliant").execute()
         violations = supabase.table("matches") \
             .select("id", count="exact") \
-            .in_("distributor_id", distributor_ids) \
+            .or_(or_filter) \
             .eq("compliance_status", "violation").execute()
         matches_today = supabase.table("matches") \
             .select("id", count="exact") \
-            .in_("distributor_id", distributor_ids) \
+            .or_(or_filter) \
             .gte("created_at", today).execute()
 
         total_matches = matches.count or 0
@@ -126,13 +134,20 @@ async def get_recent_matches(
     user: AuthUser = Depends(get_current_user),
 ):
     """Get recent matches scoped to the user's organization."""
-    distributor_ids = get_org_distributor_ids(str(user.org_id))
-    if not distributor_ids:
+    dist_ids = get_org_distributor_ids(str(user.org_id))
+    asset_ids = get_org_asset_ids(str(user.org_id))
+    if not dist_ids and not asset_ids:
         return []
+
+    or_clauses = []
+    if dist_ids:
+        or_clauses.append(f"distributor_id.in.({','.join(dist_ids)})")
+    if asset_ids:
+        or_clauses.append(f"asset_id.in.({','.join(asset_ids)})")
 
     result = supabase.table("recent_matches") \
         .select("*") \
-        .in_("distributor_id", distributor_ids) \
+        .or_(",".join(or_clauses)) \
         .order("created_at", desc=True) \
         .limit(limit) \
         .execute()
@@ -160,13 +175,20 @@ async def get_recent_alerts(
 @router.get("/coverage-by-channel", summary="Get coverage by channel")
 async def get_coverage_by_channel(user: AuthUser = Depends(get_current_user)):
     """Get match coverage by channel scoped to the user's organization."""
-    distributor_ids = get_org_distributor_ids(str(user.org_id))
-    if not distributor_ids:
+    dist_ids = get_org_distributor_ids(str(user.org_id))
+    asset_ids = get_org_asset_ids(str(user.org_id))
+    if not dist_ids and not asset_ids:
         return []
+
+    or_clauses = []
+    if dist_ids:
+        or_clauses.append(f"distributor_id.in.({','.join(dist_ids)})")
+    if asset_ids:
+        or_clauses.append(f"asset_id.in.({','.join(asset_ids)})")
 
     result = supabase.table("matches") \
         .select("channel") \
-        .in_("distributor_id", distributor_ids) \
+        .or_(",".join(or_clauses)) \
         .execute()
 
     channel_counts: dict = {}
@@ -175,7 +197,7 @@ async def get_coverage_by_channel(user: AuthUser = Depends(get_current_user)):
         channel_counts[channel] = channel_counts.get(channel, 0) + 1
 
     return [
-        {"channel": k, "count": v}
+        {"channel": k, "match_count": v}
         for k, v in sorted(channel_counts.items(), key=lambda x: -x[1])
     ]
 

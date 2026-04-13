@@ -217,7 +217,7 @@ export default function DashboardPage() {
 
             {/* Channel Chart + Asset Coverage */}
             <div className="grid gap-6 grid-cols-2">
-              <ChannelChart data={channelData.map((c: any) => ({ channel: c.channel, count: c.count ?? 0 }))} />
+              <ChannelChart data={channelData.map((c: any) => ({ channel: c.channel, count: c.match_count ?? 0 }))} />
               
               {/* Asset Coverage */}
               <Card className="opacity-0 animate-fade-up delay-75">
