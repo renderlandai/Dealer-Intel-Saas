@@ -12,6 +12,7 @@ from ..models import (
     MatchFeedbackCreate, MatchFeedback,
     FeedbackAccuracyStats, ThresholdRecommendation,
 )
+from ..org_cache import get_org_distributor_ids, get_org_asset_ids
 from ..services.adaptive_threshold_service import (
     get_all_adaptive_thresholds,
     invalidate_cache,
@@ -26,24 +27,6 @@ def _utc_now() -> str:
 log = logging.getLogger("dealer_intel.matches")
 
 router = APIRouter(prefix="/matches", tags=["matches"])
-
-
-def _org_distributor_ids(org_id: str) -> List[str]:
-    """Return all distributor IDs belonging to an organization."""
-    result = supabase.table("distributors") \
-        .select("id") \
-        .eq("organization_id", org_id) \
-        .execute()
-    return [d["id"] for d in (result.data or [])]
-
-
-def _org_asset_ids(org_id: str) -> List[str]:
-    """Return all asset IDs belonging to an organization's campaigns."""
-    result = supabase.table("assets") \
-        .select("id, campaigns!inner(organization_id)") \
-        .eq("campaigns.organization_id", org_id) \
-        .execute()
-    return [a["id"] for a in (result.data or [])]
 
 
 def _verify_match_ownership(match_id: str, org_distributor_ids: List[str]) -> dict:
@@ -74,8 +57,8 @@ async def list_matches(
     user: AuthUser = Depends(get_current_user),
 ):
     """List matches scoped to the user's organization."""
-    dist_ids = _org_distributor_ids(str(user.org_id))
-    asset_ids = _org_asset_ids(str(user.org_id))
+    dist_ids = get_org_distributor_ids(str(user.org_id))
+    asset_ids = get_org_asset_ids(str(user.org_id))
     if not dist_ids and not asset_ids:
         return []
 
@@ -105,8 +88,8 @@ async def list_matches(
 @router.get("/stats", summary="Get match statistics")
 async def get_match_stats(user: AuthUser = Depends(get_current_user)):
     """Get match statistics scoped to the user's organization."""
-    dist_ids = _org_distributor_ids(str(user.org_id))
-    asset_ids = _org_asset_ids(str(user.org_id))
+    dist_ids = get_org_distributor_ids(str(user.org_id))
+    asset_ids = get_org_asset_ids(str(user.org_id))
     if not dist_ids and not asset_ids:
         return {
             "total_matches": 0,
@@ -164,7 +147,7 @@ async def get_match_stats(user: AuthUser = Depends(get_current_user)):
 @router.get("/{match_id}", response_model=Match, summary="Get match")
 async def get_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get a specific match scoped to the user's organization."""
-    dist_ids = _org_distributor_ids(str(user.org_id))
+    dist_ids = get_org_distributor_ids(str(user.org_id))
     if not dist_ids:
         raise HTTPException(status_code=404, detail="Match not found")
 
@@ -188,7 +171,7 @@ async def update_match(
     user: AuthUser = Depends(get_current_user),
 ):
     """Update match compliance status, scoped to the user's organization."""
-    dist_ids = _org_distributor_ids(str(user.org_id))
+    dist_ids = get_org_distributor_ids(str(user.org_id))
     _verify_match_ownership(str(match_id), dist_ids)
 
     data = match.model_dump(exclude_unset=True)
@@ -209,7 +192,7 @@ async def update_match(
 @router.post("/{match_id}/approve", summary="Approve match")
 async def approve_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Mark a match as compliant, scoped to the user's organization."""
-    dist_ids = _org_distributor_ids(str(user.org_id))
+    dist_ids = get_org_distributor_ids(str(user.org_id))
     _verify_match_ownership(str(match_id), dist_ids)
 
     result = supabase.table("matches") \
@@ -233,7 +216,7 @@ async def flag_match(
     user: AuthUser = Depends(get_current_user),
 ):
     """Flag a match as a violation, scoped to the user's organization."""
-    dist_ids = _org_distributor_ids(str(user.org_id))
+    dist_ids = get_org_distributor_ids(str(user.org_id))
     _verify_match_ownership(str(match_id), dist_ids)
 
     update_data = {
@@ -265,7 +248,7 @@ async def flag_match(
 @router.delete("/{match_id}", summary="Delete match")
 async def delete_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Delete a specific match, scoped to the user's organization."""
-    dist_ids = _org_distributor_ids(str(user.org_id))
+    dist_ids = get_org_distributor_ids(str(user.org_id))
     _verify_match_ownership(str(match_id), dist_ids)
 
     supabase.table("matches") \
@@ -283,7 +266,7 @@ async def delete_all_matches(user: AuthUser = Depends(get_current_user)):
     if not get_settings().enable_dangerous_endpoints:
         raise HTTPException(status_code=403, detail="Bulk delete is disabled in this environment")
 
-    dist_ids = _org_distributor_ids(str(user.org_id))
+    dist_ids = get_org_distributor_ids(str(user.org_id))
     if not dist_ids:
         return {"status": "deleted", "count": 0}
 
@@ -394,7 +377,7 @@ async def submit_match_feedback(
     user: AuthUser = Depends(get_current_user),
 ):
     """Submit feedback on whether a match was correct, scoped to the user's org."""
-    dist_ids = _org_distributor_ids(str(user.org_id))
+    dist_ids = get_org_distributor_ids(str(user.org_id))
     _verify_match_ownership(str(match_id), dist_ids)
 
     match_result = supabase.table("matches") \
@@ -443,7 +426,7 @@ async def submit_match_feedback(
 @router.get("/feedback/stats", response_model=List[FeedbackAccuracyStats], summary="Get feedback accuracy stats")
 async def get_feedback_accuracy_stats(user: AuthUser = Depends(get_current_user)):
     """Get accuracy statistics scoped to the user's organization."""
-    dist_ids = _org_distributor_ids(str(user.org_id))
+    dist_ids = get_org_distributor_ids(str(user.org_id))
     if not dist_ids:
         return []
 

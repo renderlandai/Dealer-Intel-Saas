@@ -1,36 +1,23 @@
 """Dashboard routes — all queries scoped to the authenticated user's organization."""
 import logging
+import time
 from fastapi import APIRouter, Depends, HTTPException
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 from uuid import UUID
 from datetime import datetime, timedelta
+from cachetools import TTLCache
 
 from ..auth import AuthUser, get_current_user
 from ..database import supabase
 from ..models import DashboardStats
+from ..org_cache import get_org_distributor_ids, get_org_campaign_ids
 from ..plan_enforcement import OrgPlan, get_org_plan
 
 log = logging.getLogger("dealer_intel.dashboard")
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
-
-def _org_distributor_ids(org_id: str) -> List[str]:
-    """Return all distributor IDs belonging to an organization."""
-    result = supabase.table("distributors") \
-        .select("id") \
-        .eq("organization_id", org_id) \
-        .execute()
-    return [d["id"] for d in (result.data or [])]
-
-
-def _org_campaign_ids(org_id: str) -> List[str]:
-    """Return all campaign IDs belonging to an organization."""
-    result = supabase.table("campaigns") \
-        .select("id") \
-        .eq("organization_id", org_id) \
-        .execute()
-    return [c["id"] for c in (result.data or [])]
+_stats_cache: TTLCache = TTLCache(maxsize=200, ttl=15)
 
 
 @router.get("/stats", response_model=DashboardStats, summary="Get dashboard stats")
@@ -38,11 +25,14 @@ async def get_dashboard_stats(user: AuthUser = Depends(get_current_user)):
     """Get dashboard statistics via single Postgres RPC (falls back to sequential queries)."""
     org_id = str(user.org_id)
 
+    if org_id in _stats_cache:
+        return _stats_cache[org_id]
+
     try:
         result = supabase.rpc("get_dashboard_stats", {"p_org_id": org_id}).execute()
         if result.data:
             d = result.data
-            return DashboardStats(
+            stats = DashboardStats(
                 active_campaigns=d.get("active_campaigns", 0),
                 total_assets=d.get("total_assets", 0),
                 active_distributors=d.get("active_distributors", 0),
@@ -52,18 +42,22 @@ async def get_dashboard_stats(user: AuthUser = Depends(get_current_user)):
                 matches_today=d.get("matches_today", 0),
                 violations_count=d.get("violations_count", 0),
             )
+            _stats_cache[org_id] = stats
+            return stats
     except Exception as rpc_err:
         log.debug("Dashboard RPC unavailable, falling back to sequential queries: %s", rpc_err)
 
-    return await _get_dashboard_stats_fallback(org_id)
+    stats = await _get_dashboard_stats_fallback(org_id)
+    _stats_cache[org_id] = stats
+    return stats
 
 
 async def _get_dashboard_stats_fallback(org_id: str) -> DashboardStats:
     """Legacy sequential queries — used when the RPC hasn't been deployed yet."""
     today = datetime.utcnow().date().isoformat()
 
-    distributor_ids = _org_distributor_ids(org_id)
-    campaign_ids = _org_campaign_ids(org_id)
+    distributor_ids = get_org_distributor_ids(org_id)
+    campaign_ids = get_org_campaign_ids(org_id)
 
     campaigns = supabase.table("campaigns") \
         .select("id", count="exact") \
@@ -132,7 +126,7 @@ async def get_recent_matches(
     user: AuthUser = Depends(get_current_user),
 ):
     """Get recent matches scoped to the user's organization."""
-    distributor_ids = _org_distributor_ids(str(user.org_id))
+    distributor_ids = get_org_distributor_ids(str(user.org_id))
     if not distributor_ids:
         return []
 
@@ -166,7 +160,7 @@ async def get_recent_alerts(
 @router.get("/coverage-by-channel", summary="Get coverage by channel")
 async def get_coverage_by_channel(user: AuthUser = Depends(get_current_user)):
     """Get match coverage by channel scoped to the user's organization."""
-    distributor_ids = _org_distributor_ids(str(user.org_id))
+    distributor_ids = get_org_distributor_ids(str(user.org_id))
     if not distributor_ids:
         return []
 
@@ -192,7 +186,7 @@ async def get_coverage_by_distributor(
     user: AuthUser = Depends(get_current_user),
 ):
     """Get match coverage by distributor scoped to the user's organization."""
-    distributor_ids = _org_distributor_ids(str(user.org_id))
+    distributor_ids = get_org_distributor_ids(str(user.org_id))
     if not distributor_ids:
         return []
 
@@ -235,7 +229,7 @@ async def get_compliance_trend(
             f"Compliance trend analytics are not available on your {op.plan} plan. "
             "Upgrade to Pro to unlock this feature.",
         )
-    distributor_ids = _org_distributor_ids(str(user.org_id))
+    distributor_ids = get_org_distributor_ids(str(user.org_id))
     if not distributor_ids:
         return []
 
