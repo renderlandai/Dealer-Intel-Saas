@@ -38,8 +38,11 @@ import {
   getComplianceStatusBadge,
 } from "@/lib/utils";
 
+import { AssetThumbnail } from "@/components/asset-thumbnail";
+
 interface Match {
   id: string;
+  asset_id?: string | null;
   asset_name: string | null;
   asset_url: string | null;
   screenshot_url: string | null;
@@ -318,12 +321,10 @@ function MatchesContent() {
                           <div className="flex items-center gap-2">
                             {/* Asset Thumbnail */}
                             <div className="relative h-12 w-12 overflow-hidden bg-secondary border-2 border-success/40 flex-shrink-0">
-                              {match.asset_url ? (
-                                <Image
-                                  src={match.asset_url}
+                              {match.asset_id ? (
+                                <AssetThumbnail
+                                  assetId={match.asset_id}
                                   alt={match.asset_name || "Asset"}
-                                  fill
-                                  className="object-cover"
                                 />
                               ) : (
                                 <div className="flex h-full w-full items-center justify-center">

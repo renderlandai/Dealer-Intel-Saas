@@ -1,6 +1,5 @@
 "use client";
 
-import Image from "next/image";
 import Link from "next/link";
 import { ArrowRight, ImageIcon } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -9,8 +8,11 @@ import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { getMatchTypeBadge, getComplianceStatusBadge } from "@/lib/utils";
 
+import { AssetThumbnail } from "@/components/asset-thumbnail";
+
 interface Match {
   id: string;
+  asset_id?: string | null;
   asset_name: string | null;
   asset_url: string | null;
   distributor_name: string | null;
@@ -76,12 +78,11 @@ export function RecentMatches({ matches }: RecentMatchesProps) {
                 >
                   {/* Thumbnail */}
                   <div className="relative h-14 w-14 flex-shrink-0 overflow-hidden bg-secondary border border-border">
-                    {match.asset_url ? (
-                      <Image
-                        src={match.asset_url}
+                    {match.asset_id ? (
+                      <AssetThumbnail
+                        assetId={match.asset_id}
                         alt={match.asset_name || "Asset"}
-                        fill
-                        className="object-cover"
+                        iconSize="h-6 w-6"
                       />
                     ) : (
                       <div className="flex h-full w-full items-center justify-center">

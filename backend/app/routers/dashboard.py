@@ -134,6 +134,35 @@ def _cache_key(prefix: str, org_id: str, **kw) -> str:
     return f"{prefix}:{org_id}:{hash(tuple(sorted(kw.items())))}"
 
 
+def _strip_base64_urls(rows: list) -> list:
+    """Null out inline base64 data URLs to keep JSON payloads small."""
+    for row in rows:
+        for field in ("asset_url", "screenshot_url", "discovered_image_url"):
+            val = row.get(field)
+            if val and val.startswith("data:"):
+                row[field] = None
+    return rows
+
+
+def _flatten_dashboard_matches(rows: list) -> list:
+    """Flatten PostgREST nested joins for dashboard recent matches."""
+    out = []
+    for row in rows:
+        asset = row.pop("assets", None) or {}
+        dist = row.pop("distributors", None) or {}
+        row["asset_name"] = asset.get("name") if isinstance(asset, dict) else None
+        row["asset_url"] = None
+        row["distributor_name"] = dist.get("name") if isinstance(dist, dict) else None
+        row["campaign_name"] = None
+        row["discovered_image_url"] = None
+        for field in ("screenshot_url",):
+            val = row.get(field)
+            if val and val.startswith("data:"):
+                row[field] = None
+        out.append(row)
+    return out
+
+
 @router.get("/recent-matches", summary="Get recent matches")
 async def get_recent_matches(
     limit: int = 10,
@@ -156,14 +185,19 @@ async def get_recent_matches(
     if asset_ids:
         or_clauses.append(f"asset_id.in.({','.join(asset_ids)})")
 
-    result = supabase.table("recent_matches") \
-        .select("*") \
+    result = supabase.table("matches") \
+        .select(
+            "id, asset_id, distributor_id, confidence_score, match_type, "
+            "channel, source_url, screenshot_url, compliance_status, "
+            "created_at, assets(name), distributors(name)"
+        ) \
         .or_(",".join(or_clauses)) \
         .order("created_at", desc=True) \
         .limit(limit) \
         .execute()
-    _dashboard_cache[ck] = result.data
-    return result.data
+    data = _flatten_dashboard_matches(result.data)
+    _dashboard_cache[ck] = data
+    return data
 
 
 @router.get("/recent-alerts", summary="Get recent alerts")

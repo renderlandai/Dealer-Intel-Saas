@@ -68,12 +68,15 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         start = time.perf_counter()
         response = await call_next(request)
         elapsed_ms = (time.perf_counter() - start) * 1000
-        log.info(
-            "%s %s %d %.0fms",
+        level = logging.WARNING if elapsed_ms > 2000 else logging.INFO
+        log.log(
+            level,
+            "%s %s %d %.0fms%s",
             request.method,
             request.url.path,
             response.status_code,
             elapsed_ms,
+            " ⚠ SLOW" if elapsed_ms > 2000 else "",
         )
         return response
 

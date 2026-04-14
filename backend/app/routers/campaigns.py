@@ -1,7 +1,9 @@
 """Campaign and Asset routes."""
+import base64
 import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Request
+from fastapi.responses import Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from typing import List, Optional
@@ -280,6 +282,34 @@ async def get_asset(asset_id: UUID, user: AuthUser = Depends(get_current_user)):
     
     result.data.pop("campaigns", None)
     return result.data
+
+
+@router.get("/assets/{asset_id}/thumbnail", summary="Serve asset thumbnail")
+async def get_asset_thumbnail(asset_id: UUID, user: AuthUser = Depends(get_current_user)):
+    """Return the asset image as raw bytes (avoids base64 in JSON payloads)."""
+    result = supabase.table("assets")\
+        .select("file_url, file_type, campaigns!inner(organization_id)")\
+        .eq("id", str(asset_id))\
+        .eq("campaigns.organization_id", str(user.org_id))\
+        .maybe_single()\
+        .execute()
+
+    if not result.data or not result.data.get("file_url"):
+        raise HTTPException(status_code=404, detail="Asset image not found")
+
+    file_url: str = result.data["file_url"]
+    if file_url.startswith("data:"):
+        header, b64 = file_url.split(",", 1)
+        media_type = header.split(";")[0].replace("data:", "")
+        img_bytes = base64.b64decode(b64)
+    else:
+        raise HTTPException(status_code=404, detail="No inline image available")
+
+    return Response(
+        content=img_bytes,
+        media_type=media_type or "image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @router.delete("/assets/{asset_id}", summary="Delete asset")

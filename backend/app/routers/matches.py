@@ -2,6 +2,7 @@
 import logging
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
+from cachetools import TTLCache
 from typing import List, Optional
 from uuid import UUID
 
@@ -27,6 +28,8 @@ def _utc_now() -> str:
 log = logging.getLogger("dealer_intel.matches")
 
 router = APIRouter(prefix="/matches", tags=["matches"])
+
+_match_stats_cache: TTLCache = TTLCache(maxsize=200, ttl=60)
 
 
 def _verify_match_ownership(match_id: str, org_distributor_ids: List[str]) -> dict:
@@ -62,7 +65,14 @@ async def list_matches(
     if not dist_ids and not asset_ids:
         return []
 
-    q = supabase.table("recent_matches").select("*")
+    q = supabase.table("matches").select(
+        "id, asset_id, discovered_image_id, distributor_id, "
+        "confidence_score, match_type, is_modified, "
+        "channel, source_url, screenshot_url, discovered_at, "
+        "compliance_status, created_at, reviewed_at, reviewed_by, "
+        "last_seen_at, scan_count, previous_compliance_status, "
+        "assets(name, campaigns(name)), distributors(name)"
+    )
 
     if distributor_id:
         q = q.eq("distributor_id", str(distributor_id))
@@ -81,15 +91,61 @@ async def list_matches(
     if min_confidence:
         q = q.gte("confidence_score", min_confidence)
 
-    result = q.range(offset, offset + limit - 1).execute()
-    return result.data
+    result = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+    return _flatten_match_rows(result.data)
+
+
+def _strip_base64_urls(rows: list) -> list:
+    """Replace inline base64 data URLs with None to keep list payloads small."""
+    for row in rows:
+        for field in ("asset_url", "screenshot_url", "discovered_image_url"):
+            val = row.get(field)
+            if val and val.startswith("data:"):
+                row[field] = None
+    return rows
+
+
+def _flatten_match_rows(rows: list) -> list:
+    """Flatten PostgREST nested joins into the flat shape the frontend expects."""
+    out = []
+    for row in rows:
+        asset = row.pop("assets", None) or {}
+        dist = row.pop("distributors", None) or {}
+        campaigns = asset.pop("campaigns", None) if isinstance(asset, dict) else None
+        campaign_name = campaigns.get("name") if isinstance(campaigns, dict) else None
+
+        row["asset_name"] = asset.get("name") if isinstance(asset, dict) else None
+        row["asset_url"] = None
+        row["distributor_name"] = dist.get("name") if isinstance(dist, dict) else None
+        row["campaign_name"] = campaign_name
+        row["discovered_image_url"] = None
+
+        for field in ("screenshot_url",):
+            val = row.get(field)
+            if val and val.startswith("data:"):
+                row[field] = None
+        out.append(row)
+    return out
 
 
 @router.get("/stats", summary="Get match statistics")
 async def get_match_stats(user: AuthUser = Depends(get_current_user)):
     """Get match statistics scoped to the user's organization."""
-    dist_ids = get_org_distributor_ids(str(user.org_id))
-    asset_ids = get_org_asset_ids(str(user.org_id))
+    org_id = str(user.org_id)
+
+    if org_id in _match_stats_cache:
+        return _match_stats_cache[org_id]
+
+    try:
+        rpc = supabase.rpc("get_match_stats_for_org", {"p_org_id": org_id}).execute()
+        if rpc.data:
+            _match_stats_cache[org_id] = rpc.data
+            return rpc.data
+    except Exception:
+        log.debug("get_match_stats_for_org RPC unavailable, using fallback")
+
+    dist_ids = get_org_distributor_ids(org_id)
+    asset_ids = get_org_asset_ids(org_id)
     if not dist_ids and not asset_ids:
         return {
             "total_matches": 0, "compliant": 0, "violations": 0,
@@ -102,36 +158,42 @@ async def get_match_stats(user: AuthUser = Depends(get_current_user)):
         or_clauses.append(f"distributor_id.in.({','.join(dist_ids)})")
     if asset_ids:
         or_clauses.append(f"asset_id.in.({','.join(asset_ids)})")
-    or_filter = ",".join(or_clauses)
 
-    def _count(**extra_eq):
-        q = supabase.table("matches").select("id", count="exact").or_(or_filter)
-        for k, v in extra_eq.items():
-            q = q.eq(k, v)
-        return q.execute().count or 0
+    result = supabase.table("matches") \
+        .select("compliance_status, match_type, confidence_score") \
+        .or_(",".join(or_clauses)) \
+        .execute()
 
-    total = _count()
-    compliant = _count(compliance_status="compliant")
-    violations = _count(compliance_status="violation")
-    pending = _count(compliance_status="pending")
-    exact = _count(match_type="exact")
-    strong = _count(match_type="strong")
-    partial = _count(match_type="partial")
+    total = len(result.data) if result.data else 0
+    compliance_counts = {"compliant": 0, "violation": 0, "pending": 0}
+    type_counts = {"exact": 0, "strong": 0, "partial": 0}
+    scores = []
 
-    conf_r = supabase.table("matches").select("confidence_score").or_(or_filter) \
-        .not_.is_("confidence_score", "null").limit(1000).execute()
-    scores = [r["confidence_score"] for r in (conf_r.data or []) if r.get("confidence_score")]
-    avg_conf = sum(scores) / len(scores) if scores else 0.0
+    for match in (result.data or []):
+        status = match.get("compliance_status")
+        if status in compliance_counts:
+            compliance_counts[status] += 1
+        mtype = match.get("match_type")
+        if mtype in type_counts:
+            type_counts[mtype] += 1
+        if match.get("confidence_score"):
+            scores.append(match["confidence_score"])
 
-    return {
+    avg_confidence = sum(scores) / len(scores) if scores else 0.0
+
+    stats = {
         "total_matches": total,
-        "compliant": compliant,
-        "violations": violations,
-        "pending_review": pending,
-        "by_type": {"exact": exact, "strong": strong, "partial": partial},
-        "average_confidence": round(avg_conf, 2),
-        "compliance_rate": round(compliant / max(total, 1) * 100, 1),
+        "compliant": compliance_counts["compliant"],
+        "violations": compliance_counts["violation"],
+        "pending_review": compliance_counts["pending"],
+        "by_type": type_counts,
+        "average_confidence": round(avg_confidence, 2),
+        "compliance_rate": round(
+            compliance_counts["compliant"] / max(total, 1) * 100, 1
+        ),
     }
+    _match_stats_cache[org_id] = stats
+    return stats
 
 
 @router.get("/{match_id}", response_model=Match, summary="Get match")
