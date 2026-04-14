@@ -32,8 +32,8 @@ router = APIRouter(prefix="/matches", tags=["matches"])
 _match_stats_cache: TTLCache = TTLCache(maxsize=200, ttl=60)
 
 
-def _verify_match_ownership(match_id: str, org_distributor_ids: List[str]) -> dict:
-    """Fetch a match and verify it belongs to the org's distributors."""
+def _verify_match_ownership(match_id: str, org_distributor_ids: List[str], org_asset_ids: Optional[List[str]] = None) -> dict:
+    """Fetch a match and verify it belongs to the org's distributors or assets."""
     result = supabase.table("matches") \
         .select("*") \
         .eq("id", match_id) \
@@ -43,8 +43,14 @@ def _verify_match_ownership(match_id: str, org_distributor_ids: List[str]) -> di
     if not result.data:
         raise HTTPException(status_code=404, detail="Match not found")
 
-    if result.data.get("distributor_id") and result.data["distributor_id"] not in org_distributor_ids:
-        raise HTTPException(status_code=404, detail="Match not found")
+    dist_id = result.data.get("distributor_id")
+    asset_id = result.data.get("asset_id")
+    owns_by_dist = dist_id and dist_id in org_distributor_ids
+    owns_by_asset = asset_id and org_asset_ids and asset_id in org_asset_ids
+
+    if not owns_by_dist and not owns_by_asset:
+        if dist_id or asset_id:
+            raise HTTPException(status_code=404, detail="Match not found")
 
     return result.data
 
@@ -200,13 +206,20 @@ async def get_match_stats(user: AuthUser = Depends(get_current_user)):
 async def get_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Get a specific match scoped to the user's organization."""
     dist_ids = get_org_distributor_ids(str(user.org_id))
-    if not dist_ids:
+    asset_ids = get_org_asset_ids(str(user.org_id))
+    if not dist_ids and not asset_ids:
         raise HTTPException(status_code=404, detail="Match not found")
+
+    or_clauses = []
+    if dist_ids:
+        or_clauses.append(f"distributor_id.in.({','.join(dist_ids)})")
+    if asset_ids:
+        or_clauses.append(f"asset_id.in.({','.join(asset_ids)})")
 
     result = supabase.table("recent_matches") \
         .select("*") \
         .eq("id", str(match_id)) \
-        .in_("distributor_id", dist_ids) \
+        .or_(",".join(or_clauses)) \
         .maybe_single() \
         .execute()
 
@@ -224,7 +237,8 @@ async def update_match(
 ):
     """Update match compliance status, scoped to the user's organization."""
     dist_ids = get_org_distributor_ids(str(user.org_id))
-    _verify_match_ownership(str(match_id), dist_ids)
+    asset_ids = get_org_asset_ids(str(user.org_id))
+    _verify_match_ownership(str(match_id), dist_ids, asset_ids)
 
     data = match.model_dump(exclude_unset=True)
     if "compliance_status" in data:
@@ -245,7 +259,8 @@ async def update_match(
 async def approve_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Mark a match as compliant, scoped to the user's organization."""
     dist_ids = get_org_distributor_ids(str(user.org_id))
-    _verify_match_ownership(str(match_id), dist_ids)
+    asset_ids = get_org_asset_ids(str(user.org_id))
+    _verify_match_ownership(str(match_id), dist_ids, asset_ids)
 
     result = supabase.table("matches") \
         .update({
@@ -269,7 +284,8 @@ async def flag_match(
 ):
     """Flag a match as a violation, scoped to the user's organization."""
     dist_ids = get_org_distributor_ids(str(user.org_id))
-    _verify_match_ownership(str(match_id), dist_ids)
+    asset_ids = get_org_asset_ids(str(user.org_id))
+    _verify_match_ownership(str(match_id), dist_ids, asset_ids)
 
     update_data = {
         "compliance_status": "violation",
@@ -301,7 +317,8 @@ async def flag_match(
 async def delete_match(match_id: UUID, user: AuthUser = Depends(get_current_user)):
     """Delete a specific match, scoped to the user's organization."""
     dist_ids = get_org_distributor_ids(str(user.org_id))
-    _verify_match_ownership(str(match_id), dist_ids)
+    asset_ids = get_org_asset_ids(str(user.org_id))
+    _verify_match_ownership(str(match_id), dist_ids, asset_ids)
 
     supabase.table("matches") \
         .delete() \
@@ -430,7 +447,8 @@ async def submit_match_feedback(
 ):
     """Submit feedback on whether a match was correct, scoped to the user's org."""
     dist_ids = get_org_distributor_ids(str(user.org_id))
-    _verify_match_ownership(str(match_id), dist_ids)
+    asset_ids = get_org_asset_ids(str(user.org_id))
+    _verify_match_ownership(str(match_id), dist_ids, asset_ids)
 
     match_result = supabase.table("matches") \
         .select("id, confidence_score, match_type, channel, ai_analysis") \
