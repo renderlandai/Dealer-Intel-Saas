@@ -1,6 +1,5 @@
 """Dashboard routes — all queries scoped to the authenticated user's organization."""
 import logging
-import time
 from fastapi import APIRouter, Depends, HTTPException
 from typing import Dict, List, Optional, Tuple
 from uuid import UUID
@@ -17,7 +16,7 @@ log = logging.getLogger("dealer_intel.dashboard")
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
-_stats_cache: TTLCache = TTLCache(maxsize=200, ttl=15)
+_stats_cache: TTLCache = TTLCache(maxsize=200, ttl=60)
 
 
 @router.get("/stats", response_model=DashboardStats, summary="Get dashboard stats")
@@ -53,7 +52,7 @@ async def get_dashboard_stats(user: AuthUser = Depends(get_current_user)):
 
 
 async def _get_dashboard_stats_fallback(org_id: str) -> DashboardStats:
-    """Legacy sequential queries — used when the RPC hasn't been deployed yet."""
+    """Sequential fallback — used when the RPC hasn't been deployed yet."""
     today = datetime.utcnow().date().isoformat()
 
     distributor_ids = get_org_distributor_ids(org_id)
@@ -128,14 +127,26 @@ async def _get_dashboard_stats_fallback(org_id: str) -> DashboardStats:
     )
 
 
+_dashboard_cache: TTLCache = TTLCache(maxsize=200, ttl=60)
+
+
+def _cache_key(prefix: str, org_id: str, **kw) -> str:
+    return f"{prefix}:{org_id}:{hash(tuple(sorted(kw.items())))}"
+
+
 @router.get("/recent-matches", summary="Get recent matches")
 async def get_recent_matches(
     limit: int = 10,
     user: AuthUser = Depends(get_current_user),
 ):
     """Get recent matches scoped to the user's organization."""
-    dist_ids = get_org_distributor_ids(str(user.org_id))
-    asset_ids = get_org_asset_ids(str(user.org_id))
+    org_id = str(user.org_id)
+    ck = _cache_key("rm", org_id, limit=limit)
+    if ck in _dashboard_cache:
+        return _dashboard_cache[ck]
+
+    dist_ids = get_org_distributor_ids(org_id)
+    asset_ids = get_org_asset_ids(org_id)
     if not dist_ids and not asset_ids:
         return []
 
@@ -151,6 +162,7 @@ async def get_recent_matches(
         .order("created_at", desc=True) \
         .limit(limit) \
         .execute()
+    _dashboard_cache[ck] = result.data
     return result.data
 
 
@@ -161,22 +173,33 @@ async def get_recent_alerts(
     user: AuthUser = Depends(get_current_user),
 ):
     """Get recent alerts scoped to the user's organization."""
+    org_id = str(user.org_id)
+    ck = _cache_key("ra", org_id, limit=limit, unread=unread_only)
+    if ck in _dashboard_cache:
+        return _dashboard_cache[ck]
+
     q = supabase.table("alerts") \
         .select("*, distributors(name), matches(confidence_score)") \
-        .eq("organization_id", str(user.org_id)) \
+        .eq("organization_id", org_id) \
         .order("created_at", desc=True) \
         .limit(limit)
     if unread_only:
         q = q.eq("is_read", False)
     result = q.execute()
+    _dashboard_cache[ck] = result.data
     return result.data
 
 
 @router.get("/coverage-by-channel", summary="Get coverage by channel")
 async def get_coverage_by_channel(user: AuthUser = Depends(get_current_user)):
     """Get match coverage by channel scoped to the user's organization."""
-    dist_ids = get_org_distributor_ids(str(user.org_id))
-    asset_ids = get_org_asset_ids(str(user.org_id))
+    org_id = str(user.org_id)
+    ck = _cache_key("cc", org_id)
+    if ck in _dashboard_cache:
+        return _dashboard_cache[ck]
+
+    dist_ids = get_org_distributor_ids(org_id)
+    asset_ids = get_org_asset_ids(org_id)
     if not dist_ids and not asset_ids:
         return []
 
@@ -196,10 +219,12 @@ async def get_coverage_by_channel(user: AuthUser = Depends(get_current_user)):
         channel = match.get("channel") or "unknown"
         channel_counts[channel] = channel_counts.get(channel, 0) + 1
 
-    return [
+    data = [
         {"channel": k, "match_count": v}
         for k, v in sorted(channel_counts.items(), key=lambda x: -x[1])
     ]
+    _dashboard_cache[ck] = data
+    return data
 
 
 @router.get("/coverage-by-distributor", summary="Get coverage by distributor")
@@ -251,7 +276,12 @@ async def get_compliance_trend(
             f"Compliance trend analytics are not available on your {op.plan} plan. "
             "Upgrade to Pro to unlock this feature.",
         )
-    distributor_ids = get_org_distributor_ids(str(user.org_id))
+    org_id = str(user.org_id)
+    ck = _cache_key("ct", org_id, days=days)
+    if ck in _dashboard_cache:
+        return _dashboard_cache[ck]
+
+    distributor_ids = get_org_distributor_ids(org_id)
     if not distributor_ids:
         return []
 
@@ -276,7 +306,9 @@ async def get_compliance_trend(
         elif match["compliance_status"] == "violation":
             daily_stats[date]["violations"] += 1
 
-    return [
+    data = [
         {"date": k, **v}
         for k, v in sorted(daily_stats.items())
     ]
+    _dashboard_cache[ck] = data
+    return data

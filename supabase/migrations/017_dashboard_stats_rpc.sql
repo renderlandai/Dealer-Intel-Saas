@@ -33,11 +33,17 @@ BEGIN
         count(*),
         count(*) FILTER (WHERE compliance_status = 'compliant'),
         count(*) FILTER (WHERE compliance_status = 'violation'),
-        count(*) FILTER (WHERE created_at::date = CURRENT_DATE)
+        count(*) FILTER (WHERE m.created_at::date = CURRENT_DATE)
     INTO v_total_matches, v_compliant_count, v_violations_count, v_matches_today
     FROM matches m
-    JOIN distributors d ON m.distributor_id = d.id
-    WHERE d.organization_id = p_org_id;
+    WHERE m.distributor_id IN (
+        SELECT id FROM distributors WHERE organization_id = p_org_id
+    )
+    OR m.asset_id IN (
+        SELECT a.id FROM assets a
+        JOIN campaigns c ON a.campaign_id = c.id
+        WHERE c.organization_id = p_org_id
+    );
 
     SELECT count(*) INTO v_unread_alerts
     FROM alerts

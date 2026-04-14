@@ -2,6 +2,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from cachetools import TTLCache
 from typing import List, Optional
 from uuid import UUID
 
@@ -15,6 +16,8 @@ from ..plan_enforcement import OrgPlan, get_org_plan, check_dealer_limit, check_
 limiter = Limiter(key_func=get_remote_address)
 
 router = APIRouter(prefix="/distributors", tags=["distributors"])
+
+_dist_list_cache: TTLCache = TTLCache(maxsize=200, ttl=60)
 
 
 def _verify_distributor_ownership(distributor_id: UUID, org_id: UUID) -> None:
@@ -35,9 +38,14 @@ async def list_distributors(
     region: Optional[str] = None,
     user: AuthUser = Depends(get_current_user),
 ):
-    """List all distributors."""
+    """List all distributors with match/violation counts."""
+    org_id = str(user.org_id)
+    cache_key = f"{org_id}:{status}:{region}"
+    if cache_key in _dist_list_cache:
+        return _dist_list_cache[cache_key]
+
     query = supabase.table("distributors").select("*")
-    query = query.eq("organization_id", str(user.org_id))
+    query = query.eq("organization_id", org_id)
     if status:
         query = query.eq("status", status)
     if region:
@@ -45,17 +53,16 @@ async def list_distributors(
     distributors_result = query.order("name").execute()
 
     distributor_ids = [d["id"] for d in distributors_result.data]
-
     if not distributor_ids:
         return []
 
-    matches_result = supabase.table("matches")\
-        .select("distributor_id, compliance_status")\
-        .in_("distributor_id", distributor_ids)\
+    matches_result = supabase.table("matches") \
+        .select("distributor_id, compliance_status") \
+        .in_("distributor_id", distributor_ids) \
         .execute()
 
-    match_counts = {}
-    violation_counts = {}
+    match_counts: dict = {}
+    violation_counts: dict = {}
     for match in matches_result.data:
         did = match.get("distributor_id")
         if did:
@@ -70,6 +77,7 @@ async def list_distributors(
         dist["violation_count"] = violation_counts.get(dist["id"], 0)
         distributors.append(dist)
 
+    _dist_list_cache[cache_key] = distributors
     return distributors
 
 

@@ -97,6 +97,7 @@ export function useDashboardStats() {
   return useQuery({
     queryKey: queryKeys.dashboard.stats,
     queryFn: getDashboardStats,
+    staleTime: 60_000,
   });
 }
 
@@ -104,6 +105,7 @@ export function useRecentMatches(limit = 10) {
   return useQuery({
     queryKey: queryKeys.dashboard.recentMatches(limit),
     queryFn: () => getRecentMatches(limit),
+    staleTime: 60_000,
   });
 }
 
@@ -111,6 +113,7 @@ export function useRecentAlerts(limit = 10) {
   return useQuery({
     queryKey: queryKeys.dashboard.recentAlerts(limit),
     queryFn: () => getRecentAlerts(limit),
+    staleTime: 60_000,
   });
 }
 
@@ -168,6 +171,7 @@ export function useChannelCoverage() {
   return useQuery({
     queryKey: queryKeys.dashboard.channelCoverage,
     queryFn: getCoverageByChannel,
+    staleTime: 60_000,
   });
 }
 
@@ -176,6 +180,7 @@ export function useCampaigns() {
   return useQuery({
     queryKey: queryKeys.campaigns.all,
     queryFn: getCampaigns,
+    staleTime: 60_000,
   });
 }
 
@@ -222,6 +227,7 @@ export function useDistributors() {
   return useQuery({
     queryKey: queryKeys.distributors.all,
     queryFn: getDistributors,
+    staleTime: 60_000,
   });
 }
 
@@ -280,6 +286,7 @@ export function useMatches(filters?: MatchFilters) {
     queryKey: queryKeys.matches.all(filters),
     queryFn: () => getMatches(filters),
     placeholderData: keepPreviousData,
+    staleTime: 60_000,
   });
 }
 
@@ -295,6 +302,7 @@ export function useMatchStats() {
   return useQuery({
     queryKey: queryKeys.matches.stats,
     queryFn: getMatchStats,
+    staleTime: 60_000,
   });
 }
 

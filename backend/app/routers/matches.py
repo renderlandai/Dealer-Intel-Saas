@@ -92,13 +92,9 @@ async def get_match_stats(user: AuthUser = Depends(get_current_user)):
     asset_ids = get_org_asset_ids(str(user.org_id))
     if not dist_ids and not asset_ids:
         return {
-            "total_matches": 0,
-            "compliant": 0,
-            "violations": 0,
-            "pending_review": 0,
-            "by_type": {"exact": 0, "strong": 0, "partial": 0},
-            "average_confidence": 0.0,
-            "compliance_rate": 0.0,
+            "total_matches": 0, "compliant": 0, "violations": 0,
+            "pending_review": 0, "by_type": {"exact": 0, "strong": 0, "partial": 0},
+            "average_confidence": 0.0, "compliance_rate": 0.0,
         }
 
     or_clauses = []
@@ -106,41 +102,35 @@ async def get_match_stats(user: AuthUser = Depends(get_current_user)):
         or_clauses.append(f"distributor_id.in.({','.join(dist_ids)})")
     if asset_ids:
         or_clauses.append(f"asset_id.in.({','.join(asset_ids)})")
+    or_filter = ",".join(or_clauses)
 
-    result = supabase.table("matches") \
-        .select("compliance_status, match_type, confidence_score") \
-        .or_(",".join(or_clauses)) \
-        .execute()
+    def _count(**extra_eq):
+        q = supabase.table("matches").select("id", count="exact").or_(or_filter)
+        for k, v in extra_eq.items():
+            q = q.eq(k, v)
+        return q.execute().count or 0
 
-    total = len(result.data) if result.data else 0
-    compliance_counts = {"compliant": 0, "violation": 0, "pending": 0}
-    type_counts = {"exact": 0, "strong": 0, "partial": 0}
-    scores = []
+    total = _count()
+    compliant = _count(compliance_status="compliant")
+    violations = _count(compliance_status="violation")
+    pending = _count(compliance_status="pending")
+    exact = _count(match_type="exact")
+    strong = _count(match_type="strong")
+    partial = _count(match_type="partial")
 
-    for match in (result.data or []):
-        status = match.get("compliance_status")
-        if status in compliance_counts:
-            compliance_counts[status] += 1
-
-        mtype = match.get("match_type")
-        if mtype in type_counts:
-            type_counts[mtype] += 1
-
-        if match.get("confidence_score"):
-            scores.append(match["confidence_score"])
-
-    avg_confidence = sum(scores) / len(scores) if scores else 0.0
+    conf_r = supabase.table("matches").select("confidence_score").or_(or_filter) \
+        .not_.is_("confidence_score", "null").limit(1000).execute()
+    scores = [r["confidence_score"] for r in (conf_r.data or []) if r.get("confidence_score")]
+    avg_conf = sum(scores) / len(scores) if scores else 0.0
 
     return {
         "total_matches": total,
-        "compliant": compliance_counts["compliant"],
-        "violations": compliance_counts["violation"],
-        "pending_review": compliance_counts["pending"],
-        "by_type": type_counts,
-        "average_confidence": round(avg_confidence, 2),
-        "compliance_rate": round(
-            compliance_counts["compliant"] / max(total, 1) * 100, 1
-        ),
+        "compliant": compliant,
+        "violations": violations,
+        "pending_review": pending,
+        "by_type": {"exact": exact, "strong": strong, "partial": partial},
+        "average_confidence": round(avg_conf, 2),
+        "compliance_rate": round(compliant / max(total, 1) * 100, 1),
     }
 
 

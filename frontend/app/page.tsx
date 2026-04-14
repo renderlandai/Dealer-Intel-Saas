@@ -72,11 +72,15 @@ export default function DashboardPage() {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    queryClient.prefetchQuery({ queryKey: queryKeys.matches.all(), queryFn: () => getMatches() });
-    queryClient.prefetchQuery({ queryKey: queryKeys.matches.stats, queryFn: getMatchStats });
-    queryClient.prefetchQuery({ queryKey: queryKeys.scans.all, queryFn: getScanJobs });
-    queryClient.prefetchQuery({ queryKey: ["alerts", { unreadOnly: false }], queryFn: () => getAlerts() });
-  }, [queryClient]);
+    if (statsLoading) return;
+    const timer = setTimeout(() => {
+      queryClient.prefetchQuery({ queryKey: queryKeys.matches.all(), queryFn: () => getMatches() });
+      queryClient.prefetchQuery({ queryKey: queryKeys.matches.stats, queryFn: getMatchStats });
+      queryClient.prefetchQuery({ queryKey: queryKeys.scans.all, queryFn: getScanJobs });
+      queryClient.prefetchQuery({ queryKey: ["alerts", { unreadOnly: false }], queryFn: () => getAlerts() });
+    }, 2000);
+    return () => clearTimeout(timer);
+  }, [queryClient, statsLoading]);
 
   const campaigns = allCampaigns.filter((c: Campaign) => c.status === "active");
   const loading = statsLoading;

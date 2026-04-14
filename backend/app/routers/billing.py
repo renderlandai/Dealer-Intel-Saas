@@ -5,6 +5,7 @@ from typing import Optional
 from uuid import UUID
 
 import stripe
+from cachetools import TTLCache
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -164,12 +165,20 @@ async def create_portal_session(request: Request, user: AuthUser = Depends(get_c
 # Usage
 # ------------------------------------------------------------------
 
+_billing_cache: TTLCache = TTLCache(maxsize=200, ttl=60)
+
+
 @router.get("/usage", summary="Get billing usage")
 async def get_billing_usage(user: AuthUser = Depends(get_current_user)):
     """Return current plan, limits, and usage counters for the org."""
+    org_id = str(user.org_id)
+
+    if org_id in _billing_cache:
+        return _billing_cache[org_id]
+
     org = supabase.table("organizations") \
         .select("plan, plan_status, trial_expires_at, extra_dealers_count") \
-        .eq("id", str(user.org_id)) \
+        .eq("id", org_id) \
         .single().execute()
     if not org.data:
         raise HTTPException(404, "Organization not found")
@@ -177,37 +186,37 @@ async def get_billing_usage(user: AuthUser = Depends(get_current_user)):
     plan = org.data.get("plan", "free")
     limits = get_plan_limits(plan)
 
-    dealer_count = supabase.table("distributors") \
-        .select("id", count="exact") \
-        .eq("organization_id", str(user.org_id)) \
-        .eq("status", "active").execute()
-
-    campaign_count = supabase.table("campaigns") \
-        .select("id", count="exact") \
-        .eq("organization_id", str(user.org_id)) \
-        .eq("status", "active").execute()
-
     month_start = datetime.now(timezone.utc).replace(
         day=1, hour=0, minute=0, second=0, microsecond=0,
     )
 
+    dealer_count = supabase.table("distributors") \
+        .select("id", count="exact") \
+        .eq("organization_id", org_id) \
+        .eq("status", "active").execute()
+
+    campaign_count = supabase.table("campaigns") \
+        .select("id", count="exact") \
+        .eq("organization_id", org_id) \
+        .eq("status", "active").execute()
+
     if plan == "free":
         scan_count = supabase.table("scan_jobs") \
             .select("id", count="exact") \
-            .eq("organization_id", str(user.org_id)).execute()
+            .eq("organization_id", org_id).execute()
         scan_limit = limits.get("max_scans_total", 5)
         scan_label = "total"
     else:
         scan_count = supabase.table("scan_jobs") \
             .select("id", count="exact") \
-            .eq("organization_id", str(user.org_id)) \
+            .eq("organization_id", org_id) \
             .gte("created_at", month_start.isoformat()).execute()
         scan_limit = limits.get("max_scans_per_month")
         scan_label = "this_month"
 
     active_scans = supabase.table("scan_jobs") \
         .select("id", count="exact") \
-        .eq("organization_id", str(user.org_id)) \
+        .eq("organization_id", org_id) \
         .in_("status", ["pending", "running", "analyzing"]).execute()
 
     trial_expires = org.data.get("trial_expires_at")
@@ -220,7 +229,7 @@ async def get_billing_usage(user: AuthUser = Depends(get_current_user)):
         except Exception:
             pass
 
-    return {
+    result = {
         "plan": plan,
         "plan_status": org.data.get("plan_status", "trialing"),
         "trial_days_left": trial_days_left,
@@ -255,6 +264,8 @@ async def get_billing_usage(user: AuthUser = Depends(get_current_user)):
             "max_user_seats": limits.get("max_user_seats"),
         },
     }
+    _billing_cache[org_id] = result
+    return result
 
 
 # ------------------------------------------------------------------
