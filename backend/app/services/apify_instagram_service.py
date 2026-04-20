@@ -200,6 +200,17 @@ async def scan_instagram_organic(
     posts = await _fetch_dataset_items(dataset_id)
     log.info("Apify returned %d post(s)", len(posts))
 
+    try:
+        from . import cost_tracker
+        cost_tracker.record_apify_run(
+            actor_or_task=TASK_ID,
+            run_id=run_id,
+            usage_total_usd=completed_run.get("usageTotalUsd"),
+            items_returned=len(posts),
+        )
+    except Exception as cost_err:
+        log.debug("Cost capture skipped (apify instagram): %s", cost_err)
+
     if not posts:
         supabase.table("scan_jobs").update({
             "status": "completed",

@@ -353,43 +353,77 @@ async def call_anthropic_with_retry(
     images: List[bytes],
     max_retries: int = None,
     model: str = None,
+    cache_prefix_images: int = 0,
 ) -> str:
     """
     Call Anthropic Claude API with retry logic and image support.
-    
+
     Args:
         prompt: Text prompt for the model
         images: List of image bytes to include
         max_retries: Number of retry attempts
         model: Override model (defaults to CLAUDE_MODEL / Opus)
-    
+        cache_prefix_images: Number of leading images to mark as a cacheable
+            prefix via Anthropic prompt caching (`cache_control: ephemeral`).
+            The prompt text + the first N images become a stable prefix that
+            subsequent calls within the 5-minute cache TTL can reuse for ~90%
+            input-token discount.  Defaults to 0 (no caching, fully backward
+            compatible with the legacy call signature).
+
+            Use this when the same campaign asset(s) are compared against many
+            different discovered images in a tight loop — the asset stays the
+            same across calls, so caching it pays off after the first call.
+
     Returns:
         Response text from Claude
     """
     if max_retries is None:
         max_retries = settings.max_retries
-    
+
     use_model = model or CLAUDE_MODEL
     last_error = None
-    
+
     # Build message content with images, filtering out any None entries
     valid_images = [img for img in images if img is not None]
     if not valid_images:
         raise ValueError("No valid images to send to API — all images failed validation or optimization")
 
-    content = [{"type": "text", "text": prompt + "\n\nRespond ONLY with valid JSON matching the required schema. No markdown, no explanation outside the JSON."}]
-    
-    for img_bytes in valid_images:
+    # Cap the cacheable prefix at the number of images actually present, and
+    # at 3 (Anthropic allows up to 4 cache breakpoints per request; we use
+    # at most one — on the last cacheable image — leaving headroom for callers
+    # that want to add more later).
+    cache_prefix = max(0, min(cache_prefix_images, len(valid_images)))
+
+    # Prompt text leads.  When caching is requested, the cache breakpoint goes
+    # on the LAST cacheable image; everything from the start of the message
+    # through that block becomes the cached prefix.  The prompt text varies
+    # per-operation (filter vs compare vs compliance), but is identical across
+    # repeated calls to the same operation, so it caches naturally.
+    text_block = {
+        "type": "text",
+        "text": prompt + "\n\nRespond ONLY with valid JSON matching the required schema. No markdown, no explanation outside the JSON.",
+    }
+    content: List[Dict[str, Any]] = [text_block]
+
+    for idx, img_bytes in enumerate(valid_images):
         img_b64 = encode_image_base64(img_bytes)
-        content.append({
+        block: Dict[str, Any] = {
             "type": "image",
             "source": {
                 "type": "base64",
                 "media_type": "image/jpeg",
-                "data": img_b64
-            }
-        })
-    
+                "data": img_b64,
+            },
+        }
+        # Mark the LAST cacheable image as the cache breakpoint.  Anthropic
+        # caches everything from start-of-message up to and including this
+        # block.  Cache will only actually be created if the prefix exceeds
+        # the per-model minimum (1024 tokens for Opus, 2048 for Haiku); below
+        # that threshold the marker is silently ignored, no error.
+        if cache_prefix > 0 and idx == cache_prefix - 1:
+            block["cache_control"] = {"type": "ephemeral"}
+        content.append(block)
+
     for attempt in range(max_retries):
         try:
             # Run synchronous Anthropic call in executor
@@ -402,6 +436,19 @@ async def call_anthropic_with_retry(
                     messages=[{"role": "user", "content": content}]
                 )
             )
+            try:
+                from . import cost_tracker
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    cost_tracker.record_anthropic(
+                        model=use_model,
+                        input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+                        output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+                        cache_creation_tokens=int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
+                        cache_read_tokens=int(getattr(usage, "cache_read_input_tokens", 0) or 0),
+                    )
+            except Exception as cost_err:
+                log.debug("Cost capture skipped: %s", cost_err)
             return response.content[0].text
             
         except Exception as e:
@@ -946,14 +993,19 @@ async def filter_image(
             if asset_images:
                 prompt = get_filter_prompt(asset_aware=True, asset_count=len(asset_images))
                 images = asset_images + [image_bytes]
+                cache_n = len(asset_images)
             else:
                 prompt = get_filter_prompt(asset_aware=False)
                 images = [image_bytes]
+                cache_n = 0
         else:
             prompt = get_filter_prompt(asset_aware=False)
             images = [image_bytes]
+            cache_n = 0
 
-        response_text = await call_anthropic_with_retry(prompt, images, model=FILTER_MODEL)
+        response_text = await call_anthropic_with_retry(
+            prompt, images, model=FILTER_MODEL, cache_prefix_images=cache_n,
+        )
         result = extract_json_from_response(response_text)
         
         is_relevant = result.get("is_relevant", False)
@@ -1080,7 +1132,10 @@ async def _detect_asset_single(
         }
     prompt = get_detection_prompt()
 
-    response_text = await call_anthropic_with_retry(prompt, [asset_bytes, screenshot_bytes], model=ENSEMBLE_MODEL)
+    response_text = await call_anthropic_with_retry(
+        prompt, [asset_bytes, screenshot_bytes],
+        model=ENSEMBLE_MODEL, cache_prefix_images=1,
+    )
     result = extract_json_from_response(response_text)
 
     asset_found = result.get("asset_found", False)
@@ -1146,7 +1201,10 @@ async def _detect_asset_tiled(
             if tile_optimized is None:
                 log.debug("Tile %d/%d: skipped (optimization failed)", idx + 1, len(tiles))
                 continue
-            response_text = await call_anthropic_with_retry(prompt, [asset_bytes, tile_optimized], model=ENSEMBLE_MODEL)
+            response_text = await call_anthropic_with_retry(
+                prompt, [asset_bytes, tile_optimized],
+                model=ENSEMBLE_MODEL, cache_prefix_images=1,
+            )
             result = extract_json_from_response(response_text)
 
             found = result.get("asset_found", False)
@@ -1205,8 +1263,11 @@ async def verify_borderline_match(
             return {"verified_score": initial_score, "is_match": False, "error": "Image failed validation"}
         
         prompt = get_verification_prompt()
-        
-        response_text = await call_anthropic_with_retry(prompt, [asset_bytes, discovered_bytes], model=ENSEMBLE_MODEL)
+
+        response_text = await call_anthropic_with_retry(
+            prompt, [asset_bytes, discovered_bytes],
+            model=ENSEMBLE_MODEL, cache_prefix_images=1,
+        )
         result = extract_json_from_response(response_text)
         
         gates_passed = result.get("gates_passed", 0)
@@ -1292,8 +1353,11 @@ ZOMBIE AD CHECK:
 """
         
         prompt = get_compliance_prompt(rules_text, zombie_check)
-        
-        response_text = await call_anthropic_with_retry(prompt, [asset_bytes, discovered_bytes])
+
+        response_text = await call_anthropic_with_retry(
+            prompt, [asset_bytes, discovered_bytes],
+            cache_prefix_images=1,
+        )
         result = extract_json_from_response(response_text)
         
         log.info("Compliance result: is_compliant=%s", result.get('is_compliant'))

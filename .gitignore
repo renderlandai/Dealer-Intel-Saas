@@ -3,6 +3,9 @@
 .env.local
 .env.production
 
+# Supabase CLI cache
+supabase/.temp/
+
 # Python
 __pycache__/
 *.py[cod]

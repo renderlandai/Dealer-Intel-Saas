@@ -1,0 +1,113 @@
+{
+  "version": 1,
+  "generated_at": "2026-04-20T00:00:00+00:00",
+  "cases": [
+    {
+      "id": "example-clear-positive-001",
+      "category": "clear_positive",
+      "asset_path": "images/asset_001.jpg",
+      "discovered_path": "images/discovered_001.jpg",
+      "expected": {
+        "is_relevant": true,
+        "is_match": true,
+        "min_score": 80,
+        "max_score": 100,
+        "is_compliant": true
+      },
+      "notes": "Identical creative — recall floor.",
+      "source": {
+        "labelled_by": "ops@example.com"
+      }
+    },
+    {
+      "id": "example-template-positive-001",
+      "category": "template_positive",
+      "asset_path": "images/asset_002.jpg",
+      "discovered_path": "images/discovered_002.jpg",
+      "expected": {
+        "is_relevant": true,
+        "is_match": true,
+        "min_score": 75,
+        "max_score": 100
+      },
+      "notes": "Same artwork, dealer name swapped into placeholder."
+    },
+    {
+      "id": "example-same-promo-diff-creative-001",
+      "category": "same_promo_diff_creative",
+      "asset_path": "images/asset_003.jpg",
+      "discovered_path": "images/discovered_003.jpg",
+      "expected": {
+        "is_relevant": true,
+        "is_match": false,
+        "max_score": 64
+      },
+      "notes": "Same offer/promo code, different layout — must NOT match."
+    },
+    {
+      "id": "example-different-brand-001",
+      "category": "different_brand",
+      "asset_path": "images/asset_004.jpg",
+      "discovered_path": "images/discovered_004.jpg",
+      "expected": {
+        "is_relevant": false,
+        "is_match": false,
+        "max_score": 20
+      },
+      "notes": "Different brand entirely — precision floor."
+    },
+    {
+      "id": "example-borderline-true-001",
+      "category": "borderline_true",
+      "asset_path": "images/asset_005.jpg",
+      "discovered_path": "images/discovered_005.jpg",
+      "expected": {
+        "is_match": true,
+        "min_score": 60,
+        "max_score": 80
+      },
+      "notes": "Heavily modified true match — verifier should promote."
+    },
+    {
+      "id": "example-borderline-false-001",
+      "category": "borderline_false",
+      "asset_path": "images/asset_006.jpg",
+      "discovered_path": "images/discovered_006.jpg",
+      "expected": {
+        "is_match": false,
+        "min_score": 60,
+        "max_score": 80
+      },
+      "notes": "Confusing visual similarity — verifier should reject."
+    },
+    {
+      "id": "example-compliance-drift-001",
+      "category": "compliance_drift",
+      "asset_path": "images/asset_007.jpg",
+      "discovered_path": "images/discovered_007.jpg",
+      "expected": {
+        "is_match": true,
+        "is_compliant": false
+      },
+      "brand_rules": {
+        "required_elements": ["Manufacturer logo", "APR disclaimer"],
+        "forbidden_elements": ["Competitor branding"],
+        "brand_colors": ["#003366"]
+      },
+      "notes": "Matched creative but missing required APR disclaimer."
+    },
+    {
+      "id": "example-zombie-ad-001",
+      "category": "zombie_ad",
+      "asset_path": "images/asset_008.jpg",
+      "discovered_path": "images/discovered_008.jpg",
+      "expected": {
+        "is_match": true,
+        "is_compliant": false,
+        "zombie_ad": true
+      },
+      "campaign_end_date": "2026-03-31",
+      "notes": "Campaign expired but creative still live on dealer site."
+    }
+  ]
+}

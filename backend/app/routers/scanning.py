@@ -9,6 +9,7 @@ from ..database import supabase
 from ..models import ScanJobCreate, ScanJob, ScanSource
 from ..services import screenshot_service, extraction_service, ai_service, serpapi_service, apify_meta_service, apify_instagram_service
 from ..services.extraction_service import _safe_insert_discovered_image
+from ..services.cost_tracker import scan_cost_context, ScanCostTracker
 from ..services.notification_service import notify_scan_complete, notify_slack_scan_complete, notify_salesforce_scan_complete, notify_jira_scan_complete
 from ..services.salesforce_sync_service import push_compliance_to_salesforce
 from ..services.hubspot_sync_service import push_compliance_to_hubspot
@@ -37,6 +38,28 @@ def _heartbeat(scan_job_id) -> None:
     The hard limit is the 2-hour asyncio timeout in tasks.py.
     """
     pass
+
+
+def _persist_cost(scan_job_id: UUID, tracker: ScanCostTracker) -> Dict[str, Any]:
+    """Write tracker totals onto the scan_jobs row.
+
+    Best-effort: failures are logged and swallowed so a cost-write hiccup
+    can never fail an otherwise-successful scan.  Returns the summary dict
+    for callers that want to merge it into pipeline_stats.
+    """
+    summary = tracker.to_summary(include_line_items=True)
+    try:
+        supabase.table("scan_jobs").update({
+            "cost_usd": tracker.total_usd,
+            "cost_breakdown": summary,
+        }).eq("id", str(scan_job_id)).execute()
+        log.info(
+            "Scan %s cost: $%.4f (%s)",
+            scan_job_id, tracker.total_usd, tracker.by_vendor(),
+        )
+    except Exception as e:
+        log.warning("Failed to persist scan cost for %s: %s", scan_job_id, e)
+    return summary
 
 
 def _send_scan_notifications(
@@ -277,49 +300,52 @@ async def run_google_ads_scan(
     campaign_id: Optional[UUID] = None,
 ):
     """Background task — fetch ad creatives via SerpApi, then analyse."""
-    try:
-        supabase.table("scan_jobs").update({
-            "status": "running",
-            "started_at": _utc_now(),
-        }).eq("id", str(scan_job_id)).execute()
+    with scan_cost_context(str(scan_job_id)) as tracker:
+        try:
+            supabase.table("scan_jobs").update({
+                "status": "running",
+                "started_at": _utc_now(),
+            }).eq("id", str(scan_job_id)).execute()
 
-        campaign_assets = await _fetch_campaign_assets(campaign_id)
+            campaign_assets = await _fetch_campaign_assets(campaign_id)
 
-        from ..config import get_settings
-        _settings = get_settings()
+            from ..config import get_settings
+            _settings = get_settings()
 
-        if _settings.serpapi_api_key:
-            log.info("Using SerpApi for Google Ads scan")
-            discovered_count = await serpapi_service.scan_google_ads(
-                advertiser_ids, scan_job_id, distributor_mapping,
-                campaign_assets=campaign_assets,
-            )
-        else:
-            log.info("SerpApi key not set — falling back to Playwright extraction")
-            discovered_count = await extraction_service.scan_google_ads(
-                advertiser_ids, scan_job_id, distributor_mapping,
-                campaign_assets=campaign_assets,
-            )
+            if _settings.serpapi_api_key:
+                log.info("Using SerpApi for Google Ads scan")
+                discovered_count = await serpapi_service.scan_google_ads(
+                    advertiser_ids, scan_job_id, distributor_mapping,
+                    campaign_assets=campaign_assets,
+                )
+            else:
+                log.info("SerpApi key not set — falling back to Playwright extraction")
+                discovered_count = await extraction_service.scan_google_ads(
+                    advertiser_ids, scan_job_id, distributor_mapping,
+                    campaign_assets=campaign_assets,
+                )
 
-        if campaign_id and discovered_count > 0:
-            try:
-                await auto_analyze_scan(scan_job_id, campaign_id)
-            except Exception as analyze_err:
-                log.error("Google Ads auto-analysis failed (scan still completed): %s", analyze_err, exc_info=True)
+            if campaign_id and discovered_count > 0:
+                try:
+                    await auto_analyze_scan(scan_job_id, campaign_id)
+                except Exception as analyze_err:
+                    log.error("Google Ads auto-analysis failed (scan still completed): %s", analyze_err, exc_info=True)
 
-        supabase.table("scan_jobs").update({
-            "status": "completed",
-            "completed_at": _utc_now(),
-        }).eq("id", str(scan_job_id)).execute()
+            _persist_cost(scan_job_id, tracker)
+            supabase.table("scan_jobs").update({
+                "status": "completed",
+                "completed_at": _utc_now(),
+            }).eq("id", str(scan_job_id)).execute()
 
-        _send_scan_notifications(scan_job_id, scan_source="google_ads")
+            _send_scan_notifications(scan_job_id, scan_source="google_ads")
 
-    except Exception as e:
-        log.error("Google Ads scan failed: %s", e, exc_info=True)
-        supabase.table("scan_jobs").update({
-            "status": "failed",
-            "error_message": str(e),
-        }).eq("id", str(scan_job_id)).execute()
+        except Exception as e:
+            log.error("Google Ads scan failed: %s", e, exc_info=True)
+            _persist_cost(scan_job_id, tracker)
+            supabase.table("scan_jobs").update({
+                "status": "failed",
+                "error_message": str(e),
+            }).eq("id", str(scan_job_id)).execute()
 
 
 async def run_facebook_scan(
@@ -330,50 +356,53 @@ async def run_facebook_scan(
     channel: str = "facebook",
 ):
     """Background task — extract ad images from Meta Ad Library pages."""
-    try:
-        supabase.table("scan_jobs").update({
-            "status": "running",
-            "started_at": _utc_now(),
-        }).eq("id", str(scan_job_id)).execute()
+    with scan_cost_context(str(scan_job_id)) as tracker:
+        try:
+            supabase.table("scan_jobs").update({
+                "status": "running",
+                "started_at": _utc_now(),
+            }).eq("id", str(scan_job_id)).execute()
 
-        campaign_assets = await _fetch_campaign_assets(campaign_id)
+            campaign_assets = await _fetch_campaign_assets(campaign_id)
 
-        from ..config import get_settings
-        _settings = get_settings()
+            from ..config import get_settings
+            _settings = get_settings()
 
-        if _settings.apify_api_key:
-            log.info("Using Apify Meta Ads Scraper Pro for %s scan", channel)
-            discovered_count = await apify_meta_service.scan_meta_ads(
-                page_urls, scan_job_id, distributor_mapping,
-                channel=channel,
-                campaign_assets=campaign_assets,
-            )
-        else:
-            log.info("Apify key not set — falling back to Playwright extraction")
-            discovered_count = await extraction_service.scan_facebook_ads(
-                page_urls, scan_job_id, distributor_mapping,
-                campaign_assets=campaign_assets,
-            )
+            if _settings.apify_api_key:
+                log.info("Using Apify Meta Ads Scraper Pro for %s scan", channel)
+                discovered_count = await apify_meta_service.scan_meta_ads(
+                    page_urls, scan_job_id, distributor_mapping,
+                    channel=channel,
+                    campaign_assets=campaign_assets,
+                )
+            else:
+                log.info("Apify key not set — falling back to Playwright extraction")
+                discovered_count = await extraction_service.scan_facebook_ads(
+                    page_urls, scan_job_id, distributor_mapping,
+                    campaign_assets=campaign_assets,
+                )
 
-        if campaign_id and discovered_count > 0:
-            try:
-                await auto_analyze_scan(scan_job_id, campaign_id)
-            except Exception as analyze_err:
-                log.error("Facebook auto-analysis failed (scan still completed): %s", analyze_err, exc_info=True)
+            if campaign_id and discovered_count > 0:
+                try:
+                    await auto_analyze_scan(scan_job_id, campaign_id)
+                except Exception as analyze_err:
+                    log.error("Facebook auto-analysis failed (scan still completed): %s", analyze_err, exc_info=True)
 
-        supabase.table("scan_jobs").update({
-            "status": "completed",
-            "completed_at": _utc_now(),
-        }).eq("id", str(scan_job_id)).execute()
+            _persist_cost(scan_job_id, tracker)
+            supabase.table("scan_jobs").update({
+                "status": "completed",
+                "completed_at": _utc_now(),
+            }).eq("id", str(scan_job_id)).execute()
 
-        _send_scan_notifications(scan_job_id, scan_source="facebook")
+            _send_scan_notifications(scan_job_id, scan_source="facebook")
 
-    except Exception as e:
-        log.error("Facebook scan failed: %s", e, exc_info=True)
-        supabase.table("scan_jobs").update({
-            "status": "failed",
-            "error_message": str(e),
-        }).eq("id", str(scan_job_id)).execute()
+        except Exception as e:
+            log.error("Facebook scan failed: %s", e, exc_info=True)
+            _persist_cost(scan_job_id, tracker)
+            supabase.table("scan_jobs").update({
+                "status": "failed",
+                "error_message": str(e),
+            }).eq("id", str(scan_job_id)).execute()
 
 
 async def run_instagram_scan(
@@ -383,38 +412,41 @@ async def run_instagram_scan(
     campaign_id: Optional[UUID] = None,
 ):
     """Background task — extract organic post images from Instagram profiles."""
-    try:
-        supabase.table("scan_jobs").update({
-            "status": "running",
-            "started_at": _utc_now(),
-        }).eq("id", str(scan_job_id)).execute()
+    with scan_cost_context(str(scan_job_id)) as tracker:
+        try:
+            supabase.table("scan_jobs").update({
+                "status": "running",
+                "started_at": _utc_now(),
+            }).eq("id", str(scan_job_id)).execute()
 
-        campaign_assets = await _fetch_campaign_assets(campaign_id)
+            campaign_assets = await _fetch_campaign_assets(campaign_id)
 
-        discovered_count = await apify_instagram_service.scan_instagram_organic(
-            profile_urls, scan_job_id, distributor_mapping,
-            campaign_assets=campaign_assets,
-        )
+            discovered_count = await apify_instagram_service.scan_instagram_organic(
+                profile_urls, scan_job_id, distributor_mapping,
+                campaign_assets=campaign_assets,
+            )
 
-        if campaign_id and discovered_count > 0:
-            try:
-                await auto_analyze_scan(scan_job_id, campaign_id)
-            except Exception as analyze_err:
-                log.error("Instagram auto-analysis failed (scan still completed): %s", analyze_err, exc_info=True)
+            if campaign_id and discovered_count > 0:
+                try:
+                    await auto_analyze_scan(scan_job_id, campaign_id)
+                except Exception as analyze_err:
+                    log.error("Instagram auto-analysis failed (scan still completed): %s", analyze_err, exc_info=True)
 
-        supabase.table("scan_jobs").update({
-            "status": "completed",
-            "completed_at": _utc_now(),
-        }).eq("id", str(scan_job_id)).execute()
+            _persist_cost(scan_job_id, tracker)
+            supabase.table("scan_jobs").update({
+                "status": "completed",
+                "completed_at": _utc_now(),
+            }).eq("id", str(scan_job_id)).execute()
 
-        _send_scan_notifications(scan_job_id, scan_source="instagram")
+            _send_scan_notifications(scan_job_id, scan_source="instagram")
 
-    except Exception as e:
-        log.error("Instagram scan failed: %s", e, exc_info=True)
-        supabase.table("scan_jobs").update({
-            "status": "failed",
-            "error_message": str(e),
-        }).eq("id", str(scan_job_id)).execute()
+        except Exception as e:
+            log.error("Instagram scan failed: %s", e, exc_info=True)
+            _persist_cost(scan_job_id, tracker)
+            supabase.table("scan_jobs").update({
+                "status": "failed",
+                "error_message": str(e),
+            }).eq("id", str(scan_job_id)).execute()
 
 
 async def _prune_duplicate_matches(scan_job_id: UUID) -> int:
@@ -639,6 +671,8 @@ async def run_website_scan(
     log.info("Website scan started for job %s — URLs: %s, campaign: %s",
              scan_job_id, website_urls, campaign_id)
 
+    cost_ctx = scan_cost_context(str(scan_job_id))
+    tracker = cost_ctx.__enter__()
     try:
         # Mark running IMMEDIATELY so the cleanup job doesn't kill us
         # during the (potentially slow) prep phase.
@@ -906,6 +940,9 @@ async def run_website_scan(
         )
         log.info("Pipeline funnel: %s", pipeline_stats)
 
+        cost_summary = _persist_cost(scan_job_id, tracker)
+        pipeline_stats["cost"] = cost_summary
+
         supabase.table("scan_jobs").update({
             "status": "completed",
             "completed_at": _utc_now(),
@@ -919,10 +956,16 @@ async def run_website_scan(
 
     except Exception as e:
         log.error("Website scan failed: %s", e, exc_info=True)
+        try:
+            _persist_cost(scan_job_id, tracker)
+        except Exception:
+            pass
         supabase.table("scan_jobs").update({
             "status": "failed",
             "error_message": str(e),
         }).eq("id", str(scan_job_id)).execute()
+    finally:
+        cost_ctx.__exit__(None, None, None)
 
 
 async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
@@ -1359,6 +1402,14 @@ async def run_image_analysis(
         job_id = discovered_images[0].get("scan_job_id")
 
     if job_id:
+        from ..services import cost_tracker as _ct
+        active_tracker = _ct.get_tracker()
+        if active_tracker is not None:
+            try:
+                pipeline_stats["cost"] = active_tracker.to_summary(include_line_items=False)
+            except Exception:
+                pass
+
         log.info("Updating scan job %s with matches_count=%d (new=%d, confirmed=%d)",
                  job_id, total_matches,
                  pipeline_stats["matched_new"], pipeline_stats["matched_confirmed"])

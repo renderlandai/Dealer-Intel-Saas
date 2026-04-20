@@ -59,6 +59,11 @@ async def _fetch_ad_creatives(
 
             resp = await client.get(SERPAPI_ENDPOINT, params=params)
             resp.raise_for_status()
+            try:
+                from . import cost_tracker
+                cost_tracker.record_serpapi(requests=1, advertiser_id=advertiser_id)
+            except Exception as cost_err:
+                log.debug("Cost capture skipped (serpapi): %s", cost_err)
             data = resp.json()
 
             creatives = data.get("ad_creatives", [])

@@ -17,6 +17,7 @@ import {
   ChevronUp,
   BarChart3,
   Layers,
+  DollarSign,
 } from "lucide-react";
 import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
@@ -25,6 +26,23 @@ import { Badge } from "@/components/ui/badge";
 import { useScanJobs, useCampaigns, useDeleteScan, useDeleteAllScans, useRetryScan, useBatchScan, useBillingUsage } from "@/lib/hooks";
 import { useQueryClient } from "@tanstack/react-query";
 import { formatDateTime } from "@/lib/utils";
+
+interface CostLineItem {
+  vendor: string;
+  op: string;
+  units: number;
+  unit: string;
+  unit_cost_usd: number;
+  cost_usd: number;
+  meta?: Record<string, any>;
+}
+
+interface CostSummary {
+  total_usd: number;
+  by_vendor: Record<string, number>;
+  line_items?: CostLineItem[];
+  line_item_count?: number;
+}
 
 interface PipelineStats {
   total_images: number;
@@ -45,6 +63,7 @@ interface PipelineStats {
   early_stopped?: boolean;
   cache_hit?: boolean;
   cached_pages_used?: number;
+  cost?: CostSummary;
   // Legacy fields for backward compat with older scans
   matched?: number;
   duplicates_skipped?: number;
@@ -62,6 +81,8 @@ interface ScanJob {
   matches_count: number;
   error_message: string | null;
   pipeline_stats: PipelineStats | null;
+  cost_usd: number | null;
+  cost_breakdown: CostSummary | null;
   organization_id: string;
   apify_run_id: string | null;
   created_at: string;
@@ -72,6 +93,187 @@ interface Campaign {
   name: string;
   status: string;
   asset_count: number;
+}
+
+function formatCost(usd: number | null | undefined): string {
+  if (usd == null || isNaN(Number(usd))) return "—";
+  const n = Number(usd);
+  if (n === 0) return "$0.00";
+  if (n < 0.01) return `$${n.toFixed(4)}`;
+  if (n < 1) return `$${n.toFixed(3)}`;
+  return `$${n.toFixed(2)}`;
+}
+
+const VENDOR_LABELS: Record<string, string> = {
+  anthropic: "Claude (Anthropic)",
+  apify: "Apify",
+  serpapi: "SerpApi",
+  screenshotone: "ScreenshotOne",
+};
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
+interface AnthropicCacheStats {
+  call_count: number;
+  cached_call_count: number;
+  uncached_input_tokens: number;
+  cache_creation_tokens: number;
+  cache_read_tokens: number;
+  output_tokens: number;
+  cache_write_cost_usd: number;
+  cache_read_cost_usd: number;
+  /** What we'd have paid in input tokens if no caching was active. */
+  no_cache_input_cost_usd: number;
+  /** What we did pay for input (uncached + write + read at their multipliers). */
+  actual_input_cost_usd: number;
+  /** Total tokens that participated in the cache (creation + reads). */
+  cacheable_token_volume: number;
+}
+
+function summarizeAnthropicCache(items: CostLineItem[]): AnthropicCacheStats | null {
+  const anthropic = items.filter((li) => li.vendor === "anthropic");
+  if (anthropic.length === 0) return null;
+
+  let uncached_input_tokens = 0;
+  let cache_creation_tokens = 0;
+  let cache_read_tokens = 0;
+  let output_tokens = 0;
+  let cache_write_cost_usd = 0;
+  let cache_read_cost_usd = 0;
+  let no_cache_input_cost_usd = 0;
+  let actual_input_cost_usd = 0;
+  let cached_call_count = 0;
+
+  for (const li of anthropic) {
+    const m = li.meta || {};
+    const u = Number(m.input_tokens || 0);
+    const cw = Number(m.cache_creation_tokens || 0);
+    const cr = Number(m.cache_read_tokens || 0);
+    const out = Number(m.output_tokens || 0);
+    const inputRate = Number(m.rate_input_per_mtok || 0);
+    const inCost = Number(m.input_cost_usd || 0);
+    const writeCost = Number(m.cache_write_cost_usd || 0);
+    const readCost = Number(m.cache_read_cost_usd || 0);
+
+    uncached_input_tokens += u;
+    cache_creation_tokens += cw;
+    cache_read_tokens += cr;
+    output_tokens += out;
+    cache_write_cost_usd += writeCost;
+    cache_read_cost_usd += readCost;
+    actual_input_cost_usd += inCost + writeCost + readCost;
+
+    // Hypothetical cost if every token had been billed at the regular input rate
+    // (i.e. caching had been disabled).
+    const totalInputTokens = u + cw + cr;
+    no_cache_input_cost_usd += (totalInputTokens / 1_000_000) * inputRate;
+
+    if (cr > 0) cached_call_count += 1;
+  }
+
+  return {
+    call_count: anthropic.length,
+    cached_call_count,
+    uncached_input_tokens,
+    cache_creation_tokens,
+    cache_read_tokens,
+    output_tokens,
+    cache_write_cost_usd,
+    cache_read_cost_usd,
+    no_cache_input_cost_usd,
+    actual_input_cost_usd,
+    cacheable_token_volume: cache_creation_tokens + cache_read_tokens,
+  };
+}
+
+function CacheStatsBar({ stats }: { stats: AnthropicCacheStats }) {
+  const { cache_read_tokens, cache_creation_tokens, uncached_input_tokens, call_count, cached_call_count } = stats;
+  const total_input = uncached_input_tokens + cache_creation_tokens + cache_read_tokens;
+
+  // Hit rate by tokens (not by calls) — this is the true measure of cache effectiveness.
+  const hit_rate_tokens = total_input > 0 ? (cache_read_tokens / total_input) * 100 : 0;
+  const hit_rate_calls = call_count > 0 ? (cached_call_count / call_count) * 100 : 0;
+
+  const savings = stats.no_cache_input_cost_usd - stats.actual_input_cost_usd;
+  const savings_pct = stats.no_cache_input_cost_usd > 0
+    ? (savings / stats.no_cache_input_cost_usd) * 100
+    : 0;
+
+  // Detect the "caching is configured but not yet warm" case so we can show a
+  // helpful hint instead of just zeroes.
+  const cache_active = cache_creation_tokens > 0 || cache_read_tokens > 0;
+
+  return (
+    <div className="mt-2 pt-2 border-t border-border/20 text-xs">
+      <div className="flex items-center justify-between mb-1.5 text-muted-foreground">
+        <span className="font-medium">Anthropic prompt cache</span>
+        {cache_active ? (
+          <span className="font-mono tabular-nums text-emerald-400">
+            saved {formatCost(savings)} ({savings_pct.toFixed(0)}% of input)
+          </span>
+        ) : (
+          <span className="text-muted-foreground/70 italic">no cache hits yet</span>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Hit rate (tokens)</span>
+          <span className="font-mono tabular-nums">{hit_rate_tokens.toFixed(1)}%</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Hit rate (calls)</span>
+          <span className="font-mono tabular-nums">
+            {cached_call_count}/{call_count} ({hit_rate_calls.toFixed(0)}%)
+          </span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Cache reads</span>
+          <span className="font-mono tabular-nums text-emerald-400">{formatTokens(cache_read_tokens)} tok</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Cache writes</span>
+          <span className="font-mono tabular-nums text-amber-400">{formatTokens(cache_creation_tokens)} tok</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Uncached input</span>
+          <span className="font-mono tabular-nums">{formatTokens(uncached_input_tokens)} tok</span>
+        </div>
+        <div className="flex justify-between">
+          <span className="text-muted-foreground">Output</span>
+          <span className="font-mono tabular-nums">{formatTokens(stats.output_tokens)} tok</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CostBreakdown({ cost }: { cost: CostSummary }) {
+  const vendors = Object.entries(cost.by_vendor || {}).sort((a, b) => b[1] - a[1]);
+  if (vendors.length === 0) return null;
+
+  const cacheStats = cost.line_items ? summarizeAnthropicCache(cost.line_items) : null;
+
+  return (
+    <div className="mt-2 pt-2 border-t border-border/30 text-xs">
+      <div className="flex items-center gap-2 mb-1.5 text-muted-foreground">
+        <DollarSign className="h-3 w-3" />
+        <span className="font-medium">Cost breakdown — total {formatCost(cost.total_usd)}</span>
+      </div>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+        {vendors.map(([vendor, amount]) => (
+          <div key={vendor} className="flex justify-between">
+            <span className="text-muted-foreground">{VENDOR_LABELS[vendor] || vendor}</span>
+            <span className="font-mono tabular-nums">{formatCost(amount)}</span>
+          </div>
+        ))}
+      </div>
+      {cacheStats && cacheStats.call_count > 0 && <CacheStatsBar stats={cacheStats} />}
+    </div>
+  );
 }
 
 function PipelineFunnel({ stats }: { stats: PipelineStats }) {
@@ -139,6 +341,7 @@ function PipelineFunnel({ stats }: { stats: PipelineStats }) {
           <span>{stats.image_cache.cached_mb} MB cached</span>
         </div>
       )}
+      {stats.cost && <CostBreakdown cost={stats.cost} />}
     </div>
   );
 }
@@ -383,6 +586,15 @@ export default function ScansPage() {
                     </div>
 
                     <div className="flex items-center gap-4">
+                      {Number(job.cost_usd ?? 0) > 0 && (
+                        <div className="text-right">
+                          <div className="flex items-center justify-end gap-1 text-sm font-medium text-emerald-400">
+                            <DollarSign className="h-3.5 w-3.5" />
+                            <span className="font-mono tabular-nums">{formatCost(job.cost_usd)}</span>
+                          </div>
+                          <p className="text-xs text-muted-foreground">scan cost</p>
+                        </div>
+                      )}
                       <div className="text-right">
                         <p className="text-sm font-medium">
                           {job.matches_count ?? 0} matches found
@@ -459,14 +671,14 @@ export default function ScansPage() {
                     </div>
                   )}
 
-                  {job.pipeline_stats && (
+                  {(job.pipeline_stats || job.cost_breakdown) && (
                     <div className="mt-3">
                       <button
                         onClick={() => toggleExpanded(job.id)}
                         className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
                       >
                         <BarChart3 className="h-3.5 w-3.5" />
-                        Pipeline Funnel
+                        {job.pipeline_stats ? "Pipeline Funnel & Cost" : "Cost Breakdown"}
                         {expandedJobs.has(job.id) ? (
                           <ChevronUp className="h-3 w-3" />
                         ) : (
@@ -475,7 +687,18 @@ export default function ScansPage() {
                       </button>
 
                       {expandedJobs.has(job.id) && (
-                        <PipelineFunnel stats={job.pipeline_stats} />
+                        job.pipeline_stats ? (
+                          <PipelineFunnel
+                            stats={{
+                              ...job.pipeline_stats,
+                              cost: job.pipeline_stats.cost ?? job.cost_breakdown ?? undefined,
+                            }}
+                          />
+                        ) : job.cost_breakdown ? (
+                          <div className="mt-3 p-3 rounded-lg bg-muted/50 border border-border/50">
+                            <CostBreakdown cost={job.cost_breakdown} />
+                          </div>
+                        ) : null
                       )}
                     </div>
                   )}

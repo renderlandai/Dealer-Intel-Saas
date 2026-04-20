@@ -57,6 +57,11 @@ async def capture_screenshot(target_url: str, **overrides) -> bytes:
     async with httpx.AsyncClient(timeout=90.0) as client:
         response = await client.get(SCREENSHOTONE_BASE, params=params)
         response.raise_for_status()
+        try:
+            from . import cost_tracker
+            cost_tracker.record_screenshotone(renders=1, target=target_url)
+        except Exception as cost_err:
+            log.debug("Cost capture skipped (screenshotone): %s", cost_err)
         return response.content
 
 

@@ -374,6 +374,17 @@ async def scan_meta_ads(
     ads = await _fetch_dataset_items(dataset_id)
     log.info("Apify returned %d ad item(s)", len(ads))
 
+    try:
+        from . import cost_tracker
+        cost_tracker.record_apify_run(
+            actor_or_task=ACTOR_ID,
+            run_id=run_id,
+            usage_total_usd=completed_run.get("usageTotalUsd"),
+            items_returned=len(ads),
+        )
+    except Exception as cost_err:
+        log.debug("Cost capture skipped (apify meta): %s", cost_err)
+
     # Log raw payload keys for debugging (first ad only)
     if ads:
         sample = ads[0]

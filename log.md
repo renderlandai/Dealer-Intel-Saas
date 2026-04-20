@@ -2512,3 +2512,616 @@ TARGET (150+ dealers)
 | File | Change |
 |------|--------|
 | `backend/app/services/ai_service.py` | Updated `CLAUDE_MODEL` and `ENSEMBLE_MODEL` from `claude-opus-4-20250514` to `claude-opus-4-6` (67% cost reduction, better model) |
+
+---
+
+## 2026-04-13 — Dashboard Data Fix, Scan Investigation & Pilot Readiness
+
+### Summary
+
+Fixed the dashboard to show all matches (including those with NULL distributor_id), investigated a slow website scan, audited the AI pipeline model usage across all stages, identified prompt caching as a major post-pilot optimization, assessed pilot readiness for the demo, and verified per-org data isolation.
+
+### Changes
+
+**Backend**
+
+- **Dashboard stats fallback** — `_get_dashboard_stats_fallback` now builds an `or_` filter combining `distributor_id.in.(...)` and `asset_id.in.(...)`, so total_matches, compliance_rate, violations_count, and matches_today all include matches where distributor_id is NULL. (`dashboard.py`)
+- **Recent matches endpoint** — `get_recent_matches` replaced `.in_("distributor_id", ...)` with the same `or_` clause so dashboard recent matches card shows all org matches. (`dashboard.py`)
+- **Coverage by channel endpoint** — `get_coverage_by_channel` uses the same `or_` filter and now returns `match_count` instead of `count` to align with the frontend field name. (`dashboard.py`)
+
+**Frontend**
+
+- **ChannelChart mapping** — Fixed `page.tsx` to read `c.match_count` instead of `c.count` from the coverage-by-channel API response, so the Coverage by Channel bar chart and Asset Coverage card display correct numbers. (`page.tsx`)
+
+### Investigation: Website Scan Slowness
+
+Investigated a website scan (job `9f82a6a1`) that appeared stuck. Findings:
+
+- **Not stuck — just slow.** The worker process (pid 47522) was alive with 327MB memory and active CPU usage.
+- **Progress:** 181 discovered images, 166 processed, 15 remaining across 15 pages on `yanceybros.com`.
+- **Root cause:** Every image that passes the hash pre-filter triggers multiple Opus 4.6 API calls. For a single image that passes Stage 3, worst case is 5 Opus calls (1 filter + 3 assets × 1 comparison + 1 compliance).
+- **Scan completed successfully** — status moved to `completed` after ~49 minutes.
+- **Cleanup safety net:** `_cleanup_stale_scans` auto-fails scans after 60 minutes; hard timeout is 7,200 seconds (2 hours).
+
+### AI Pipeline Model Audit
+
+| Stage | Purpose | Model | Speed |
+|-------|---------|-------|-------|
+| Stage 1 | Hash pre-filter (pHash, dHash, wHash, average) | No AI model | Instant |
+| Stage 2 | CLIP embedding pre-filter | Not installed (`sentence_transformers` missing) | Skipped |
+| Stage 3 | Relevance filter (is image campaign-related?) | `claude-haiku-4-5-20251001` | Fast/cheap |
+| Stage 4 | Ensemble match — `compare_images` | `claude-opus-4-6` | Slow/expensive |
+| Stage 4 | Ensemble match — `compare_with_hash` | No AI model (perceptual hashing) | Instant |
+| Verification | Borderline match verification | `claude-opus-4-6` | Slow/expensive |
+| Calibration | Confidence score adjustment | No AI model (math from feedback) | Instant |
+| Compliance | Deep compliance analysis | `claude-opus-4-6` | Slow/expensive |
+
+### Prompt Caching Opportunity (Post-Pilot)
+
+Identified that **prompt caching is not implemented**. Every call to `call_anthropic_with_retry` sends the full system prompt + asset images with no `cache_control` markers. The same 3 campaign assets are re-uploaded on every comparison call — potentially dozens of times per scan. Adding Anthropic prompt caching (`cache_control: {"type": "ephemeral"}`) on system prompts and asset images would:
+
+- Reduce input token costs by ~80-90%
+- Lower per-call latency (cached prefix skips full processing)
+- Cache has 5-minute TTL — calls during a scan easily stay within window
+
+Deferred to post-pilot to avoid risking changes before demo.
+
+### Pilot Readiness Assessment
+
+**Working:**
+- All 4 scan channels completing (Website, Facebook, Instagram, Google Ads)
+- 43 matches found across channels (29 website, 8 Facebook, 4 Instagram, 2 Google Ads)
+- Dashboard, campaigns, matches, alerts, compliance rules, billing, team management, onboarding all functional
+- 5 third-party integrations built (Slack, Salesforce, HubSpot, Dropbox, Jira)
+
+**Cautions for demo:**
+- Website scans take 20-40+ minutes — pre-run before demo, don't trigger live
+- "Scan All Channels" not fully tested — avoid during demo
+- 7 matches show "Unknown" distributor (NULL distributor_id from before mapping fix)
+- Google Ads fails gracefully when distributors lack Advertiser IDs
+
+**Data isolation verified:** Each user's org sees only its own data. New signups get an empty org via auto-provisioning. Pilot client won't see test data.
+
+### Known Issues / TODO
+
+- **Prompt caching** — Major cost/speed optimization, implement post-pilot
+- **CLIP pre-filter disabled** — `sentence_transformers` not installed, more images leak to expensive Opus stages
+- **Base64 asset storage** — Assets stored as data URLs instead of Supabase Storage, bloats API payloads
+- **Old NULL distributor matches** — 7 existing matches won't self-heal; need re-scan or backfill
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `backend/app/routers/dashboard.py` | Fixed 3 endpoints (stats fallback, recent matches, coverage-by-channel) to include NULL distributor_id matches via `or_` filter; changed response field `count` → `match_count` |
+| `frontend/app/page.tsx` | Fixed ChannelChart mapping to read `match_count` instead of `count` |
+
+---
+
+## 2026-04-14 — 150-Dealer Cost-Per-Scan Analysis
+
+### Summary
+
+Deep cost analysis session for a prospective client with 150 dealers. Audited the full scan pipeline end-to-end — every external API call, every Anthropic model invocation, infrastructure costs — to produce a per-scan and per-dealer cost model. Also investigated why CLIP is disabled in production.
+
+### Cost-Per-Scan Model (150 Dealers, All 4 Channels)
+
+#### Image Volume Estimates
+
+| Channel | Per Dealer | Total (150 dealers) | Source |
+|---------|-----------|-------------------|--------|
+| Website | ~225 (15 pages × 15 imgs) | ~33,750 | Playwright extraction |
+| Google Ads | ~20 creatives | ~3,000 | SerpApi |
+| Facebook | ~10 ad images | ~1,500 | Apify Meta actor |
+| Instagram | ~20 post images | ~3,000 | Apify Instagram task |
+| **Total** | | **~41,250** | |
+
+Early stopping + page caching on repeat scans reduces website volume significantly (~94% reduction observed in prior tests). Realistic repeat scan total: ~15,000–20,000 images.
+
+#### Per-Image AI Pipeline Cost
+
+| Stage | Model | Cost/Call | Notes |
+|-------|-------|----------|-------|
+| Stage 1: Hash pre-filter | None | Free | <1ms, ~60–70% rejection rate (hash-only) |
+| Stage 2: CLIP embedding | None | **Skipped** | `sentence_transformers` not installed |
+| Stage 3: Haiku filter | `claude-haiku-4-5-20251001` | ~$0.007 | ~3,000 input + ~200 output tokens |
+| Stage 4: Opus comparison | `claude-opus-4-6` | ~$0.031 | Per asset — runs N times (1 per campaign asset) |
+| Verification | `claude-opus-4-6` | ~$0.031 | Borderline scores 60–80 only |
+| Compliance | `claude-opus-4-6` | ~$0.039 | Matched images only |
+
+Worst case per image surviving hash: 1 Haiku + N Opus (1 per asset) + 1 Opus compliance = up to 5 calls with 3 assets.
+
+#### Total Cost Per Scan
+
+| Component | Current (Opus 4.6, no CLIP) | Fully Optimized |
+|-----------|---------------------------|-----------------|
+| Anthropic Claude | ~$432 | ~$100–150 |
+| SerpApi | ~$19–38 | ~$19–38 |
+| Apify (Meta + IG) | ~$7–12 | ~$7–12 |
+| Infrastructure (DO + Supabase + Vercel) | ~$34–46 | ~$34–46 |
+| **Total per scan** | **~$492–528** | **~$160–246** |
+| **Per dealer per scan** | **$3.28–3.52** | **$1.07–1.64** |
+
+#### Monthly Cost (Weekly Scans)
+
+| | Current | Fully Optimized |
+|---|---------|-----------------|
+| Monthly total | ~$1,968–2,112 | ~$640–984 |
+| Per dealer per month | ~$13.12–14.08 | ~$4.27–6.56 |
+
+Anthropic is ~85% of the total bill. Every optimization that reduces Opus calls has outsized impact.
+
+### CLIP Pre-Filter Investigation
+
+Investigated why Stage 2 (CLIP embedding gate) is disabled in production:
+
+1. **`sentence-transformers` is not in `requirements.txt`** — listed in the March 18 architecture review as added but not present in the current requirements file. Never gets installed in production.
+2. **Graceful degradation** — `embedding_service.py` uses lazy-load with `try/except ImportError`. When `sentence_transformers` is missing, it logs a warning and every `compute_embedding()` call returns `None`. The pipeline's CLIP gate silently skips Stage 2.
+3. **Root cause: memory pressure** — The CLIP model (`clip-ViT-B-32`) requires ~200MB RAM. Current production instance is 2GB. Memory budget is already tight: Chromium (~250MB) + image cache (~200MB) + Python baseline (~100MB) = ~550MB before scan work. Adding CLIP would push toward OOM under load.
+4. **Resolution path** — In the target Phase 2 architecture, CLIP moves to dedicated 4GB worker instances alongside Playwright, where there's room for both. Re-enabling CLIP would reject an additional ~20–30% of images before they reach paid API calls, cutting Anthropic costs by an estimated 30–50%.
+
+### Optimization Priority Recap
+
+From the Phase 1 roadmap (2026-04-10), the 5 uncommitted optimizations that would drop monthly COG from ~$2,050 to ~$750–1,050:
+
+| # | Optimization | Anthropic Impact | Status |
+|---|-------------|-----------------|--------|
+| 1.2 | Sonnet 4 for ensemble (keep Opus for compliance only) | ~40% reduction on ensemble calls | Not started |
+| 1.3 | CLIP-based asset preselection (top 2–3 assets per image) | Cuts Opus calls 50–70% | Not started (blocked by memory) |
+| 1.4 | Anthropic Batch API | 50% off all tokens | Not started |
+| 1.5 | Prompt caching (`cache_control: ephemeral`) | 80–90% off cached input tokens | Not started |
+| 1.6 | Cross-dealer image deduplication | Analyze once, attribute to all | Not started |
+
+### Plan Limits Note
+
+Current `PLAN_LIMITS` in `config.py` caps the Business tier at 100 dealers (`max_dealers: 100`). A 150-dealer client requires the Enterprise tier (`max_dealers: None`) or a plan limit increase.
+
+---
+
+## 2026-04-14 (Tuesday) — Critical Performance Fix: Base64 Image Bloat
+
+### Summary
+
+Diagnosed and fixed a critical performance regression where all list API endpoints (`/matches`, `/dashboard/recent-matches`) had degraded from sub-second to 20+ seconds. Root cause was base64-encoded asset images (~3.5 MB each) being pulled through PostgREST joins and the `recent_matches` view, inflating JSON payloads to 36–48 MB per request.
+
+### Root Cause Analysis
+
+The `assets.file_url` column stores full PNG images as inline `data:image/png;base64,...` strings averaging 3.5 MB each. Two query paths were pulling this data into every list response:
+
+1. **`recent_matches` SQL view** — Joins `assets` and includes `file_url` as `asset_url` in every row. The view materializes the full `SELECT m.*` (including `ai_analysis` JSON) before PostgREST applies column filtering. With 42 matches across 37 assets, the view produced ~39 MB of raw data.
+2. **PostgREST foreign key joins** — `assets(name, file_url, campaigns(name))` pulled `file_url` into the join result. Even with explicit column selection on the `matches` table, the joined `file_url` added ~48 MB to the response.
+
+The `recent_matches` view compounded the problem: it runs `ROW_NUMBER() OVER (PARTITION BY ...)` with 4 LEFT JOINs on the entire matches table, materializing all columns including the heavy ones, before PostgREST can filter.
+
+### Performance Results
+
+| Endpoint | Before Fix | After (cold) | After (warm) |
+|---|---|---|---|
+| `/matches?limit=50` | 20,058 ms / 41 KB | 692 ms / 41 KB | 342 ms |
+| `/dashboard/recent-matches?limit=6` | 5,153 ms / 6.9 KB | 322 ms / 5 KB | 217 ms |
+| `/matches/stats` | 405 ms | 399 ms | 258 ms |
+| `/dashboard/stats` | 653 ms | 982 ms | 267 ms |
+| **Total (all endpoints)** | **28,619 ms** | **4,387 ms** | **2,303 ms** |
+
+Cold load improved **6.5x**, warm load improved **12.4x**.
+
+### Changes Made
+
+#### Backend — Query Optimization
+
+**`backend/app/routers/matches.py`**
+- Switched `list_matches` from `recent_matches` view to direct `matches` table query
+- Joins only lightweight name columns: `assets(name, campaigns(name)), distributors(name)` — no `file_url`
+- Added `_flatten_match_rows()` to transform nested PostgREST join responses into the flat shape the frontend expects
+- `_strip_base64_urls()` nulls out any remaining `data:` URLs in `screenshot_url` fields
+- `get_match_stats` still uses TTLCache (60s) and attempts `get_match_stats_for_org` RPC first
+
+**`backend/app/routers/dashboard.py`**
+- Switched `/dashboard/recent-matches` from `recent_matches` view to direct `matches` table query with name-only joins
+- Added `_flatten_dashboard_matches()` for response shaping
+- Cache still active via `_dashboard_cache` TTLCache (60s)
+
+**`backend/app/routers/campaigns.py`**
+- Added `GET /campaigns/assets/{asset_id}/thumbnail` endpoint
+- Decodes base64 `file_url` and returns raw image bytes with `Content-Type` and `Cache-Control: public, max-age=86400`
+- Auth-protected — requires valid JWT via `get_current_user`
+- Keeps image serving separate from JSON API responses
+
+#### Frontend — Lazy Thumbnail Loading
+
+**`frontend/components/asset-thumbnail.tsx`** (new)
+- Reusable `AssetThumbnail` component
+- Fetches thumbnail via `api.get()` (auto-attaches JWT via axios interceptor) with `responseType: "blob"`
+- In-memory `Map<string, string>` cache of blob URLs — each asset image fetched only once per session
+- Shows `ImageIcon` placeholder while loading or on failure
+
+**`frontend/app/matches/page.tsx`**
+- Replaced inline `<Image src={match.asset_url}>` with `<AssetThumbnail assetId={match.asset_id}>`
+- Asset images now load independently per-row, don't block the table render
+
+**`frontend/components/dashboard/recent-matches.tsx`**
+- Same change — uses `AssetThumbnail` for dashboard match thumbnails
+- Removed unused `next/image` import
+
+#### Database — Match Stats RPC
+
+**`supabase/migrations/020_match_stats_rpc.sql`**
+- New `get_match_stats_for_org(p_org_id UUID)` RPC function
+- Single SQL round-trip for all match statistics (total, compliant, violations, pending, by type, avg confidence, compliance rate)
+- Scopes matches via `distributor_id IN (org distributors) OR asset_id IN (org assets)` — consistent with dashboard RPC
+- Pending deployment to Supabase SQL Editor
+
+### Architecture Decision: Why Not the View?
+
+The `recent_matches` view was designed for deduplication (ROW_NUMBER partitioned by asset+distributor). However:
+
+1. **PostgreSQL materializes the full CTE** before PostgREST column filtering — so even selecting 5 columns still processes all columns including 3.5 MB `file_url` per row
+2. **The view joins 4 tables** (`assets`, `distributors`, `campaigns`, `discovered_images`) with window functions across all rows — expensive even with indexes
+3. **Direct table queries with PostgREST foreign key joins** are dramatically faster because PostgreSQL can push down LIMIT and column selection before joining
+
+For list endpoints, direct queries are preferred. The view can still be used for single-row lookups (match detail page) where full data is needed.
+
+### Known Issues / TODO
+
+- **`thumbnail_url` column is NULL for all assets** — The `assets` table has a `thumbnail_url` column that's never populated. Generating and storing actual thumbnails (resized to ~200px) would eliminate the need for the `/thumbnail` endpoint to decode full-size base64 on every request.
+- **`020_match_stats_rpc.sql` needs manual deployment** — Must be run in Supabase SQL Editor if CI doesn't auto-push migrations.
+- **Base64 asset storage remains the root issue** — Assets should be migrated to Supabase Storage with proper URLs instead of inline `data:` URIs. This would make all queries fast by default without special handling.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `backend/app/routers/matches.py` | Switch from `recent_matches` view to direct `matches` table; add `_flatten_match_rows()`, `_strip_base64_urls()` |
+| `backend/app/routers/dashboard.py` | Switch recent-matches from view to direct table; add `_flatten_dashboard_matches()` |
+| `backend/app/routers/campaigns.py` | Add `GET /assets/{id}/thumbnail` endpoint serving raw image bytes |
+| `backend/app/main.py` | Request timing middleware (added earlier in session) |
+| `frontend/components/asset-thumbnail.tsx` | New `AssetThumbnail` component with auth-aware lazy loading and blob URL cache |
+| `frontend/app/matches/page.tsx` | Use `AssetThumbnail` for match comparison images |
+| `frontend/components/dashboard/recent-matches.tsx` | Use `AssetThumbnail` for dashboard thumbnails |
+| `supabase/migrations/020_match_stats_rpc.sql` | New `get_match_stats_for_org` RPC function |
+
+---
+
+## 2026-04-20 (Monday) — Opus 4.7 Upgrade + Anthropic Prompt Caching (Phase 1.1)
+
+### Summary
+
+First execution of the 6-week 150-dealer scaling plan. Upgraded all Opus calls from `claude-opus-4-6` → `claude-opus-4-7` (released 2026-04-16, same $5/$25 per-MTok pricing, improved vision and instruction-following) and implemented Anthropic ephemeral prompt caching across the 5 highest-leverage call sites in the AI pipeline. Also fixed a pre-existing pricing bug in `cost_tracker.py` where Opus 4.x was billed at $15/$75 (legacy Opus 4 pricing) instead of the correct $5/$25.
+
+### Why Caching Matters Here
+
+Within a single scan, the same 1–10 campaign asset images are sent to Claude alongside dozens-to-hundreds of different discovered images. Without caching, every single call re-uploads and re-processes the asset images (~1500–2000 vision tokens each). With ephemeral prompt caching, the asset prefix is processed once and reused for every subsequent call within a 5-minute window:
+
+- **Cache write:** 1.25x base input rate (small one-time premium)
+- **Cache read:** 0.10x base input rate (90% discount)
+- **TTL:** 5 minutes — easily within a single scan's analysis loop
+
+Effect on Opus 4.7 input pricing: cached prefix tokens drop from $5/MTok → $0.50/MTok on every call after the first.
+
+### Changes
+
+**Backend — Model upgrade**
+
+- `backend/app/services/ai_service.py` — `CLAUDE_MODEL` and `ENSEMBLE_MODEL` updated from `claude-opus-4-6` to `claude-opus-4-7`. `FILTER_MODEL` (Haiku 4.5) unchanged.
+
+**Backend — Prompt caching infrastructure**
+
+- `backend/app/services/ai_service.py::call_anthropic_with_retry` — Added `cache_prefix_images: int = 0` keyword argument. When > 0, the first N images get marked as a cacheable prefix via `cache_control: {"type": "ephemeral"}` on the last cacheable block. The text prompt naturally caches as part of the prefix. Default 0 = legacy behavior (no caching), so the change is fully backward compatible. Captures `cache_creation_input_tokens` and `cache_read_input_tokens` from `response.usage` and forwards to the cost tracker.
+
+**Backend — Caching enabled at 5 high-leverage call sites**
+
+| Function | Cache config | Why |
+|----------|--------------|-----|
+| `filter_image` (Haiku) | `cache_prefix_images=len(asset_images)` when asset-aware | 100s of repeated calls per scan, same N assets every time |
+| `_detect_asset_single` (Opus) | `cache_prefix_images=1` | Asset constant across many screenshot detections |
+| `_detect_asset_tiled` (Opus) | `cache_prefix_images=1` | Inner loop fires 5+ tile calls with the same asset — biggest single win |
+| `verify_borderline_match` (Opus) | `cache_prefix_images=1` | Same campaign asset reused across borderline verifications |
+| `analyze_compliance` (Opus) | `cache_prefix_images=1` | Same asset across compliance checks within a campaign |
+
+Skipped: `compare_images` (both images vary call-to-call, no cache benefit) and `localize_assets_in_screenshot` (asset varies in the loop; would require prompt rewrite to flip image order — deferred).
+
+**Backend — Cost tracker**
+
+- `backend/app/services/cost_tracker.py` — Added `claude-opus-4-7` to pricing table at $5/$25 per MTok. **Fixed pre-existing bug**: Opus 4.6 and 4.5 were incorrectly listed at $15/$75 (the original Opus 4 price) — now corrected to $5/$25 to match Anthropic's published pricing and the user-facing cost numbers in `log.md`. Legacy `claude-opus-4` retained at $15/$75 for historical scan records.
+- Added `ANTHROPIC_CACHE_WRITE_MULTIPLIER = 1.25` and `ANTHROPIC_CACHE_READ_MULTIPLIER = 0.10` constants for ephemeral 5-min cache pricing.
+- `record_anthropic` extended with `cache_creation_tokens` and `cache_read_tokens` parameters. Computes `cache_write_cost`, `cache_read_cost`, and regular `in_cost` independently. Stores all three in line-item `meta` so the existing pipeline funnel UI can show cache hit-rate per operation.
+
+### Smoke-Test Results
+
+Synthetic scenario validating the cost math (`venv/bin/python` smoke test):
+
+```
+Call 1 (cache write): 10,000 input + 5,000 cache_write + 200 output → $0.086250
+Call 2 (cache read):     500 input + 5,000 cache_read  + 200 output → $0.010000
+Equivalent no-cache (5,500 input + 200 output)                       → $0.032500
+Cache savings on call 2: 69.2%
+```
+
+The 69% saving on call 2 closely matches the theoretical 90% discount on the cached portion (the remaining cost is the 500 uncached input tokens + 200 output tokens at full rate). At realistic scan scale where 100+ calls hit the same cached prefix, effective savings on input tokens approach 88–90%.
+
+### Backward Compatibility
+
+The `call_anthropic_with_retry` refactor is fully backward compatible. All existing callers that don't pass `cache_prefix_images` continue to work unchanged with no caching applied. No breaking changes to the public function signature.
+
+### Eval Required Before Production
+
+Per the 6-week plan's stop-ship gate, the eval harness (Phase 1.8) must run before this hits production to confirm zero false-negative drift on the known-positive holdout set. The cache changes themselves should not affect model output — `cache_control` is invisible to the model, only changes how Anthropic processes the prefix server-side. But the model upgrade Opus 4.6 → 4.7 is a behavioral change that needs validation:
+
+- Anthropic notes "improved instruction-following behavior that interprets instructions more literally" in 4.7 — could affect strict JSON adherence (positive) but could also reject borderline cases the older model tolerated (potential recall risk on borderline matches).
+- Vision improvements (3x larger image support) are pure upside for our use case.
+
+### Expected Cost Impact
+
+For a single scan that previously made 100 Opus calls each carrying ~3,000 token asset prefix:
+
+- **Before:** 100 × 3,000 × $5/MTok = $1.50 on asset prefix alone
+- **After:**  1 × 3,000 × $5/MTok × 1.25 (write) + 99 × 3,000 × $5/MTok × 0.10 (read) = $0.019 + $0.149 = **$0.17**
+- **Savings:** ~$1.33 per scan on prefix tokens, or **~89% reduction on the cached portion**.
+
+Stacks multiplicatively with the remaining Phase 1 levers (CLIP preselection, dedup, Batch API).
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `backend/app/services/ai_service.py` | Model constants → Opus 4.7; `call_anthropic_with_retry` accepts `cache_prefix_images`; cache_control marker on last cacheable image; usage capture extended for cache tokens; 5 call sites enabled (`filter_image`, `_detect_asset_single`, `_detect_asset_tiled`, `verify_borderline_match`, `analyze_compliance`) |
+| `backend/app/services/cost_tracker.py` | Added Opus 4.7 pricing; fixed Opus 4.6/4.5 pricing bug ($15/$75 → $5/$25); added cache write/read multipliers; `record_anthropic` accepts and bills cache tokens separately; line-item meta exposes per-call cache stats |
+
+### Known Issues / TODO
+
+- Eval harness (Phase 1.8) not yet built — needed before any future model upgrade is attempted again.
+- `localize_assets_in_screenshot` does not yet benefit from caching (asset varies in the inner loop). Could be unlocked by flipping image order and rewriting the prompt — deferred until benefit is measured against effort.
+- Cache hit rate visibility — added to `cost_breakdown.line_items[*].meta` but not yet surfaced in the frontend `/scans` page cost panel. Easy follow-up.
+
+### Same-Day Rollback: Opus 4.7 → 4.6
+
+After the initial deployment, the first real scan failed with `400 invalid_request_error: temperature is deprecated for this model`. Investigation revealed Opus 4.7 silently removed three sampling parameters from the Messages API:
+
+- `temperature` → 400 error (was set to `0` for determinism in `call_anthropic_with_retry`)
+- `top_p` → 400 error (not used by us)
+- `top_k` → 400 error (not used by us)
+
+This is a hard breaking change documented in Anthropic's migration guide but not in the release announcement. All Opus calls in the pipeline (`_detect_asset_single`, `_detect_asset_tiled`, `verify_borderline_match`, `analyze_compliance`, `compare_images`) failed; only Haiku-based filter calls survived. Failed Anthropic calls aren't billed, which is why the cost panel showed a non-zero number ($0.092) but the scan returned empty compliance analyses.
+
+#### Decision: Roll back to Opus 4.6, keep all caching infrastructure
+
+Rather than just delete `temperature=0` and accept Opus 4.7's non-determinism, we evaluated whether 4.7 is actually a better fit for this product. Conclusion: it isn't.
+
+| Opus 4.7 change | Effect on dealer-compliance image matching |
+|----------------|-------------------------------------------|
+| `temperature` removed | Loses determinism — same image can yield different confidence scores on re-scan. Compliance customers expect reproducibility. |
+| New tokenizer (1.0–1.35× more tokens) | 0–35% cost regression for identical inputs |
+| Adaptive thinking | Marginal — image classification is not a reasoning task |
+| 3.75 MP image input | No benefit — `optimize_image_for_api` downscales to ~1.5 MP anyway |
+| Better software engineering | Not applicable to our workload |
+| `task_budget` for agent loops | Not applicable — single-call API |
+| More literal instruction-following | Could change behavior on edge cases prompts didn't anticipate |
+
+For a bounded, repetitive, deterministic image-classification workload, Opus 4.6 is the better tool. The "newer is better" assumption did not hold for this use case.
+
+#### What was reverted
+
+| File | Change |
+|------|--------|
+| `backend/app/services/ai_service.py` | `CLAUDE_MODEL` and `ENSEMBLE_MODEL` reverted from `claude-opus-4-7` → `claude-opus-4-6` |
+
+#### What was KEPT (still in place from the morning's work)
+
+- `cache_prefix_images` parameter on `call_anthropic_with_retry` — works on both 4.6 and 4.7, fully backward compatible
+- `cache_control: {"type": "ephemeral"}` markers at all 5 enabled call sites
+- `cache_creation_input_tokens` / `cache_read_input_tokens` capture from `response.usage`
+- Cost tracker pricing fix: Opus 4.6 corrected from $15/$75 → $5/$25 per MTok (matches Anthropic's published pricing and `log.md` references)
+- Cost tracker cache write/read multipliers (1.25x / 0.10x)
+- Per-call cache token meta in `cost_breakdown.line_items[*].meta`
+
+The rollback is purely the model-id constants. All cost optimization work survived.
+
+#### Pre-Upgrade Discipline (for future model migrations)
+
+Before any future model upgrade, the eval harness from Phase 1.8 must exist and the candidate model must demonstrate:
+
+1. Strictly equal-or-greater recall on the known-positive holdout set
+2. No new breaking-change rejections from a smoke test scan against staging
+3. Acceptable cost change (within ±10% per scan after token-count differences)
+
+Until those gates exist, the cost of "shiny new model" regressions exceeds the upside.
+
+---
+
+## 2026-04-20 (Monday) — Eval Harness (Phase 1.8)
+
+Built the eval harness that the same-day Opus 4.7 rollback identified as a hard blocker for any future AI-pipeline change. The harness runs the real production AI functions (`filter_image`, `detect_asset_in_screenshot`, `verify_borderline_match`, `analyze_compliance`) against a frozen labelled fixture set, computes per-stage precision/recall/cost/latency, diffs against a committed baseline, and exits non-zero when any guarded metric regresses past its tolerance.
+
+### Why now
+
+Three open questions could not be resolved without it:
+
+1. **Caching not firing** — today's scan showed 80 Anthropic calls, 0 cache writes/reads. The fix candidates (Option A padding vs Option B system-prompt restructure) all carry scoring risk that needs to be measured before shipping. Without an eval, the correct call was "don't ship," which left ~$400-670/mo in caching savings on the table.
+2. **Pre-filter thresholds are off-limits** — every prior tuning attempt regressed recall, so the rule became "don't touch them." That's a sign there's no objective way to measure improvement, not that the thresholds are optimal.
+3. **Opus 4.6 will eventually be deprecated** — when that happens, a model migration becomes mandatory. The 4.7 incident proved that "ship and hope" is unacceptable; the harness creates the gate that future migrations must pass.
+
+### Architecture
+
+```
+backend/eval/
+  config.py                  ← paths + regression thresholds (env-overridable)
+  manifest.py                ← FixtureCase / Manifest dataclasses + IO
+  build_fixtures.py          ← seed manifest from production match_feedback
+  metrics.py                 ← precision/recall/F1/cost/latency/score-drift
+  baseline.py                ← Baseline persistence + diff_against_baseline()
+  report.py                  ← Markdown reporter (PR-ready)
+  run.py                     ← `python -m eval.run` CLI
+  runners/
+    base.py                  ← BaseRunner — uniform timing + cost capture
+    haiku_filter.py          ← exercises filter_image
+    opus_detect.py           ← exercises detect_asset_in_screenshot
+    verify.py                ← exercises verify_borderline_match
+    compliance.py            ← exercises analyze_compliance
+  fixtures/
+    manifest.example.json    ← committed template (8 example cases)
+    manifest.json            ← gitignored — actual labelled set
+    images/                  ← gitignored — image bytes on disk
+  reports/                   ← gitignored — per-run Markdown outputs
+  baseline.json              ← committed last-known-good metrics
+```
+
+### Design decisions
+
+- **Real production code path, mocked network only.** Each runner patches `ai_service.download_image` to read fixture bytes from disk for the duration of the call, then calls the real `filter_image` / `detect_asset_in_screenshot` / etc. Image optimisation, prompt construction, Anthropic call, retry logic, and cost tracking all execute unmodified. A pricing change, prompt change, model-id change, or cache-control change is therefore detected automatically.
+- **Per-stage runners, not end-to-end.** Each pipeline stage is exercised independently so that a regression can be isolated to the function that caused it. Fixtures are tagged with categories and routed to the relevant runners (e.g. the verifier only runs on `borderline_*` cases).
+- **Fixtures stored as bytes, not URLs.** The manifest references local files under `fixtures/images/`. Source URLs go stale; eval reproducibility cannot.
+- **Categories pinned to product-level questions.** Ten categories — `clear_positive`, `template_positive`, `modified_positive`, `same_promo_diff_creative`, `same_brand_diff_campaign`, `different_brand`, `borderline_true`, `borderline_false`, `compliance_drift`, `zombie_ad` — each answering a specific quality concern (recall floor, template-customization tolerance, modification robustness, false-positive hardness, brand-confusion rejection, precision floor, verifier promotion, verifier rejection, drift detection, zombie detection).
+- **Baseline + diff workflow.** `eval/baseline.json` is committed to the repo. Every PR runs `python -m eval.run` which diffs against it. Intentional changes update the baseline via `--update-baseline` and commit it alongside the change.
+- **Score drift is measured separately from verdict flips.** A prompt restructure that doesn't flip any boolean verdicts but shifts confidence by 5-10 points across the board would silently corrupt the adaptive thresholds — `_check_score_drift` in `baseline.py` catches that.
+- **Compliance recall has zero tolerance.** `EVAL_MAX_COMPLIANCE_RECALL_DROP=0.0` in `config.py` — drift detection is the product, missing it cannot ever be silently accepted.
+
+### Regression thresholds (defaults)
+
+| Threshold | Default | Rationale |
+|---|---|---|
+| Recall drop | 2 pts | Missed match = customer doesn't catch real violation |
+| Precision drop | 5 pts | False match = annoyance, manual review |
+| Compliance recall drop | 0 pts | Zero tolerance — drift is the product |
+| Cost increase | 15% | Catches new tokenizer / longer prompts (the Opus 4.7 surprise) |
+| p95 latency increase | 20% | Catches slowdowns |
+| Score drift (per case) | 10 pts | Catches subtle prompt restructures |
+| Score drift (case count) | 5 cases | How many cases may drift before failing |
+
+All overridable via env vars (`EVAL_MAX_RECALL_DROP`, etc.) for CI tuning.
+
+### Fixture sourcing
+
+`build_fixtures.py` pulls `match_feedback` rows from production Supabase, joins them through `matches` → `assets` + `discovered_images`, downloads both image files into `fixtures/images/`, and appends the case to `manifest.json`. The auto-import maps `actual_verdict` to a coarse category (`true_positive` → `clear_positive`, `false_positive` → `borderline_false`, etc.); a human must hand-correct the categories before trusting the manifest.
+
+The `match_feedback` table already exists in production (migration `004_add_match_feedback.sql`, written 2025) and is populated by the existing `/matches/{id}` feedback UI. Roughly N labelled cases are available from prior reviews — no separate labelling tool needed.
+
+### CLI surface
+
+```bash
+python -m eval.run                            # all runners, gate-mode
+python -m eval.run --stage haiku_filter       # single runner
+python -m eval.run --stage opus_detect,verify # subset
+python -m eval.run --concurrency 4            # parallel cases per runner
+python -m eval.run --update-baseline          # accept current as new baseline
+python -m eval.build_fixtures --limit 50      # seed from Supabase
+python -m eval.build_fixtures --verdict false_positive --limit 30
+```
+
+Exit codes: `0` pass / `2` regression / `3` infrastructure error (no manifest, missing fixtures).
+
+### Smoke verification
+
+Two synthetic smoke tests run during build, both passing:
+
+1. **Metrics + diff + report** (`venv/bin/python` synthetic harness): builds a baseline `RunnerResult` where all 3 cases pass, then a current `RunnerResult` where one verdict flipped and one score drifted by 14 points. The gate correctly fails with reason `"opus_detect: recall dropped 50.00 pts (1.0000 → 0.5000, max allowed -2.0)"`, the verdict flip is captured in `flipped_verdicts`, and the score drift is captured in `drifted_scores`.
+2. **End-to-end runner** with mocked Anthropic: writes two tiny PNG fixtures to disk, points the manifest at them, mocks `ai_service.anthropic_client.messages.create` to return a deterministic verdict + usage payload, and runs `HaikuFilterRunner._run_one`. Result captures correct verdict (`is_relevant=True`), cost ($0.0019 for 1500 input + 80 output Haiku tokens — matches manual math), token counts (1500/80), and latency. No errors. Confirms the production code path, image-optimisation, prompt construction, and cost tracker are all wired through.
+
+### Files added
+
+| File | Purpose |
+|------|---------|
+| `backend/eval/__init__.py` | Package marker + module docstring |
+| `backend/eval/config.py` | Paths + regression thresholds |
+| `backend/eval/manifest.py` | `FixtureCase`, `Expected`, `Manifest`, `CATEGORIES` |
+| `backend/eval/build_fixtures.py` | `python -m eval.build_fixtures` — seed from Supabase |
+| `backend/eval/metrics.py` | `compute_metrics` + per-stage confusion-matrix logic |
+| `backend/eval/baseline.py` | `Baseline` + `diff_against_baseline` + per-metric checks |
+| `backend/eval/report.py` | Markdown + console summary rendering |
+| `backend/eval/run.py` | `python -m eval.run` CLI |
+| `backend/eval/runners/__init__.py` | `RUNNERS` registry |
+| `backend/eval/runners/base.py` | `BaseRunner`, `CaseResult`, `RunnerResult` |
+| `backend/eval/runners/haiku_filter.py` | Stage 3 runner |
+| `backend/eval/runners/opus_detect.py` | Stage 4 runner |
+| `backend/eval/runners/verify.py` | Verifier runner |
+| `backend/eval/runners/compliance.py` | Compliance runner |
+| `backend/eval/fixtures/manifest.example.json` | 8-case template (committed) |
+| `backend/eval/fixtures/.gitignore` | Excludes real `manifest.json` + `images/` |
+| `backend/eval/fixtures/images/.gitkeep` | Keeps directory present |
+| `backend/eval/reports/.gitignore` | Excludes generated reports |
+| `backend/eval/README.md` | Workflow docs + threshold reference |
+
+No changes to existing files — the harness is a pure addition.
+
+### What this unblocks
+
+Now safe to attempt:
+
+1. **Caching Option A or B** — restructure prompts to clear Anthropic's per-model cache minimums (1024 tok Opus / 2048 tok Haiku). Run the eval, confirm no verdict flips on the 10 borderline cases or score drift > 10 points, then ship. Realistic savings: ~$400-670/mo at 150-dealer scale.
+2. **Pre-filter threshold tuning** — the long-deferred Phase 1.5. With objective recall measurement, can finally validate whether a tighter threshold actually loses matches or just rejects junk faster.
+3. **Future Opus migrations** — Opus 4.7+ or 5.x can be evaluated without production risk. Gate criteria: equal-or-greater recall on positives, ≤10% cost change, no breaking parameter changes (today's surprise).
+
+### Pending follow-ups
+
+- Seed the production fixture set (`python -m eval.build_fixtures --limit 50`, then hand-review categories).
+- Capture the first baseline (`python -m eval.run --update-baseline`).
+- Wire into GitHub Actions on PRs that touch `backend/app/services/ai_service.py`, `backend/app/services/adaptive_threshold_service.py`, `backend/app/config.py`. Estimated cost: $1.50-3.00 per CI run on a 50-fixture set.
+
+---
+
+## 2026-04-20 (Monday afternoon) — First Real Eval Run + Hand-Labelled Compliance Baseline
+
+Followed the Phase 1.8 plan to its first real outcome: pulled fixtures from production, hand-labelled the compliance set, captured a meaningful baseline, and surfaced two real model bugs the harness now guards against.
+
+### Bug fix in `build_fixtures.py`
+
+First fixture pull failed silently — every case was skipped with `URL too long`. Cause: many `discovered_images.image_url` values are stored as inline `data:image/...;base64,...` URIs (Meta-source crops are inlined). `httpx.AsyncClient.get` rejects them at the URL parser. Patched `backend/eval/build_fixtures.py` to detect data URIs, decode the base64 payload locally, and infer the file extension from the MIME type. HTTP URLs unchanged. Re-pull pulled 35 of the 38 most recent feedback rows (3 skipped — expired Meta CDN signatures returning 403, expected and unrecoverable).
+
+### Production fixture composition (after manual labelling)
+
+| Category | Count | Origin |
+|---|---|---|
+| `clear_positive` | 7 | Yancey CAT promos with logo + date, 1 CAT corporate ad, 1 CAT 307.5 product hero |
+| `compliance_drift` | 9 | Missing-Yancey-logo violations across 4 unique creatives (5 dupes from `match_feedback`) |
+| `zombie_ad` | 1 | Retail Special creative with `campaign_end_date` set 90+ days in the past |
+| `borderline_false` | 18 | User-confirmed false-positive matches |
+| **Total** | **35** | |
+
+Ran the eval three times this session against the labelled set. Final baseline written to `backend/eval/baseline.json` (git_sha `60c5ad7d41ee`).
+
+### Final baseline metrics
+
+| Stage | Cases | Correct | Recall | Precision | Cost | p95 latency |
+|---|---|---|---|---|---|---|
+| `haiku_filter` | 7 | 7 | 1.000 | 1.000 | $0.013 | 2 951 ms |
+| `opus_detect` | 25 | 25 | 1.000 | 1.000 | $0.317 | 10 199 ms |
+| `verify` | 18 | 18 | — | — | $0.174 | 6 449 ms |
+| `compliance` | 17 | 13 | recall 0.900 / precision 0.750 | — | $0.359 | 12 478 ms |
+
+- Detector score separation: avg **90.0** for positives, **5.0** for negatives — 85 points of headroom.
+- Verifier rejected all 18 user-flagged false positives at avg score 10.
+- Compliance: caught 9 of 10 expected violations (recall 0.900). Of 12 violation flags, 9 were real (precision 0.750).
+- Total session API spend across three runs: **~$2.89**.
+
+### Two real bugs the eval surfaced
+
+Each now has a fixture acting as a permanent regression test.
+
+1. **Zombie-ad detection broken on metadata-only inputs** (`feedback-91713971`). Campaign metadata says ended 2026-01-15 (90+ days past today). Image itself has no on-image expiration text. Opus returned `is_compliant=True, zombie_ad=False` — completely missed it. Means the `campaign_end_date` metadata path in `get_compliance_prompt` is not being weighted relative to image content. Fixing this is the highest-leverage compliance change available; the moment it works, `compliance_recall` will tick from 0.900 → 1.000.
+
+2. **Compliance prompt over-flags non-promotional creatives.** Three legitimate compliant ads got marked as violations:
+   - CAT 307.5 Mini Excavator product hero (`feedback-1095ee74` + `feedback-1fb27b39` B&W variant) — evergreen product page, no promo elements, model wanted promo elements anyway.
+   - 10% Off Undercarriage GROUND10 (`feedback-ff223913`) — has Yancey CAT logo, promo code, AND "VALID THROUGH 6/30/2026" disclaimer in clear text. Every required element present, yet flagged. Worth pulling the model's `analysis_summary` to see what it claimed was missing.
+
+   Suggests `get_compliance_prompt` is too strict by default — needs either a promo-vs-product mode hint, or a more careful enumeration of "compliant" so the model has an explicit anchor.
+
+### Helper scripts added (in `backend/eval/`)
+
+- `_label_compliance.py` — idempotent re-runnable helper that applies the curated compliance labels to `manifest.json`. Re-running it after a fresh `build_fixtures` re-applies the labels in place.
+- `_inspect_compliance.py` — runs the compliance runner only and prints per-case `expected vs got` for `is_compliant` and `zombie_ad`. Cheaper diagnostic than a full eval run when iterating on the compliance prompt.
+
+### Workflow validated end-to-end
+
+The Phase 1.8 plan said the harness would catch silent regressions and surface real defects. First real run did both:
+- The build_fixtures bug was caught at the very first invocation, before any AI work.
+- The compliance prompt's zombie-detection failure and over-strict default behaviour were surfaced by the very first labelled-fixture run.
+- Three full eval runs gated against an evolving baseline — every diff was correctly classified as improvement, info, or regression. No false alarms; no silent bugs.
+
+The harness is now ready to validate any future AI-pipeline change (caching restructure, prompt edit, model swap) without production risk.
+
+### Pending follow-ups (carried forward)
+
+- **Fix zombie-ad detection** in `get_compliance_prompt`. Regression test: `feedback-91713971`.
+- **Tune compliance prompt** to handle product-page and fully-compliant promo cases. Regression tests: `feedback-1095ee74`, `feedback-1fb27b39`, `feedback-ff223913`.
+- Wire `python -m eval.run` into GitHub Actions on PRs that touch `backend/app/services/ai_service.py` etc.
+- Attempt the deferred prompt-caching restructure (Phase 1.1 Option A/B) now that the eval gate is in place.
+

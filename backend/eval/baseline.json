@@ -1,0 +1,970 @@
+{
+  "version": 1,
+  "captured_at": "2026-04-20T20:23:25+00:00",
+  "git_sha": "60c5ad7d41ee1be7ba9802954a5126fa95705a70",
+  "runner_metrics": {
+    "haiku_filter": {
+      "runner": "haiku_filter",
+      "total_cases": 7,
+      "correct": 7,
+      "incorrect": 0,
+      "skipped": 0,
+      "errors": 0,
+      "total_cost_usd": 0.0132,
+      "avg_latency_ms": 2667.2,
+      "p95_latency_ms": 2951.2,
+      "recall": 1.0,
+      "precision": 1.0,
+      "f1": 1.0,
+      "per_case": {
+        "feedback-9c57ed94-0cf9-4608-a6a5-f1f0712b18e8": {
+          "category": "clear_positive",
+          "latency_ms": 2951.190959,
+          "cost_usd": 0.0018,
+          "expected": {
+            "is_relevant": true
+          },
+          "actual": {
+            "is_relevant": true
+          }
+        },
+        "feedback-1fb27b39-614b-4efd-8a6e-f149b52d38f9": {
+          "category": "clear_positive",
+          "latency_ms": 2806.4692080000004,
+          "cost_usd": 0.002,
+          "expected": {
+            "is_relevant": true
+          },
+          "actual": {
+            "is_relevant": true
+          }
+        },
+        "feedback-1095ee74-87a3-4d43-a997-6653f4b4a26a": {
+          "category": "clear_positive",
+          "latency_ms": 2713.874917,
+          "cost_usd": 0.002,
+          "expected": {
+            "is_relevant": true
+          },
+          "actual": {
+            "is_relevant": true
+          }
+        },
+        "feedback-7cd06bf2-b5d2-4a06-9590-cad58a70d914": {
+          "category": "clear_positive",
+          "latency_ms": 2500.417375,
+          "cost_usd": 0.0018,
+          "expected": {
+            "is_relevant": true
+          },
+          "actual": {
+            "is_relevant": true
+          }
+        },
+        "feedback-ff223913-a3b5-4d34-960d-8143d60f3f9b": {
+          "category": "clear_positive",
+          "latency_ms": 2797.7384580000003,
+          "cost_usd": 0.002,
+          "expected": {
+            "is_relevant": true
+          },
+          "actual": {
+            "is_relevant": true
+          }
+        },
+        "feedback-a5c98008-71ac-4387-8ab4-0c373b94b0a2": {
+          "category": "clear_positive",
+          "latency_ms": 2660.788708,
+          "cost_usd": 0.0018,
+          "expected": {
+            "is_relevant": true
+          },
+          "actual": {
+            "is_relevant": true
+          }
+        },
+        "feedback-bc8a67ba-4bd1-4604-a816-17f2a9f1cfd6": {
+          "category": "clear_positive",
+          "latency_ms": 2239.9127499999995,
+          "cost_usd": 0.0018,
+          "expected": {
+            "is_relevant": true
+          },
+          "actual": {
+            "is_relevant": true
+          }
+        }
+      }
+    },
+    "opus_detect": {
+      "runner": "opus_detect",
+      "total_cases": 25,
+      "correct": 25,
+      "incorrect": 0,
+      "skipped": 0,
+      "errors": 0,
+      "total_cost_usd": 0.3165,
+      "avg_latency_ms": 6594.4,
+      "p95_latency_ms": 10199.0,
+      "recall": 1.0,
+      "precision": 1.0,
+      "f1": 1.0,
+      "avg_score_positive": 90.0,
+      "avg_score_negative": 5.0,
+      "per_case": {
+        "feedback-9c57ed94-0cf9-4608-a6a5-f1f0712b18e8": {
+          "category": "clear_positive",
+          "latency_ms": 7334.8695,
+          "cost_usd": 0.0144,
+          "expected": {
+            "is_match": true,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": true,
+            "score": 95
+          }
+        },
+        "feedback-1fb27b39-614b-4efd-8a6e-f149b52d38f9": {
+          "category": "clear_positive",
+          "latency_ms": 10736.051041999997,
+          "cost_usd": 0.0198,
+          "expected": {
+            "is_match": true,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": true,
+            "score": 82
+          }
+        },
+        "feedback-1095ee74-87a3-4d43-a997-6653f4b4a26a": {
+          "category": "clear_positive",
+          "latency_ms": 10199.023083000002,
+          "cost_usd": 0.0193,
+          "expected": {
+            "is_match": true,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": true,
+            "score": 78
+          }
+        },
+        "feedback-7cd06bf2-b5d2-4a06-9590-cad58a70d914": {
+          "category": "clear_positive",
+          "latency_ms": 6590.213417000001,
+          "cost_usd": 0.0145,
+          "expected": {
+            "is_match": true,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": true,
+            "score": 95
+          }
+        },
+        "feedback-ff223913-a3b5-4d34-960d-8143d60f3f9b": {
+          "category": "clear_positive",
+          "latency_ms": 9238.447292,
+          "cost_usd": 0.0162,
+          "expected": {
+            "is_match": true,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": true,
+            "score": 90
+          }
+        },
+        "feedback-a5c98008-71ac-4387-8ab4-0c373b94b0a2": {
+          "category": "clear_positive",
+          "latency_ms": 7931.858625,
+          "cost_usd": 0.0142,
+          "expected": {
+            "is_match": true,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": true,
+            "score": 95
+          }
+        },
+        "feedback-bc8a67ba-4bd1-4604-a816-17f2a9f1cfd6": {
+          "category": "clear_positive",
+          "latency_ms": 6779.753875000001,
+          "cost_usd": 0.0138,
+          "expected": {
+            "is_match": true,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": true,
+            "score": 95
+          }
+        },
+        "feedback-b1ba8360-ee33-4cb8-a9b5-40e29138753c": {
+          "category": "borderline_false",
+          "latency_ms": 4028.5258330000033,
+          "cost_usd": 0.0106,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-92f2fe85-bcf6-4570-9705-ff7f761f6ee7": {
+          "category": "borderline_false",
+          "latency_ms": 6105.670792000002,
+          "cost_usd": 0.0108,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 5
+          }
+        },
+        "feedback-7de10f9c-72d4-4324-8e16-df050182b124": {
+          "category": "borderline_false",
+          "latency_ms": 5435.733541000001,
+          "cost_usd": 0.012,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 5
+          }
+        },
+        "feedback-5d507a4c-7844-4118-b4a7-db802704e521": {
+          "category": "borderline_false",
+          "latency_ms": 4265.632333000003,
+          "cost_usd": 0.0109,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-05279b68-a217-4074-84ea-9098d4694960": {
+          "category": "borderline_false",
+          "latency_ms": 6493.665583000002,
+          "cost_usd": 0.0119,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 10
+          }
+        },
+        "feedback-0e582765-cc2d-4bf4-95d2-dca3d0e1f8ac": {
+          "category": "borderline_false",
+          "latency_ms": 6047.048625000002,
+          "cost_usd": 0.0122,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 5
+          }
+        },
+        "feedback-7758edad-fd49-45df-88d8-14f686ac9f51": {
+          "category": "borderline_false",
+          "latency_ms": 4742.648500000001,
+          "cost_usd": 0.01,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 5
+          }
+        },
+        "feedback-ea81cf8a-8ed2-4d40-a790-e9b76f470450": {
+          "category": "borderline_false",
+          "latency_ms": 6488.2359579999975,
+          "cost_usd": 0.0113,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 5
+          }
+        },
+        "feedback-d68fc42c-4be8-4385-80da-d114b2c20882": {
+          "category": "borderline_false",
+          "latency_ms": 3977.701332999999,
+          "cost_usd": 0.0109,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-c5d9d9a7-8a29-4180-972c-e8da64dc9b0e": {
+          "category": "borderline_false",
+          "latency_ms": 5541.537082999995,
+          "cost_usd": 0.0116,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 5
+          }
+        },
+        "feedback-20ad49aa-a878-4aeb-bd60-163fd63f3795": {
+          "category": "borderline_false",
+          "latency_ms": 5879.3085,
+          "cost_usd": 0.0111,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 5
+          }
+        },
+        "feedback-07c46d90-38ec-4fff-a28b-66c6e44a0bff": {
+          "category": "borderline_false",
+          "latency_ms": 9740.992917,
+          "cost_usd": 0.01,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 5
+          }
+        },
+        "feedback-4a23d2cd-f280-469f-a4e9-b3e9df02adae": {
+          "category": "borderline_false",
+          "latency_ms": 6637.269583000006,
+          "cost_usd": 0.012,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 10
+          }
+        },
+        "feedback-7fb7adf7-5479-42da-8d39-142f23f5e2e6": {
+          "category": "borderline_false",
+          "latency_ms": 6815.794750000002,
+          "cost_usd": 0.0122,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 5
+          }
+        },
+        "feedback-7a31ea90-f69d-4aa4-960e-c9baa7265b6b": {
+          "category": "borderline_false",
+          "latency_ms": 6728.0833340000045,
+          "cost_usd": 0.0125,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 10
+          }
+        },
+        "feedback-b56b385d-e692-481e-8124-661ca8aec34e": {
+          "category": "borderline_false",
+          "latency_ms": 6009.055832999998,
+          "cost_usd": 0.0108,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 5
+          }
+        },
+        "feedback-cbb3cb41-12ec-409c-90b4-e8bcd18439a1": {
+          "category": "borderline_false",
+          "latency_ms": 6786.963499999999,
+          "cost_usd": 0.0125,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 10
+          }
+        },
+        "feedback-95320cd8-f2a5-4311-b002-f86e6927ca6e": {
+          "category": "borderline_false",
+          "latency_ms": 4324.990207999996,
+          "cost_usd": 0.011,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        }
+      }
+    },
+    "verify": {
+      "runner": "verify",
+      "total_cases": 18,
+      "correct": 18,
+      "incorrect": 0,
+      "skipped": 0,
+      "errors": 0,
+      "total_cost_usd": 0.1739,
+      "avg_latency_ms": 4654.4,
+      "p95_latency_ms": 6448.9,
+      "avg_score_negative": 10.0,
+      "per_case": {
+        "feedback-b1ba8360-ee33-4cb8-a9b5-40e29138753c": {
+          "category": "borderline_false",
+          "latency_ms": 3757.9314590000054,
+          "cost_usd": 0.0096,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-92f2fe85-bcf6-4570-9705-ff7f761f6ee7": {
+          "category": "borderline_false",
+          "latency_ms": 4445.014291999996,
+          "cost_usd": 0.0089,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-7de10f9c-72d4-4324-8e16-df050182b124": {
+          "category": "borderline_false",
+          "latency_ms": 6641.359958999999,
+          "cost_usd": 0.0106,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-5d507a4c-7844-4118-b4a7-db802704e521": {
+          "category": "borderline_false",
+          "latency_ms": 3832.2407080000003,
+          "cost_usd": 0.0102,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-05279b68-a217-4074-84ea-9098d4694960": {
+          "category": "borderline_false",
+          "latency_ms": 6448.881874999998,
+          "cost_usd": 0.0098,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 20
+          }
+        },
+        "feedback-0e582765-cc2d-4bf4-95d2-dca3d0e1f8ac": {
+          "category": "borderline_false",
+          "latency_ms": 5047.896292000004,
+          "cost_usd": 0.0097,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 20
+          }
+        },
+        "feedback-7758edad-fd49-45df-88d8-14f686ac9f51": {
+          "category": "borderline_false",
+          "latency_ms": 4179.81404199999,
+          "cost_usd": 0.0087,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 20
+          }
+        },
+        "feedback-ea81cf8a-8ed2-4d40-a790-e9b76f470450": {
+          "category": "borderline_false",
+          "latency_ms": 4290.147250000004,
+          "cost_usd": 0.0093,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 20
+          }
+        },
+        "feedback-d68fc42c-4be8-4385-80da-d114b2c20882": {
+          "category": "borderline_false",
+          "latency_ms": 3747.666250000009,
+          "cost_usd": 0.01,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-c5d9d9a7-8a29-4180-972c-e8da64dc9b0e": {
+          "category": "borderline_false",
+          "latency_ms": 5107.359875,
+          "cost_usd": 0.0106,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-20ad49aa-a878-4aeb-bd60-163fd63f3795": {
+          "category": "borderline_false",
+          "latency_ms": 4299.057208999997,
+          "cost_usd": 0.0089,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-07c46d90-38ec-4fff-a28b-66c6e44a0bff": {
+          "category": "borderline_false",
+          "latency_ms": 4556.175208999988,
+          "cost_usd": 0.0089,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 20
+          }
+        },
+        "feedback-4a23d2cd-f280-469f-a4e9-b3e9df02adae": {
+          "category": "borderline_false",
+          "latency_ms": 4864.37475000001,
+          "cost_usd": 0.0099,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 20
+          }
+        },
+        "feedback-7fb7adf7-5479-42da-8d39-142f23f5e2e6": {
+          "category": "borderline_false",
+          "latency_ms": 5185.648541999995,
+          "cost_usd": 0.0097,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 20
+          }
+        },
+        "feedback-7a31ea90-f69d-4aa4-960e-c9baa7265b6b": {
+          "category": "borderline_false",
+          "latency_ms": 4608.01450000001,
+          "cost_usd": 0.0098,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 20
+          }
+        },
+        "feedback-b56b385d-e692-481e-8124-661ca8aec34e": {
+          "category": "borderline_false",
+          "latency_ms": 3883.5764589999967,
+          "cost_usd": 0.0089,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        },
+        "feedback-cbb3cb41-12ec-409c-90b4-e8bcd18439a1": {
+          "category": "borderline_false",
+          "latency_ms": 4487.84183299999,
+          "cost_usd": 0.0099,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 20
+          }
+        },
+        "feedback-95320cd8-f2a5-4311-b002-f86e6927ca6e": {
+          "category": "borderline_false",
+          "latency_ms": 4395.363499999988,
+          "cost_usd": 0.0105,
+          "expected": {
+            "is_match": false,
+            "min_score": null,
+            "max_score": null
+          },
+          "actual": {
+            "is_match": false,
+            "score": 0
+          }
+        }
+      }
+    },
+    "compliance": {
+      "runner": "compliance",
+      "total_cases": 17,
+      "correct": 13,
+      "incorrect": 4,
+      "skipped": 0,
+      "errors": 0,
+      "total_cost_usd": 0.3586,
+      "avg_latency_ms": 10093.8,
+      "p95_latency_ms": 12478.3,
+      "compliance_recall": 0.9,
+      "compliance_precision": 0.75,
+      "per_case": {
+        "feedback-c8c0c0f4-0ba8-4549-997a-4418b7420b93": {
+          "category": "compliance_drift",
+          "latency_ms": 10275.142459000008,
+          "cost_usd": 0.0216,
+          "expected": {
+            "is_compliant": false,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-9c57ed94-0cf9-4608-a6a5-f1f0712b18e8": {
+          "category": "clear_positive",
+          "latency_ms": 7376.679250000009,
+          "cost_usd": 0.0185,
+          "expected": {
+            "is_compliant": true,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": true,
+            "zombie_ad": false
+          }
+        },
+        "feedback-1fb27b39-614b-4efd-8a6e-f149b52d38f9": {
+          "category": "clear_positive",
+          "latency_ms": 11201.933249999996,
+          "cost_usd": 0.0232,
+          "expected": {
+            "is_compliant": true,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-1095ee74-87a3-4d43-a997-6653f4b4a26a": {
+          "category": "clear_positive",
+          "latency_ms": 11651.86712500001,
+          "cost_usd": 0.0237,
+          "expected": {
+            "is_compliant": true,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-7cd06bf2-b5d2-4a06-9590-cad58a70d914": {
+          "category": "clear_positive",
+          "latency_ms": 6467.923749999997,
+          "cost_usd": 0.0185,
+          "expected": {
+            "is_compliant": true,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": true,
+            "zombie_ad": false
+          }
+        },
+        "feedback-ff223913-a3b5-4d34-960d-8143d60f3f9b": {
+          "category": "clear_positive",
+          "latency_ms": 14759.575332999986,
+          "cost_usd": 0.0286,
+          "expected": {
+            "is_compliant": true,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-9b068a88-0247-4841-9082-6599698fa302": {
+          "category": "compliance_drift",
+          "latency_ms": 12478.309166999992,
+          "cost_usd": 0.022,
+          "expected": {
+            "is_compliant": false,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-91713971-9846-479c-8441-3fc773f16448": {
+          "category": "zombie_ad",
+          "latency_ms": 9412.003333,
+          "cost_usd": 0.0178,
+          "expected": {
+            "is_compliant": false,
+            "zombie_ad": true
+          },
+          "actual": {
+            "is_compliant": true,
+            "zombie_ad": false
+          }
+        },
+        "feedback-2741b80a-cc88-4693-a461-ade66a2687af": {
+          "category": "compliance_drift",
+          "latency_ms": 12044.884832999984,
+          "cost_usd": 0.0253,
+          "expected": {
+            "is_compliant": false,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-ee10889a-cc2c-4dfe-81b2-744c95f9c3d6": {
+          "category": "compliance_drift",
+          "latency_ms": 11210.969541999986,
+          "cost_usd": 0.021,
+          "expected": {
+            "is_compliant": false,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-a5c98008-71ac-4387-8ab4-0c373b94b0a2": {
+          "category": "clear_positive",
+          "latency_ms": 7370.331625000006,
+          "cost_usd": 0.0176,
+          "expected": {
+            "is_compliant": true,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": true,
+            "zombie_ad": false
+          }
+        },
+        "feedback-db291585-921b-414a-a796-c4e65ac12d0e": {
+          "category": "compliance_drift",
+          "latency_ms": 12123.329291999995,
+          "cost_usd": 0.0217,
+          "expected": {
+            "is_compliant": false,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-a0d36c1a-264c-4578-aff2-ed45744d1653": {
+          "category": "compliance_drift",
+          "latency_ms": 10799.146750000005,
+          "cost_usd": 0.021,
+          "expected": {
+            "is_compliant": false,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-64a7396a-7273-48fc-ae66-773a4fbda994": {
+          "category": "compliance_drift",
+          "latency_ms": 11127.199916999984,
+          "cost_usd": 0.0213,
+          "expected": {
+            "is_compliant": false,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-95c08729-6511-4a6e-8f25-2bdec2b3ca6c": {
+          "category": "compliance_drift",
+          "latency_ms": 7909.646916999975,
+          "cost_usd": 0.0196,
+          "expected": {
+            "is_compliant": false,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        },
+        "feedback-bc8a67ba-4bd1-4604-a816-17f2a9f1cfd6": {
+          "category": "clear_positive",
+          "latency_ms": 7503.9000419999975,
+          "cost_usd": 0.0175,
+          "expected": {
+            "is_compliant": true,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": true,
+            "zombie_ad": false
+          }
+        },
+        "feedback-2e307d3b-0a29-4e14-9426-b8d68147aa12": {
+          "category": "compliance_drift",
+          "latency_ms": 7882.153791000008,
+          "cost_usd": 0.0197,
+          "expected": {
+            "is_compliant": false,
+            "zombie_ad": false
+          },
+          "actual": {
+            "is_compliant": false,
+            "zombie_ad": false
+          }
+        }
+      }
+    }
+  }
+}

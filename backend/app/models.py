@@ -215,6 +215,8 @@ class ScanJob(BaseModel):
     error_message: Optional[str]
     apify_run_id: Optional[str]
     pipeline_stats: Optional[Dict[str, Any]] = None
+    cost_usd: Optional[float] = 0
+    cost_breakdown: Optional[Dict[str, Any]] = None
     created_at: datetime
 
     class Config:
