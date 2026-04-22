@@ -18,6 +18,7 @@ import httpx
 
 from ..config import get_settings
 from ..database import supabase
+from .bulk_writers import DiscoveredImageBuffer
 
 log = logging.getLogger("dealer_intel.screenshot")
 
@@ -112,7 +113,7 @@ async def scan_dealer_websites(
     Returns the number of discovered images saved.
     """
     log.info("Starting ScreenshotOne capture for %d URLs", len(website_urls))
-    discovered_count = 0
+    img_buffer = DiscoveredImageBuffer()
 
     for url in website_urls:
         log.info("Capturing: %s", url)
@@ -124,7 +125,7 @@ async def scan_dealer_websites(
 
         distributor_id = _match_distributor_by_domain(url, distributor_mapping)
 
-        supabase.table("discovered_images").insert({
+        img_buffer.add({
             "scan_job_id": str(scan_job_id),
             "distributor_id": str(distributor_id) if distributor_id else None,
             "source_url": url,
@@ -136,9 +137,10 @@ async def scan_dealer_websites(
                 "full_page": True,
                 "viewport": "1920x1080",
             },
-        }).execute()
-        discovered_count += 1
-        log.info("Saved screenshot for %s", url)
+        })
+        log.info("Queued screenshot for %s", url)
+
+    discovered_count = img_buffer.flush_all()
 
     supabase.table("scan_jobs").update({
         "status": "analyzing",
@@ -164,7 +166,7 @@ async def scan_google_ads(
     Returns the number of discovered images saved.
     """
     log.info("Starting ScreenshotOne capture for %d advertisers", len(advertiser_ids))
-    discovered_count = 0
+    img_buffer = DiscoveredImageBuffer()
     skipped = []
 
     for adv_id in advertiser_ids:
@@ -199,7 +201,7 @@ async def scan_google_ads(
             or distributor_mapping.get(adv_id)
         )
 
-        supabase.table("discovered_images").insert({
+        img_buffer.add({
             "scan_job_id": str(scan_job_id),
             "distributor_id": str(distributor_id) if distributor_id else None,
             "source_url": transparency_url,
@@ -210,8 +212,9 @@ async def scan_google_ads(
                 "advertiser_id": adv_id,
                 "capture_method": "screenshotone",
             },
-        }).execute()
-        discovered_count += 1
+        })
+
+    discovered_count = img_buffer.flush_all()
 
     if skipped:
         log.warning(
@@ -263,7 +266,7 @@ async def scan_facebook_ads(
     Returns the number of discovered images saved.
     """
     log.info("Starting ScreenshotOne capture for %d pages", len(page_urls))
-    discovered_count = 0
+    img_buffer = DiscoveredImageBuffer()
 
     for page_url in page_urls:
         page_name = page_url.rstrip("/").split("/")[-1]
@@ -290,7 +293,7 @@ async def scan_facebook_ads(
                 distributor_id = dist_id
                 break
 
-        supabase.table("discovered_images").insert({
+        img_buffer.add({
             "scan_job_id": str(scan_job_id),
             "distributor_id": str(distributor_id) if distributor_id else None,
             "source_url": ad_library_url,
@@ -302,8 +305,9 @@ async def scan_facebook_ads(
                 "original_url": page_url,
                 "capture_method": "screenshotone",
             },
-        }).execute()
-        discovered_count += 1
+        })
+
+    discovered_count = img_buffer.flush_all()
 
     supabase.table("scan_jobs").update({
         "status": "analyzing",

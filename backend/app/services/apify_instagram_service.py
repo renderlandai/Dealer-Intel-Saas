@@ -17,6 +17,7 @@ import httpx
 
 from ..config import get_settings
 from ..database import supabase
+from .bulk_writers import DiscoveredImageBuffer
 
 log = logging.getLogger("dealer_intel.apify_instagram")
 
@@ -220,7 +221,7 @@ async def scan_instagram_organic(
         log.warning("No posts found for the provided profiles")
         return 0
 
-    total_inserted = 0
+    img_buffer = DiscoveredImageBuffer()
     skipped_no_image = 0
     skipped_video = 0
     for post in posts:
@@ -257,7 +258,7 @@ async def scan_instagram_organic(
             if not img_url or not img_url.startswith("http"):
                 continue
 
-            supabase.table("discovered_images").insert({
+            img_buffer.add({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
                 "source_url": post_url,
@@ -277,8 +278,9 @@ async def scan_instagram_organic(
                     "hashtags": post.get("hashtags", []),
                     "mentions": post.get("mentions", []),
                 },
-            }).execute()
-            total_inserted += 1
+            })
+
+    total_inserted = img_buffer.flush_all()
 
     supabase.table("scan_jobs").update({
         "status": "analyzing",

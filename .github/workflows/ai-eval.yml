@@ -1,0 +1,108 @@
+# AI Pipeline Eval Gate
+#
+# Runs `python -m eval.run` against the committed baseline whenever a PR
+# touches AI-pipeline code. Fails the check (exit 2) when any gate
+# threshold in `backend/eval/config.py` is exceeded.
+#
+# Cost / runtime: ~$0.85 of Anthropic spend, ~5 min wall clock per run.
+# Path-filtered so unrelated PRs don't trigger it. Drafts and PRs labelled
+# `skip-eval` are excluded.
+#
+# Required repo secret:
+#   ANTHROPIC_API_KEY  — production key with Claude access
+#
+# To make this check required for merge, add it to branch protection
+# under Settings → Branches → main → Required status checks.
+
+name: AI Eval Gate
+
+on:
+  pull_request:
+    paths:
+      - "backend/app/services/ai_service.py"
+      - "backend/app/services/cost_tracker.py"
+      - "backend/app/config.py"
+      - "backend/app/models.py"
+      - "backend/eval/**"
+      - "backend/requirements.txt"
+      - ".github/workflows/ai-eval.yml"
+  workflow_dispatch:
+
+# Cancel in-progress runs when a new commit lands on the same PR — saves
+# ~$0.85 per cancelled run.
+concurrency:
+  group: ai-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ai-eval:
+    name: AI Pipeline Eval
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Skip drafts and PRs explicitly opted out via the `skip-eval` label.
+    # workflow_dispatch always runs (no PR context to evaluate).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.pull_request.draft == false &&
+        !contains(github.event.pull_request.labels.*.name, 'skip-eval')
+      )
+
+    defaults:
+      run:
+        working-directory: backend
+
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Verify ANTHROPIC_API_KEY is configured
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY secret is not configured. Add it via Settings → Secrets and variables → Actions before this workflow can run."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run eval gate
+        id: eval
+        # concurrency=2 matches the local run cadence; keeps total runtime
+        # ~5 min while leaving room for prompt-cache reads to land.
+        run: python -m eval.run --concurrency 2
+
+      - name: Locate latest report
+        id: report
+        if: always()
+        run: |
+          latest=$(ls -t eval/reports/eval-*.md 2>/dev/null | head -1 || true)
+          if [ -n "$latest" ]; then
+            echo "path=$latest" >> "$GITHUB_OUTPUT"
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Render report into job summary
+        if: always() && steps.report.outputs.found == 'true'
+        run: cat "${{ steps.report.outputs.path }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload eval report
+        if: always() && steps.report.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-${{ github.sha }}
+          path: backend/eval/reports/eval-*.md
+          retention-days: 30

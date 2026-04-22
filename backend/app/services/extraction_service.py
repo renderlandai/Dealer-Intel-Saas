@@ -31,36 +31,14 @@ from playwright.async_api import async_playwright, Page, Browser, TimeoutError a
 from ..config import get_settings
 from ..database import supabase
 from ..services import ai_service
+from ..services.bulk_writers import (
+    DiscoveredImageBuffer,
+    _safe_insert_discovered_image,
+)
 
 log = logging.getLogger("dealer_intel.extraction")
 
 settings = get_settings()
-
-
-def _safe_insert_discovered_image(data: dict) -> bool:
-    """Insert a discovered_image row, gracefully handling deleted distributors.
-
-    If the distributor was deleted mid-scan (FK violation 23503), the row is
-    re-inserted with distributor_id=None so the scan keeps running.
-    Returns True on success, False on failure.
-    """
-    try:
-        supabase.table("discovered_images").insert(data).execute()
-        return True
-    except Exception as e:
-        if "23503" in str(e) and data.get("distributor_id"):
-            log.warning(
-                "Distributor %s deleted mid-scan — saving image without distributor",
-                data["distributor_id"],
-            )
-            data["distributor_id"] = None
-            try:
-                supabase.table("discovered_images").insert(data).execute()
-                return True
-            except Exception as retry_err:
-                log.error("Insert still failed after clearing distributor_id: %s", retry_err)
-                return False
-        raise
 
 
 # Shared browser instance to avoid repeated cold starts
@@ -486,7 +464,8 @@ async def _extract_from_viewport(
     viewport_label = "mobile" if mobile else "desktop"
     browser = await _get_browser()
     page = await _new_page(browser, mobile=mobile)
-    extracted_count = 0
+    img_buffer = DiscoveredImageBuffer()
+    first_pass_added = 0  # tracks whether the first pass added anything (for retry trigger)
     evidence_url = None
 
     try:
@@ -533,7 +512,7 @@ async def _extract_from_viewport(
             seen_srcs.add(img["src"])
 
             location = _classify_location(img["y"], page_height)
-            if _safe_insert_discovered_image({
+            img_buffer.add({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
                 "source_url": url,
@@ -552,8 +531,8 @@ async def _extract_from_viewport(
                     "css_classes": img["classes"],
                     "evidence_screenshot_url": evidence_url,
                 },
-            }):
-                extracted_count += 1
+            })
+            first_pass_added += 1
 
     except PlaywrightTimeout:
         log.error("Timeout loading %s (%s) — will retry with fresh browser", url, viewport_label)
@@ -566,7 +545,7 @@ async def _extract_from_viewport(
             pass
 
     # Retry once with a recycled browser when extraction failed completely
-    if extracted_count == 0 and evidence_url is None:
+    if first_pass_added == 0 and evidence_url is None:
         log.info("Retrying %s (%s) with fresh browser", url, viewport_label)
         global _browser, _pw_instance, _browser_created_at
         async with _browser_lock:
@@ -621,7 +600,7 @@ async def _extract_from_viewport(
                     continue
                 seen_srcs.add(img["src"])
                 location = _classify_location(img["y"], page_height)
-                if _safe_insert_discovered_image({
+                img_buffer.add({
                     "scan_job_id": str(scan_job_id),
                     "distributor_id": str(distributor_id) if distributor_id else None,
                     "source_url": url,
@@ -640,8 +619,7 @@ async def _extract_from_viewport(
                         "css_classes": img["classes"],
                         "evidence_screenshot_url": evidence_url,
                     },
-                }):
-                    extracted_count += 1
+                })
 
         except PlaywrightTimeout:
             log.error("Retry also timed out for %s (%s)", url, viewport_label)
@@ -653,6 +631,7 @@ async def _extract_from_viewport(
             except Exception:
                 pass
 
+    extracted_count = img_buffer.flush_all()
     return extracted_count, evidence_url, seen_srcs
 
 
@@ -829,7 +808,7 @@ async def _extract_ads_from_viewport(
     viewport_label = "mobile" if mobile else "desktop"
     browser = await _get_browser()
     page = await _new_page(browser, mobile=mobile)
-    extracted_count = 0
+    img_buffer = DiscoveredImageBuffer()
     evidence_url = None
 
     try:
@@ -873,7 +852,7 @@ async def _extract_ads_from_viewport(
             if extra_metadata:
                 meta.update(extra_metadata)
 
-            if _safe_insert_discovered_image({
+            img_buffer.add({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
                 "source_url": target_url,
@@ -881,8 +860,7 @@ async def _extract_ads_from_viewport(
                 "source_type": "extracted_image",
                 "channel": channel,
                 "metadata": meta,
-            }):
-                extracted_count += 1
+            })
 
     except PlaywrightTimeout:
         log.error("Timeout loading %s (%s)", target_url[:60], viewport_label)
@@ -894,6 +872,7 @@ async def _extract_ads_from_viewport(
         except Exception:
             pass
 
+    extracted_count = img_buffer.flush_all()
     return extracted_count, evidence_url, seen_srcs
 
 

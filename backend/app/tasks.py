@@ -100,7 +100,7 @@ def _mark_job_failed(scan_job_id: str, error: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _run_website_scan(urls, scan_job_id, distributor_mapping, campaign_id=None):
-    from .routers.scanning import run_website_scan
+    from .services.scan_runners import run_website_scan
     log.info("RUNNING website scan job=%s urls=%d", scan_job_id, len(urls))
     try:
         await asyncio.wait_for(
@@ -119,7 +119,7 @@ async def _run_website_scan(urls, scan_job_id, distributor_mapping, campaign_id=
 
 
 async def _run_google_ads_scan(advertiser_ids, scan_job_id, distributor_mapping, campaign_id=None):
-    from .routers.scanning import run_google_ads_scan
+    from .services.scan_runners import run_google_ads_scan
     log.info("RUNNING Google Ads scan job=%s advertisers=%d", scan_job_id, len(advertiser_ids))
     try:
         await asyncio.wait_for(
@@ -138,7 +138,7 @@ async def _run_google_ads_scan(advertiser_ids, scan_job_id, distributor_mapping,
 
 
 async def _run_facebook_scan(page_urls, scan_job_id, distributor_mapping, campaign_id=None, channel="facebook"):
-    from .routers.scanning import run_facebook_scan
+    from .services.scan_runners import run_facebook_scan
     log.info("RUNNING Facebook scan job=%s pages=%d", scan_job_id, len(page_urls))
     try:
         await asyncio.wait_for(
@@ -157,7 +157,7 @@ async def _run_facebook_scan(page_urls, scan_job_id, distributor_mapping, campai
 
 
 async def _run_instagram_scan(profile_urls, scan_job_id, distributor_mapping, campaign_id=None):
-    from .routers.scanning import run_instagram_scan
+    from .services.scan_runners import run_instagram_scan
     log.info("RUNNING Instagram scan job=%s profiles=%d", scan_job_id, len(profile_urls))
     try:
         await asyncio.wait_for(
@@ -177,7 +177,7 @@ async def _run_instagram_scan(profile_urls, scan_job_id, distributor_mapping, ca
 
 async def _run_analyze_scan(scan_job_id, campaign_id=None):
     """Run AI analysis on discovered images."""
-    from .routers.scanning import auto_analyze_scan, run_image_analysis
+    from .services.scan_runners import auto_analyze_scan, run_image_analysis
     from .database import supabase
 
     log.info("RUNNING analyze scan job=%s campaign=%s", scan_job_id, campaign_id)
@@ -232,7 +232,7 @@ async def _run_analyze_scan(scan_job_id, campaign_id=None):
 
 async def _run_reprocess_images(campaign_id, limit=100):
     """Re-analyze unprocessed images for a campaign."""
-    from .routers.scanning import run_image_analysis
+    from .services.scan_runners import run_image_analysis
     from .database import supabase
 
     log.info("RUNNING reprocess images campaign=%s limit=%d", campaign_id, limit)

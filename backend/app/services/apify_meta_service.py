@@ -25,6 +25,7 @@ import httpx
 
 from ..config import get_settings
 from ..database import supabase
+from .bulk_writers import DiscoveredImageBuffer
 
 log = logging.getLogger("dealer_intel.apify_meta")
 
@@ -412,7 +413,7 @@ async def scan_meta_ads(
     slug_map = _build_url_to_distributor_map(page_urls, distributor_mapping)
 
     # 6. Insert each ad image as a discovered_image
-    total_inserted = 0
+    img_buffer = DiscoveredImageBuffer()
     ads_with_images = 0
     ads_skipped = 0
 
@@ -454,7 +455,7 @@ async def scan_meta_ads(
         distributor_id = _resolve_distributor(ad, slug_map)
 
         for img_url in image_urls:
-            supabase.table("discovered_images").insert({
+            img_buffer.add({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
                 "source_url": ad_url or f"https://www.facebook.com/ads/library/?id={ad_id}",
@@ -474,8 +475,9 @@ async def scan_meta_ads(
                     "headline": ad.get("headline", ""),
                     "ad_text": (ad.get("adText") or "")[:500],
                 },
-            }).execute()
-            total_inserted += 1
+            })
+
+    total_inserted = img_buffer.flush_all()
 
     supabase.table("scan_jobs").update({
         "status": "analyzing",

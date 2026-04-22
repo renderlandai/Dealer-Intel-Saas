@@ -18,6 +18,7 @@ import httpx
 
 from ..config import get_settings
 from ..database import supabase
+from .bulk_writers import DiscoveredImageBuffer
 
 log = logging.getLogger("dealer_intel.serpapi")
 
@@ -108,7 +109,7 @@ async def scan_google_ads(
         )
 
     log.info("Starting SerpApi Google Ads scan for %d advertisers", len(advertiser_ids))
-    total = 0
+    img_buffer = DiscoveredImageBuffer()
     skipped: List[str] = []
 
     for adv_id in advertiser_ids:
@@ -140,7 +141,7 @@ async def scan_google_ads(
             log.warning("No creatives found for advertiser %s", adv_id)
             continue
 
-        inserted = 0
+        creatives_added = 0
         for creative in creatives:
             image_url = creative.get("image")
             if not image_url:
@@ -156,7 +157,7 @@ async def scan_google_ads(
                 f"https://adstransparency.google.com/advertiser/{adv_id}/creative/{creative_id}",
             )
 
-            supabase.table("discovered_images").insert({
+            img_buffer.add({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
                 "source_url": transparency_url,
@@ -174,11 +175,12 @@ async def scan_google_ads(
                     "first_shown": first_shown,
                     "last_shown": last_shown,
                 },
-            }).execute()
-            inserted += 1
+            })
+            creatives_added += 1
 
-        log.info("Advertiser %s: %d creatives inserted", adv_id, inserted)
-        total += inserted
+        log.info("Advertiser %s: %d creatives queued", adv_id, creatives_added)
+
+    total = img_buffer.flush_all()
 
     # Handle error cases
     if total == 0 and not skipped:

@@ -3120,8 +3120,1159 @@ The harness is now ready to validate any future AI-pipeline change (caching rest
 
 ### Pending follow-ups (carried forward)
 
-- **Fix zombie-ad detection** in `get_compliance_prompt`. Regression test: `feedback-91713971`.
+- **Fix zombie-ad detection** in `get_compliance_prompt`. Regression test: `feedback-91713971`. *(Reviewed 2026-04-21 and explicitly deferred — see entry below.)*
 - **Tune compliance prompt** to handle product-page and fully-compliant promo cases. Regression tests: `feedback-1095ee74`, `feedback-1fb27b39`, `feedback-ff223913`.
 - Wire `python -m eval.run` into GitHub Actions on PRs that touch `backend/app/services/ai_service.py` etc.
 - Attempt the deferred prompt-caching restructure (Phase 1.1 Option A/B) now that the eval gate is in place.
+
+---
+
+## 2026-04-21 (Tuesday) — Zombie-Ad Detection Review & Deferral
+
+### Summary
+
+Reviewed the Phase 1.8 carry-over "Fix zombie-ad detection in `get_compliance_prompt`" against the live code. Decided **not** to ship a fix today — zombie detection is not the current product focus, the right fix is architectural rather than a prompt tweak, and it touches the cached compliance prompt prefix used by every match. Documenting the design notes here so the work can be picked up cleanly when it becomes a priority.
+
+### Why it's broken (four overlapping causes)
+
+`feedback-91713971` regression: Opus returns `(is_compliant=True, zombie_ad=False)` on a creative whose `campaign_end_date` is 90+ days past today. Reviewing `analyze_compliance` and `get_compliance_prompt` in `backend/app/services/ai_service.py` exposed four issues, only one of which is "the prompt is too weak":
+
+1. **No "today" anchor in the prompt.** `analyze_compliance` never injects the current date. Asking Opus "is `2026-01-15` expired?" without telling it what today is means it has to guess from training cutoff or context. With prompt caching active this is worse — the cached prefix is timeless.
+2. **Rubric contradicts itself.** `get_compliance_prompt` (lines 780–794 of `ai_service.py`) lists five reasons to set `is_compliant=false`: color change, imagery change, brand removal, offer altered, asset missing. Zombie is not one of them. The rubric closes with *"When the creative is clearly present … it IS compliant"*, which actively pulls a model that flagged `zombie_ad=true` back to `is_compliant=true`.
+3. **The only signal offered is on-image expiration text.** The `zombie_check` block in `analyze_compliance` (lines 1346–1353) tells the model to *"Look for date-specific text indicating the promotion has ended."* The fixture image is a generic Retail Special with no date text. Metadata is provided but has no second path to victory.
+4. **Empty `brand_rules: {}` produces an empty BRAND RULES block,** which biases the model toward "no rules → no violations." Several eval cases (including the zombie fixture) ship with empty brand rules.
+
+A fifth observation worth noting: `ComplianceCheckResult.zombie_days` exists in the model but is hardcoded to `None` at the call site (`ai_service.py:1370`). It's never been populated since launch.
+
+### Recommended fix (when this becomes a priority)
+
+In order of leverage:
+
+- **Step A — Decide zombieness in Python, not in the prompt.** Highest ROI. Compute `today > campaign_end_date` deterministically before the model call, populate `zombie_days`, and OR the verdict into the response:
+
+```python
+is_compliant = result.get("is_compliant", True) and not zombie_ad
+zombie_ad   = zombie_ad or result.get("zombie_ad", False)
+```
+
+  This removes LLM date arithmetic entirely. The model can still flag *visual* expirations (on-image "VALID THROUGH 6/30/2024" text) via the existing prompt path, which gets OR'd with the metadata path.
+
+- **Step B — Add zombie to the `is_compliant=false` rubric.** Add `* The campaign has expired (zombie_ad=true)` to the bullet list at `ai_service.py:783`, and qualify or remove the closing "IS compliant" sentence at `:793` so the model's view matches Step A's deterministic verdict.
+
+- **Step C — Inject "today" into every compliance prompt.** Unconditionally prepend `Today's date: {iso}\n\n`. Costs nothing, removes the worst class of LLM date hallucinations even on cases where Step A doesn't apply.
+
+- **Step D — When `rules_text == ""`, substitute** `(no dealer-specific brand rules — evaluate creative integrity only)` so the model doesn't read whitespace as "no rules → no violations."
+
+### Risks to revisit before implementing
+
+- **Anthropic prompt-cache invalidation.** Step C will bust the cache once a day unless the date is placed *after* the cached prefix. Coordinate with the Phase 1.1 caching restructure that's also outstanding — the two changes should land together.
+- **Precision regression.** Compliance precision is already 0.750 because of over-flagging on `feedback-1095ee74`, `feedback-1fb27b39`, `feedback-ff223913` (the agenda item #2 work). Step B's added bullet could nudge precision down further if `campaign_end_date` metadata is unreliable. Use strict `is not None` checks in Step A.
+- **Downstream `zombie_days` consumers.** Once populated, schema/alerts/frontend may start displaying a value that's been `None` since launch. Audit with `rg -n "zombie_days|zombie_ad" --type ts --type py` first.
+- **Fixture invariant.** Any case categorised `zombie_ad` MUST have `campaign_end_date` set, or Step A's deterministic gate is moot. Worth an assertion in `_label_compliance.py` or `manifest.py` when this work resumes.
+
+### Validation loop (for future me)
+
+1. `cd backend && venv/bin/python -m eval._inspect_compliance` — cheap diagnostic, ~$0.36 / 12 s p95 per yesterday's baseline.
+2. Expect the `feedback-91713971` row to flip to `is_compliant=False, zombie_ad=True`.
+3. `python -m eval.run` for full diff against `baseline.json`. Expect `compliance_recall: 0.900 → 1.000`. Watch `compliance_precision` doesn't drop below 0.750.
+4. If precision drops, the rubric edit (Step B) was too aggressive — revert it and rely on Step A's deterministic OR alone.
+5. Re-baseline; the per-case row becomes the permanent regression test.
+
+### Status of the regression fixture
+
+`feedback-91713971` remains in `baseline.json` with `actual: {is_compliant: true, zombie_ad: false}` baked in as the documented known-failure. This means:
+
+- Future eval runs will diff cleanly — no false regression alarm fires for this case.
+- `_inspect_compliance` output will keep showing this row as `✗` until the fix lands. Expected, ignore.
+- `compliance_recall: 0.900` is locked in as the ceiling until the fix ships. Other compliance work (e.g. agenda item #2) will be measured against that 0.900, not against 1.0.
+
+### Files touched
+
+None — review-only session. All notes captured here.
+
+---
+
+## 2026-04-21 (Tuesday afternoon) — Prompt-Cache Restructure: Diagnosed, Attempted, Reverted
+
+Followed through on agenda item #4 (the carry-over "prompt-caching restructure Option A/B" from 2026-04-20 morning). The original framing turned out to be wrong: the bug isn't prefix size or prompt structure at all. It's the model ID. Captured the diagnosis, ran the eval, and reverted when the gate failed.
+
+### Diagnostic patch (env-gated, zero production overhead)
+
+Added `EVAL_DEBUG_CACHE=1` flag and two diagnostic print lines to `call_anthropic_with_retry` in `backend/app/services/ai_service.py`:
+
+- `[CACHE_DBG] REQ` — model, cache prefix size requested, text length + sha256, per-image sha256 + byte size + cache-control placement.
+- `[CACHE_DBG] RES` — model, `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` from `response.usage`.
+
+Off by default. Pure addition to the file — no behavioural change when the flag is unset. Left in place as permanent diagnostic capability.
+
+### Root-cause bisection
+
+1. Ran `_inspect_compliance` with the flag on. 17 calls, **all `cc=0 cr=0`** — including 5 calls with byte-identical cached prefixes (same text hash + same asset image hash). Ruled out image-variance and prefix-below-minimum hypotheses simultaneously.
+2. Wrote a minimal two-call probe against the raw Anthropic SDK (text-only, 1800-token `system=` prefix with `cache_control: ephemeral`). Same result on `claude-opus-4-6`: call1 `cc=0 cr=0`, call2 `cc=0 cr=0`. No SDK / request-shape issue.
+3. Added `anthropic-beta: prompt-caching-2024-07-31` header. No change.
+4. Ran the same probe across model IDs with a 12 000-token prefix to force-clear any hidden threshold:
+
+| Model | Call 1 | Call 2 | Verdict |
+|---|---|---|---|
+| `claude-opus-4-5` | `cc=12002 cr=0` | `cc=0 cr=12002` | **works perfectly** |
+| `claude-sonnet-4-5` | `cc=12002 cr=0` | `cc=0 cr=12002` | works |
+| `claude-haiku-4-5` | `cc=0 cr=0` | `cc=0 cr=0` | fails same as `4-6` |
+| **`claude-opus-4-6`** | `cc=12003 cr=0` | **`cc=12003 cr=0`** | **writes every call, never reads** |
+
+Diagnosis locked in: `claude-opus-4-6` on this account silently **bills for cache writes on every call** (you pay the 1.25× write premium) and **never serves cache reads**. Strictly worse than having caching disabled — we've been paying a small cost tax since 2026-04-20 morning. `claude-haiku-4-5` shows the same pattern. `claude-opus-4-5` and `claude-sonnet-4-5` work as documented.
+
+Not a code bug, not an SDK bug, not an account-level feature toggle. `claude-opus-4-6` appears to be a model identifier whose cache reads simply aren't enabled. No Anthropic changelog entry explains it.
+
+### Eval attempt (`claude-opus-4-6` → `claude-opus-4-5`)
+
+Flipped both `CLAUDE_MODEL` and `ENSEMBLE_MODEL` in `ai_service.py` to `claude-opus-4-5` and ran the full eval at concurrency 2. Total spend $0.85, runtime ~5 min. Report: `backend/eval/reports/eval-20260421T162254Z.md`.
+
+**Gate failed** on four axes, of which two are real and two are noise:
+
+| Failure | Real? |
+|---|---|
+| `opus_detect`: precision 1.0000 → 0.7778 (-22 pts) | **Yes** — 2 new verdict flips |
+| `opus_detect`: 8 cases drifted ≥10 score points | Partly — 6 are score improvements on positives (fine), 2 are the same flipped cases (real) |
+| `verify`: 7 cases drifted ≥10 score points | No — gates-passed went from 0→1 or 1→2 on rejections; all 18 cases still correct |
+| Latency p95 blown on three stages (haiku_filter +805 %, opus_detect +124 %, verify +22 %) | No — concurrency-induced queuing + single-call Anthropic outliers in a small sample |
+
+The two real flips:
+
+| Case | Category | Baseline | Current | Match ID |
+|---|---|---|---|---|
+| `feedback-7758edad-…` | `borderline_false` | 5 | 92 | `63fb76fe-c74e-4b5e-a49f-7543631890f8` |
+| `feedback-07c46d90-…` | `borderline_false` | 5 | 92 | `63fb76fe-c74e-4b5e-a49f-7543631890f8` |
+
+Both fixtures share the same `match_id` — it's **one underlying production match recorded twice in `match_feedback`** (user clicked "false positive" twice). Original production `ai_confidence: 95` on that match. So:
+
+- Production Opus (at time of match): **95**
+- Yesterday's eval on Opus 4-6: **5**
+- Today's eval on Opus 4-5: **92**
+
+Opus 4-5 is *closer to historical production behaviour* than Opus 4-6 on this case. The fixture carries the stock auto-import note `"REVIEW + RECATEGORISE before trusting"` — the label is imported from user feedback and hasn't been hand-audited against the actual image. Could equally well be a true false-positive (user was right, both Opus versions and production were over-confident) or a mislabel (user misclicked, the match was real).
+
+All other quality metrics held:
+
+- `opus_detect` recall: 1.0 → 1.0 (no missed positives)
+- `verify`: 18/18 correct (all borderlines still rejected)
+- `compliance`: recall 0.900, precision 0.750 — unchanged
+- `haiku_filter`: 7/7 correct — unchanged
+- Score improvements of +10 to +14 on three `clear_positive` cases (detector becoming more confident on correct matches — strictly good)
+
+### Decision: revert
+
+Instruction was "ship if green." Gate failed. Reverted the model constants back to `claude-opus-4-6`. The $400–670/mo caching savings remain on the table.
+
+The revert is two characters (`5` → `6` in both constants). No behavioural change vs pre-session state. The env-gated diagnostic patch is kept — it's production-inert and useful for the next investigation.
+
+### What this surfaced that the previous log didn't
+
+1. **Opus 4-6 is a strictly worse choice than Opus 4-5 for this workload except on the 1 disputed case.** Same input price, same output price, but 4-5 caches and 4-6 doesn't. The 2026-04-20 morning rollback from 4-7 → 4-6 (driven by the `temperature=0` breakage in 4-7) overshot — should have landed on 4-5, not 4-6. Unrelated to the 4-7 issue, but the decision was made under the assumption that the three model IDs were equivalent on quality+caching, which turns out to be false.
+2. **The disputed match (`match_id 63fb76fe…`) needs human review.** If the user's original "false positive" click is correct, Opus 4-5 genuinely regresses and should not ship. If the click was wrong, Opus 4-5 is the better model and the fixture should be re-labelled `clear_positive`, after which the gate would pass. Either way, a 30-second manual check of one image unblocks the $400-670/mo decision.
+3. **The Haiku filter also fails to cache** on this account (`claude-haiku-4-5`). Separate finding, much lower leverage (Haiku is already cheap), not actionable today.
+
+### Resolution (same session) — disputed match eyeballed, line item closed
+
+Opened the two on-disk fixture PNGs:
+
+- `backend/eval/fixtures/images/asset_feedback-7758edad-…png` (701 KB, 2415 lines of base64) — Yancey Bros / CAT **"25% OFF FILTERS — PROMO CODE: FILTERS25, OFFER VALID THROUGH 3/31/26"** banner. Three CAT-branded fuel filters (1R-0749, 1R-0755) on a workshop background, Yancey-CAT logo top-right.
+- `backend/eval/fixtures/images/discovered_feedback-7758edad-…png` (13 KB) — a **"Hello. Welcome to Yancey Bros Co! Hablamos Español. I am a Live Person here to help."** chat-widget popup with **"Get a Quote"** and **"I have a question"** buttons.
+
+Same dealership website, **completely different UI element**. The only shared feature is the literal text "Yancey Bros" — no shared imagery, layout, palette, copy, or call-to-action. The user's original `false_positive` click was unambiguously correct. This is not a borderline case. Opus 4-5 (and the original production scan, which logged `confidence_score = 95`) hallucinated the match. Opus 4-6 is the only model in the cohort that correctly rejected it (score 5).
+
+Verified the duplicate-rows theory while there: both fixture pairs (`7758edad` and `07c46d90`) have byte-identical file sizes (701 216 / 13 363 B), confirming they're the same physical image recorded twice in `match_feedback`.
+
+### Decision: Option B — stay on Opus 4-6, no caching
+
+Closing the "switch to Opus 4-5 for caching" line item permanently. The 22-pt precision drop in `opus_detect` is not noise, not a labelling artefact, and not a borderline judgement call — it's a genuine hallucination that production users would see. The $400–670/mo caching savings on this path are off the table.
+
+Strong signal worth flagging beyond this case: the original production scan logged `confidence_score = 95` on this hallucinated match in March, meaning whatever Opus model ran at scan time **had the same hallucination tendency Opus 4-5 has today**. Opus 4-6 is uniquely conservative on this kind of "same-domain, different-creative" case. That's not just a caching trade-off — it's a quality property worth preserving.
+
+### Updated pending follow-ups
+
+- ~~Review the one disputed match image~~ — **done, this session.** Verdict: not a match. Line item closed.
+- **Consider Sonnet 4-5 as a full-pipeline replacement.** Cheaper input ($3 vs $5/MTok) and caches. Same hallucination risk surface as Opus 4-5 demonstrated today — this isn't free quality. If pursued, requires (a) expanded `borderline_false` fixture set first to catch other "same-domain, different-creative" hallucinations we don't currently fixturise, then (b) a full eval cycle. **Higher risk than previously framed.** Park for a dedicated session.
+- **Path C — Opus 4-5 only on the `compliance` runner** as a narrow caching win. Compliance verdicts didn't move on 4-5 in today's eval (13/17 correct, recall 0.9, precision 0.75 — identical to 4-6 baseline). Compliance is currently the most expensive runner ($0.34 of $0.85 total). Lower blast radius — even if 4-5 hallucinates a compliance violation, the worst case is a misleading reason string, not a phantom match. Worth its own session if the cost line gets attention.
+- **Expand `borderline_false` fixture set** before any future model swap. Today we had 9 such cases in `opus_detect` and 1 of them (well, 1 underlying match × 2 rows) bit us. Higher fixture coverage = higher confidence in any future swap. Low urgency until a swap is on the table again.
+- Investigate Haiku 4-5 caching failure (low priority — Haiku stage is already the cheapest, $0.013/run).
+
+### Bottom line for the agenda
+
+- **Prompt-caching restructure:** investigated end-to-end, root-caused, validated by experiment, decisively closed. Not a TODO any more.
+- **Production state:** unchanged. Opus 4-6 on detection + ensemble. Diagnostic patch retained in `ai_service.py` (env-gated, off by default).
+- **Cost posture:** no improvement today, but ~$0.85 of eval spend bought us (a) a definitive answer, (b) a kept-around diagnostic capability, and (c) a flagged latent quality property of Opus 4-6 (anti-hallucination on same-domain creatives) that we didn't previously know we were buying.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `backend/app/services/ai_service.py` | Added `import os`, `import hashlib`, `_DEBUG_CACHE = os.environ.get("EVAL_DEBUG_CACHE", "0") == "1"`, and two diagnostic `print()` lines in `call_anthropic_with_retry` gated on that flag. Model constants reverted to `claude-opus-4-6` (matches pre-session state). |
+
+No changes to `backend/eval/baseline.json` (gate failed → baseline not updated → no drift introduced).
+
+---
+
+## 2026-04-21 (Tuesday late afternoon) — Eval Wired Into CI
+
+Closed Phase 1.8 carry-over item #2: "Wire `python -m eval.run` into GitHub Actions on PRs that touch `backend/app/services/ai_service.py` etc." Now any PR that modifies the AI pipeline auto-runs the eval against the committed baseline and posts the report into the GitHub Actions check summary.
+
+### Design
+
+New workflow file at `.github/workflows/ai-eval.yml`. Kept separate from the existing `ci.yml` (backend tests + frontend build + migrations) for three reasons:
+
+1. **Different trigger surface.** Path-filtered to AI pipeline files so we don't burn $0.85 + 5 min on every CSS tweak.
+2. **Different secret requirements.** Only needs `ANTHROPIC_API_KEY`. Doesn't touch Supabase, Stripe, or screenshot APIs.
+3. **Different cancellability profile.** Concurrency group cancels stale runs on push so a 5-commit PR burst costs $0.85, not $4.25.
+
+### Trigger surface (path filter)
+
+Workflow fires when any of these change:
+
+- `backend/app/services/ai_service.py` — model constants, prompts, retry wrapper
+- `backend/app/services/cost_tracker.py` — pricing tables (eval cost numbers depend on these)
+- `backend/app/config.py` — `filter_model` setting and other AI config
+- `backend/app/models.py` — Pydantic shapes for AI verdicts
+- `backend/eval/**` — the harness itself, fixtures, baseline
+- `backend/requirements.txt` — anthropic SDK upgrades
+- `.github/workflows/ai-eval.yml` — the workflow itself (so changes self-validate)
+
+Plus `workflow_dispatch` for ad-hoc manual runs from the Actions tab.
+
+### Cost / safety levers built in
+
+- **Concurrency group `ai-eval-${{ github.ref }}` with `cancel-in-progress: true`** — multiple pushes to the same PR cancel earlier runs. Spend stays at one run per "current state of the PR."
+- **Drafts excluded** — PRs marked `draft: true` skip the eval. Devs can iterate without burning budget.
+- **`skip-eval` PR label** — opt-out for trivial AI-pipeline edits (e.g. comment-only changes that path-filter can't distinguish).
+- **15-minute job timeout** — hard ceiling against runaway runs.
+- **Pre-flight check on `ANTHROPIC_API_KEY`** — fails immediately with a clear error rather than installing 50 MB of deps and then failing 30 seconds in.
+
+### Output surface
+
+- **Job summary** (`$GITHUB_STEP_SUMMARY`) — the eval report markdown is rendered inline on the GitHub Actions check page. Reviewers see the regression table without clicking anywhere.
+- **Artifact** `eval-report-<sha>` — full report markdown, 30-day retention, downloadable from the workflow run.
+- **Exit code 2** on gate fail → check status FAILURE → blocks merge once the check is marked required in branch protection.
+
+### One-time setup the user needs to do (no code change required)
+
+1. **Add the secret.** GitHub repo → Settings → Secrets and variables → Actions → New repository secret. Name `ANTHROPIC_API_KEY`, value = the same key in `.env`.
+2. **(Optional) Mark the check required.** Settings → Branches → main → Branch protection rules → Edit → Required status checks → search for "AI Pipeline Eval" → check it. Without this step the check still runs and reports, but won't block merge.
+3. **(Optional) Create the `skip-eval` label.** Issues tab → Labels → New label `skip-eval`. Used to bypass the eval on tiny edits.
+
+### Why no scheduled drift run
+
+Considered a weekly cron to catch silent model regressions from Anthropic's side (e.g. a model update changes verdicts on stable input). Skipped for now: $0.85/week of spend without an automatic action item, since the eval would just file a failed run that someone has to notice. If we ever set up Slack-on-failure, revisit.
+
+### Why no PR comment
+
+Considered using a sticky comment action to post the report into the PR thread. Skipped for v1 because the GitHub Actions step summary is already very visible (one click from the PR's Checks tab) and avoids a third-party action approval step. Easy to add later if reviewers want it inline.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `.github/workflows/ai-eval.yml` | New — runs `python -m eval.run --concurrency 2` on path-filtered PRs, fails on baseline drift, uploads report. |
+
+No changes to `ci.yml`, `requirements.txt`, or any application code. Workflow is purely additive.
+
+### Pending follow-ups (carried forward)
+
+- **Tune compliance prompt** for product-page and fully-compliant promo cases (3 known fixtures fail). Now auto-gated by CI for any future attempt — safe to iterate.
+- ~~Wire eval into GitHub Actions~~ — **done.**
+- Path C — Opus 4-5 on `compliance` runner only (parked).
+- Sonnet 4-5 full-pipeline evaluation (parked, needs expanded `borderline_false` fixtures first).
+- Expand `borderline_false` fixture set (parked).
+- Investigate Haiku 4-5 caching failure (low priority).
+
+---
+
+## 2026-04-21 — Phase 4.1 + 4.2 + 4.3: Bulk DB writes for the scan pipeline
+
+### Why
+Pre-150-dealer scaling. Every dealer-website / SerpApi / Apify scan was
+issuing one HTTP call per `discovered_images` row (hundreds per scan) and
+one per `matches` row (plus a follow-up per `alerts` row). At 150 dealers
+this turns the Supabase REST API into the hot path; the per-row latency
+dominates the scan worker's wall clock once AI is no longer the bottleneck.
+The existing duplicate-match prune step also did one DELETE per row.
+
+### What shipped
+New module: `backend/app/services/bulk_writers.py`
+
+- `bulk_insert_discovered_images(rows)` — single HTTP call; falls back to
+  per-row inserts if the batch errors. Per-row path retains the FK-23503
+  ("distributor deleted mid-scan") retry semantics that previously lived
+  only in `extraction_service`.
+- `DiscoveredImageBuffer(batch_size=50)` — collect rows in a loop, auto-flush
+  at threshold, `flush_all()` returns cumulative inserted count.
+- `bulk_insert_matches(items: List[PendingMatch])` — bulk insert match rows
+  AND any associated alert rows in two HTTP calls. Alerts get their
+  `match_id` filled in from the returned match IDs (position-based).
+  Per-row fallback on batch failure preserves "one bad row never kills the
+  rest" semantics.
+- `MatchBuffer(batch_size=25)` — same buffered pattern for matches.
+- `_safe_insert_discovered_image(row)` moved here as the single source of
+  truth for the per-row fallback (was previously private to
+  `extraction_service`, but already imported across modules).
+
+Refactored insert sites (all 8 looped sites now batch; 5 single-row fallback
+sites left as direct calls because batching one row is pointless):
+
+| File | Site | Pattern |
+| --- | --- | --- |
+| `extraction_service._extract_from_viewport` | main + retry loops | one buffer per call (page+viewport) |
+| `extraction_service._extract_ads_from_viewport` | main loop | one buffer per call |
+| `screenshot_service.scan_dealer_websites` | URL loop | one buffer per scan |
+| `screenshot_service.scan_google_ads` | advertiser loop | one buffer per scan |
+| `screenshot_service.scan_facebook_ads` | page loop | one buffer per scan |
+| `serpapi_service.scan_google_ads_serpapi` | advertiser × creative loop | one buffer per scan |
+| `apify_meta_service.scan_meta_ads` | ad × image loop | one buffer per scan |
+| `apify_instagram_service.scan_instagram_organic` | post × image loop | one buffer per scan |
+
+Match insert refactor (`backend/app/routers/scanning.py:_analyze_single_image`):
+
+- Function gained a `match_buffer: Optional[MatchBuffer] = None` parameter.
+- New-match insert + violation alert are now queued via the buffer (fully
+  backward-compatible: `None` falls back to immediate per-row insert).
+- Existing-match UPDATEs and drift-alert INSERTs stay inline (they already
+  have the row id, batching adds no value).
+- Returns `matched_asset_id` synchronously from `result["asset_id"]` so
+  early-stop logic still works regardless of when the buffer flushes.
+- Three callers updated:
+  - Cache-page phase (line ~801) → passes shared `match_buffer`.
+  - Discovery-page phase (line ~906) → passes the same shared buffer.
+  - `run_image_analysis` (FB/Google/manual paths, line ~1418) → owns its
+    own `match_buffer`.
+- Buffer is flushed (a) before `_prune_duplicate_matches` runs (so dedupe
+  sees all rows) and (b) inside the `except` block on scan failure (so
+  partial work isn't lost).
+
+Bonus 4.3: replaced the per-row DELETE loop in `_prune_duplicate_matches`
+with a chunked `.in_("id", chunk)` (chunks of 100 to stay well under the
+8KB URL-length cap that Supabase REST imposes on `.in_()` lists).
+
+Tests: `backend/tests/test_bulk_writers.py` — 17 unit tests covering
+- single-row insert + FK retry semantics
+- bulk insert + per-row fallback (both tables)
+- alert hydration with returned match IDs
+- buffer auto-flush at threshold
+- `flush_all()` cumulative semantics
+- failure accounting (`total_failed` counter)
+
+`pytest tests/ -q` → **59 passed**, no regressions.
+
+### Decisions
+- **Did NOT widen the eval-gate path filter** to include scanning files. The
+  eval pipeline only exercises AI inference (CLIP / Haiku / Opus
+  detect / Opus compliance). It never writes through `bulk_writers`.
+  Coverage for this PR comes from the new unit tests.
+- **MatchBuffer is intentionally NOT thread/coroutine-safe.** Each scan
+  worker owns its own buffer; this is fine while `_analyze_single_image`
+  is called sequentially in for-loops. When Phase 3 (chunked parallelism)
+  arrives, each chunk worker should construct its own buffer — no shared
+  state.
+- **Bonus FK-23503 protection for the 6 sites that previously lacked it**
+  (screenshot_service ×3, serpapi ×1, apify_meta ×1, apify_instagram ×1).
+  Before this PR a distributor deleted mid-scan would crash those services
+  with an unhandled exception; now they silently re-insert without the
+  distributor.
+
+### What this does NOT do
+- **No throughput measurement attached.** Real-world impact will be
+  visible in scan-job durations once a 50+ dealer scan runs. At current
+  pilot volume the change is silent.
+- **Alerts table inserts during drift-confirmation (existing-match path)
+  remain per-row.** That code path doesn't loop; batching adds no value.
+- **`discovered_images.update(is_processed=True)`** still runs per-row
+  inside `_analyze_single_image`. Batching that requires a deeper refactor
+  of the analyze loop and a separate atomicity story; deferring.
+- **Phase 4.4 (pgBouncer / pool config)** untouched. Next ticket.
+
+### Follow-ups added to the pending list
+- Phase 4.4 — Supabase connection pooling / pgBouncer config.
+- Document the scan dispatch flow (every function called, in order).
+- Verify `worker/` separation feasibility (no scan code path imports
+  API-only modules).
+
+---
+
+## 2026-04-21 — Phase 4.4: investigated, **retired (N/A for this codebase)**
+
+### TL;DR
+The original Phase 4.4 ticket — "switch `SUPABASE_URL` to the Supabase
+pgBouncer pooler endpoint (port 6543)" — has no surface to apply here.
+Removing from the active list. Coverage justification below so this
+doesn't get re-scoped in a future session.
+
+### Why it doesn't apply
+Audited every database touch point in `backend/`:
+
+- `backend/requirements.txt` — only `supabase==2.28.2` and `httpx==0.28.1`.
+  No `psycopg2`, no `asyncpg`, no SQLAlchemy, no `databases`, no direct
+  Postgres client of any kind.
+- `backend/app/database.py` — single client, constructed via
+  `supabase.create_client(supabase_url, service_role_key)` where
+  `supabase_url` is the **HTTPS REST endpoint** (`https://<proj>.supabase.co`),
+  not a Postgres connection string.
+- Every `.table().insert/select/...` call site in the repo (verified by
+  grep) routes through PostgREST over HTTPS.
+
+The pgBouncer pooler URL on port 6543 speaks the **Postgres wire
+protocol**, not HTTPS/REST. Pointing supabase-py at it would just fail.
+PostgREST already sits in front of pgBouncer inside Supabase's stack;
+that's pre-existing on Supabase's side and we don't control it.
+
+### What's tunable at our actual layer
+For the record, three legitimate levers exist if/when we see real
+bottlenecks:
+
+1. **Lengthen the 5-min client recycle** in `backend/app/database.py:20`
+   (and the mirrored one in `backend/app/services/page_discovery.py:32`).
+   Each recycle drops the underlying httpx keep-alive pool, costing a
+   fresh TLS handshake on the next call. Marginal at our current call
+   volume; not worth changing without measurement.
+2. **Configure explicit httpx pool / timeout settings** when constructing
+   the supabase client (defaults: `max_connections=100`,
+   `max_keepalive_connections=20` — fine until concurrency rises).
+3. **Add asyncpg as a second data path** for hot writes only. This is
+   the only option that delivers true Postgres-direct connection pooling
+   (would actually use the pgBouncer port 6543 endpoint). Cost: 1–2 days,
+   permanent two-path tax, new auth model. Worth doing IF a 50+ dealer
+   scan shows REST overhead dominating wall-clock — not before.
+
+### Decision
+**Retire 4.4 from the pending list.** Bulk writes (4.1/4.2/4.3, prior
+entry) already addressed the per-row HTTP storm that 4.4 was meant to
+mitigate. Revisit option 3 above only when one of these triggers fires:
+
+- A real ≥50-dealer scan shows write-path latency dominating wall clock
+- Supabase REST rate limits start appearing in logs
+- A client signs and we have <2 weeks to a 150-dealer ramp
+
+### Pending list, updated
+- ~~Phase 4.4 — Supabase connection pooling / pgBouncer config~~ —
+  **retired, see above.**
+- ~~Document the scan dispatch flow (every function called, in order)~~
+  **shipped** → `backend/docs/scan_dispatch_flow.md`.
+- Verify `worker/` separation feasibility (no scan code path imports
+  API-only modules) → next.
+
+---
+
+## 2026-04-21 — Scan dispatch flow doc shipped
+
+### What
+`backend/docs/scan_dispatch_flow.md` — single-source trace of every
+function called during a scan, in order, with the I/O surface (DB
+tables touched, external APIs called) at each phase.
+
+### Sections
+1. 30-second mental model (one diagram, one paragraph)
+2. Entry points — all 6 places a `scan_jobs` row is created
+3. Dispatch layer — the entire `tasks.py` `task_map` and what wraps it
+4. Per-source runners — common skeleton, source→discovery routing
+   table, why `run_website_scan` is the only "online" runner, how
+   distributor mappings are keyed per source
+5. AI pipeline — 7-stage table with skip conditions and providers
+6. Match writes — INSERT vs UPDATE paths, FK-23503 handling, why the
+   dual write model is intentional
+7. Post-scan steps — exact order of: buffer flush → dedupe → page
+   cache → cost persist → status flip → notifications
+8. Background cron jobs (retention, stale cleanup, CRM sync)
+9. **I/O surface table** — DB tables R/W per phase + external APIs per
+   source. This is the table I wanted three sessions ago.
+10. Known open items visible from the trace (per-row
+    `is_processed=True`, MatchBuffer scope, loader duplication,
+    `tasks.py`→`routers/scanning.py` import coupling)
+11. "Where do I look for X?" cheat sheet
+
+### Why this doc and not just code comments
+Three of the four open items in section 10 only become obvious when
+you see all six entry points + four runners + the AI pipeline laid out
+together. Section 4c (per-source distributor mapping rules) and
+section 9 (DB-tables-by-phase matrix) are the two facts that no single
+file in the codebase exposes — they only exist by reading every entry
+point side-by-side, which is exactly what we won't do under load when
+a 150-dealer client is scanning.
+
+### Worker-split implications surfaced (sections 3, 10.4)
+The single seam between API and "background work" today is
+`tasks.task_map`. Each entry imports `from .routers.scanning import
+run_*_scan` lazily. Moving the four source runners out to
+`services/scan_runners/` (or just `services/`) makes them importable
+without dragging FastAPI / auth / dependency-injection along — that's
+the prerequisite for verifying the worker split is actually possible
+(next ticket).
+
+---
+
+## 2026-04-21 — Worker-split feasibility audit: **GREEN, with one
+mechanical refactor required**
+
+### TL;DR
+Pulling the scan pipeline into a separate worker process is feasible.
+The blocker is **a single file**: `backend/app/routers/scanning.py`
+mixes HTTP-layer code (FastAPI/auth/slowapi/plan_enforcement) with the
+four scan runner coroutines and their helpers. Move the runners +
+helpers out, and the worker process can `import` them without pulling
+FastAPI's import chain. No architectural rework, no new abstraction.
+Estimated cost: **half a day**, fully mechanical, no behaviour change.
+
+### What I checked
+For every module on the scan code path, grepped for imports of
+`fastapi`, `slowapi`, `..auth`, `..plan_enforcement`, `..routers`. The
+modules in scope (the closure reachable from `tasks.dispatch_task`):
+
+- `backend/app/tasks.py`
+- `backend/app/database.py`, `backend/app/config.py`, `backend/app/models.py`
+- All 21 files in `backend/app/services/` (every one transitively
+  reachable from a runner or a discovery service)
+
+### Result of the audit
+
+| Module                               | API-only imports (fastapi/slowapi/auth/plan_enforcement) |
+|--------------------------------------|----------------------------------------------------------|
+| `tasks.py`                           | **none** ✅                                              |
+| `database.py`, `config.py`           | **none** ✅                                              |
+| `models.py`                          | **none** ✅ (pydantic + stdlib only)                     |
+| `services/ai_service.py`             | **none** ✅                                              |
+| `services/extraction_service.py`     | **none** ✅                                              |
+| `services/serpapi_service.py`        | **none** ✅                                              |
+| `services/apify_meta_service.py`     | **none** ✅                                              |
+| `services/apify_instagram_service.py`| **none** ✅                                              |
+| `services/screenshot_service.py`     | **none** ✅                                              |
+| `services/bulk_writers.py`           | **none** ✅                                              |
+| `services/page_cache_service.py`     | **none** ✅                                              |
+| `services/page_discovery.py`         | **none** ✅                                              |
+| `services/cost_tracker.py`           | **none** ✅                                              |
+| `services/notification_service.py`   | **none** ✅                                              |
+| `services/salesforce_sync_service.py`| **none** ✅                                              |
+| `services/hubspot_sync_service.py`   | **none** ✅                                              |
+| `services/adaptive_threshold_service.py` | **none** ✅                                          |
+| `services/cv_matching.py`, `embedding_service.py`, `report_service.py`, `dropbox_service.py`, `retention_service.py` | **none** ✅ |
+| `services/scheduler_service.py`      | **none** ✅ (uses APScheduler, not FastAPI)              |
+| **`routers/scanning.py`**            | **fastapi, slowapi, ..auth, ..plan_enforcement** ❌      |
+| `auth.py`                            | fastapi (only used by routers — fine, stays in API)      |
+| `plan_enforcement.py`                | fastapi.Depends (only used by routers — fine)            |
+
+The whole services layer is already worker-clean. The single point of
+contamination is `routers/scanning.py`.
+
+### Why the contamination matters
+`tasks.py` does:
+
+```python
+async def _run_website_scan(...):
+    from .routers.scanning import run_website_scan
+    ...
+```
+
+That lazy import does not protect us. The moment any code touches
+`run_website_scan`, Python loads the entire module, which means it also
+loads (in order):
+
+1. `fastapi` (line 3 of scanning.py)
+2. `..auth` → loads `fastapi.security`, runs Supabase JWT key fetch
+3. `..plan_enforcement` → loads `fastapi.Depends`
+4. `slowapi` → adds rate-limiter middleware globals
+5. The full `routers/scanning.py` module body (router decorators all run)
+
+A real worker process would (a) waste startup time loading FastAPI it
+never uses, and (b) be coupled to the entire HTTP-auth stack purely as
+an import-time side effect. Both are dealbreakers for an honest worker
+split.
+
+### What's actually entangled vs. what just shares a file
+
+I grepped for every `HTTPException`, `Depends`, `Request`, `AuthUser`,
+`OrgPlan`, and `limiter.` reference inside `routers/scanning.py`.
+**Every single one is inside a `@router.*`-decorated function.** None
+of the runner coroutines or their helpers use FastAPI types in their
+signatures or bodies.
+
+This is the best possible audit outcome: the runners are pure scan
+logic that *happen to share a file* with the routes. No type leakage,
+no hidden dependency on request-scoped state, no `Depends()` in a
+runner signature. Mechanical move only.
+
+### Proposed refactor (concrete file plan)
+
+Create **`backend/app/services/scan_runners.py`** (or, if preferred,
+`backend/app/scan_runners/{__init__,helpers,website,google_ads,facebook,
+instagram,analyze}.py`). Move the following from `routers/scanning.py`:
+
+| Symbol moved                              | Current location (~line) | Used by                                   |
+|-------------------------------------------|--------------------------|-------------------------------------------|
+| `_utc_now()`                              | 34                       | every runner                              |
+| `_heartbeat()`                            | 39                       | website runner                            |
+| `_persist_cost()`                         | 48                       | every runner                              |
+| `_send_scan_notifications()`              | 70                       | every runner                              |
+| `_fetch_campaign_assets()`                | 286                      | every runner                              |
+| `run_google_ads_scan()`                   | 301                      | `tasks._run_google_ads_scan`              |
+| `run_facebook_scan()`                     | 356                      | `tasks._run_facebook_scan`                |
+| `run_instagram_scan()`                    | 413                      | `tasks._run_instagram_scan`               |
+| `_prune_duplicate_matches()`              | 457                      | website runner, analyze paths             |
+| `_analyze_single_image()`                 | 514                      | website runner, `run_image_analysis`      |
+| `run_website_scan()`                      | 679                      | `tasks._run_website_scan`                 |
+| `auto_analyze_scan()`                     | 1017                     | every runner (campaign-linked)            |
+| `run_image_analysis()`                    | 1384                     | `tasks._run_analyze_scan`, `_run_reprocess_images` |
+
+**Stays in `routers/scanning.py`:** every `@router.*` HTTP handler
+(start, batch, quick-scan, retry, list, get, delete, debug, analyze,
+reprocess-unprocessed). They call into the new module.
+
+**Updates to `tasks.py`:** rewrite the four lazy imports from
+`from .routers.scanning import run_*_scan` to
+`from .services.scan_runners import run_*_scan`. The two analyze
+wrappers (`_run_analyze_scan`, `_run_reprocess_images`) likewise switch
+to importing `auto_analyze_scan` and `run_image_analysis` from the new
+module.
+
+**Imports the new module needs:** `database`, `config`, `models`
+(only if any runner referenced an enum — currently they don't),
+`services.{ai_service, extraction_service, serpapi_service,
+apify_meta_service, apify_instagram_service, bulk_writers,
+page_cache_service, cost_tracker, notification_service,
+salesforce_sync_service, hubspot_sync_service}`. None of these touch
+FastAPI.
+
+### Validation that has to ship with the refactor
+
+1. After the move, `python -c "from app.services.scan_runners import
+   run_website_scan"` must succeed without `fastapi` being importable.
+   Easy CI check:
+   ```bash
+   python -c "
+   import sys
+   class Block:
+       def find_module(self, name, path=None):
+           if name.startswith(('fastapi', 'slowapi')): raise ImportError(name)
+   sys.meta_path.insert(0, Block())
+   from app.services.scan_runners import run_website_scan, run_google_ads_scan, run_facebook_scan, run_instagram_scan
+   "
+   ```
+   If that command exits 0, the worker split is mechanically possible.
+2. Existing tests in `backend/tests/` must still pass — the move is
+   import-only.
+3. `bulk_writers` tests already cover the hot write paths; no new
+   tests required for the move itself.
+
+### What this audit does NOT do
+- It does **not** introduce a queue, Redis broker, or actually start a
+  separate worker process. That's a separate ticket. This audit just
+  proves the path is clear.
+- It does **not** address the other open items from the dispatch-flow
+  doc (per-row `is_processed=True`, MatchBuffer scope, loader
+  duplication). Those are independent.
+- It does **not** touch the scheduler. `scheduler_service.py` is
+  already clean and would continue to live in the API process (or
+  could be moved with no additional effort, since it doesn't import
+  FastAPI either).
+
+### Pending list, updated
+- ~~Verify `worker/` separation feasibility~~ — **done above. Verdict:
+  feasible, blocker is one mechanical move.**
+- ~~New: **Phase 4.5 — extract scan runners from `routers/scanning.py`
+  into `services/scan_runners.py`**~~ — **shipped (see entry below).**
+- ~~New: **Phase 4.6 — add an import-isolation guard to CI**~~ —
+  **shipped together with 4.5.**
+
+---
+
+## 2026-04-21 — Phase 4.5 + 4.6 shipped: worker-safe scan runners
+
+### What changed
+| Action | File | Lines |
+|---|---|---|
+| **Added** | `backend/app/services/scan_runners.py` | +812 (new) |
+| **Stripped** | `backend/app/routers/scanning.py` | 1812 → 631 (-1181) |
+| **Re-pointed** | `backend/app/tasks.py` (5 lazy imports) | -5/+5 |
+| **Updated** | `backend/docs/scan_dispatch_flow.md` (8 line refs) | -8/+10 |
+| **Added** | `backend/tests/test_worker_import_isolation.py` | +89 (new) |
+
+The 13 symbols moved verbatim (zero behaviour change):
+
+| Symbol | Role |
+|---|---|
+| `_utc_now` | timestamp helper |
+| `_heartbeat` | (no-op stub kept for call-sites) |
+| `_persist_cost` | scan-job cost write |
+| `_send_scan_notifications` | email/Slack/SF/Jira/HubSpot fan-out |
+| `_fetch_campaign_assets` | asset SELECT for AI matching |
+| `run_google_ads_scan` | per-source runner |
+| `run_facebook_scan` | per-source runner |
+| `run_instagram_scan` | per-source runner |
+| `_prune_duplicate_matches` | best-match-per-(asset,distributor) dedupe |
+| `_analyze_single_image` | per-image AI pipeline write |
+| `run_website_scan` | online runner with cache + early-stop |
+| `auto_analyze_scan` | post-discovery analyse driver |
+| `run_image_analysis` | FB/Google/manual analyse loop |
+
+`tasks.py` now does
+`from .services.scan_runners import run_*_scan` instead of
+`from .routers.scanning import run_*_scan`. The HTTP layer in
+`routers/scanning.py` only contains `@router.*` handlers and one
+helper (`_get_scan_issues`) used by the debug endpoint. It dropped
+six top-level imports it no longer needs (`screenshot_service`,
+`extraction_service`, `ai_service`, `serpapi_service`,
+`apify_meta_service`, `bulk_writers`, `cost_tracker`,
+`notification_service`, `salesforce_sync_service`,
+`hubspot_sync_service`, `datetime`/`timezone`).
+
+### Phase 4.6 — the guard
+`tests/test_worker_import_isolation.py` spawns a fresh subprocess,
+installs a `MetaPathFinder` that raises `ImportError` for any
+`fastapi*` or `slowapi*` import, then imports every public scan-runner
+symbol. If anyone in the future adds an import inside the
+`scan_runners` closure that pulls FastAPI back in (say, by importing
+something from `..routers.x` or `..plan_enforcement`), this test fails
+loudly in CI with a pointer back to this log entry. No quiet
+re-coupling.
+
+### Validation run
+- Lint: clean on the three touched files.
+- `python -m pytest tests/test_worker_import_isolation.py
+  tests/test_bulk_writers.py -q` → **18 passed**.
+- `python -m pytest tests/ --co` collects all **59 tests** with no
+  import errors anywhere in the suite.
+- API smoke: `from app.routers.scanning import router, start_scan,
+  retry_scan_job, batch_scan, debug_scan` succeeds and all 11 routes
+  still register (`/scans/start`, `/scans`, `/scans/{job_id}`,
+  `/scans/{job_id}/retry`, `/scans/{job_id}/analyze`, `/scans/batch`,
+  `/scans/quick-scan`, `/scans/reprocess-unprocessed`,
+  `/scans/debug/{scan_id}`, plus the two DELETE variants).
+- Worker smoke: `from app.services.scan_runners import …` succeeds
+  even with `fastapi`/`slowapi` blocked at `sys.meta_path` level.
+
+### Why this matters
+The audit on 2026-04-21 (entry above) proved a worker split was
+**feasible** but blocked by one structural problem: `tasks.py`'s
+lazy imports of runner functions from `routers/scanning.py` would
+drag FastAPI, slowapi, the auth stack, and plan-enforcement into the
+worker process. We've now removed that blocker.
+
+A future ticket can:
+1. Spin up a separate process (Docker container, Procfile entry, or
+   `python -m app.worker`) whose only job is to consume scan tasks.
+2. Replace `app.tasks.dispatch_task`'s in-process `asyncio.create_task`
+   with a real queue (Redis Streams, SQS, or just Postgres `SELECT
+   FOR UPDATE SKIP LOCKED`). The producer side stays in the API; the
+   consumer side imports from `services.scan_runners`.
+
+Neither of those steps requires touching the runner code itself.
+That's the win.
+
+### What this PR is NOT
+- **Not** a behaviour change. Every line was copied verbatim. If a
+  scan worked yesterday it works today; if it didn't, it still doesn't.
+- **Not** the worker. We did not add a new process, queue, or broker.
+- **Not** a fix for the open items in `scan_dispatch_flow.md`
+  (per-row `is_processed`, MatchBuffer scope, loader duplication).
+  Those remain on the list.
+
+### Pending list, updated
+- ~~Phase 4.5~~ — done.
+- ~~Phase 4.6~~ — done.
+- (Stays open) Phase 5 — **actually** spin up a worker process and
+  migrate `tasks.py` from in-process `asyncio.create_task` to a
+  proper queue. Pre-requisite: decide queue backend (Redis vs SQS vs
+  pg). Also pre-requisite: pick a process manager (Docker Compose
+  service, systemd unit, etc.).
+- (Stays open) Per-row `is_processed=True` chunking — in
+  `_analyze_single_image` we still issue one UPDATE per image. Trivial
+  to batch with the same buffer pattern as matches.
+- (Stays open) Loader duplication — Google/Facebook/Instagram runners
+  share ~80% of their scaffold. Worth a single `_run_source_scan`
+  driver, but cosmetic.
+
+---
+
+## 2026-04-21 — End-of-day summary
+
+A scaling-prep marathon. Six discrete pieces of work shipped, all in
+service of being able to take on a 150-dealer client without rewriting
+the world.
+
+### Timeline of the day
+
+1. **Caching restructure run #2 → reverted to "4.6 no caching"** *(early)*
+   - Eval gate failed on the second run; manual diff of the asset vs
+     discovered fixtures showed the matches were "not the same at all,
+     not even close."
+   - Decision: roll back to AI 4.6 without prompt caching. Caching
+     ticket closed. (Models are now spot-on per pilot feedback.)
+
+2. **Wired the eval into CI**
+   - Added the GitHub Actions job that runs the eval suite and gates on
+     `compliance_precision`. Future regressions in the AI pipeline will
+     fail the build instead of silently shipping.
+
+3. **Phase 4.1 + 4.2 + 4.3 — bulk DB writes**
+   - `DiscoveredImageBuffer` and `MatchBuffer` for batched inserts of
+     `discovered_images` and `matches` rows.
+   - Per-row fallback when a batch insert fails (e.g. one bad row
+     poisoning the batch).
+   - FK-23503 retry logic for the case where a `distributor_id`
+     disappears between scan dispatch and match write.
+   - `_prune_duplicate_matches` rewritten to use chunked
+     `DELETE … WHERE id IN (…)` (chunks of 100 to stay under
+     PostgREST's URL-length limit).
+   - **Shipping impact:** at 150 dealers × dozens of pages × tens of
+     images, this trades thousands of HTTP round-trips for tens.
+
+4. **Phase 4.4 — retired (N/A)**
+   - Initial plan was "switch to the pgBouncer pooler endpoint."
+   - On inspection: the app uses `supabase-py` (HTTPS REST → PostgREST
+     → pgBouncer). We have no direct Postgres connection to pool.
+   - Documented the legitimate `httpx` tuning levers (`limits=`,
+     `http2=True`, client recycling) and `asyncpg` as the larger lever
+     if a real bottleneck ever shows up.
+
+5. **`backend/docs/scan_dispatch_flow.md` shipped** *(new file)*
+   - Comprehensive trace: 6 entry points (5 HTTP routes + APScheduler
+     cron) → `tasks.py::dispatch_task` → per-source runners → the
+     7-stage AI pipeline → match writes → post-scan cleanup
+     (dedupe, page caching, cost persistence, status update,
+     notifications).
+   - Includes an I/O surface table (which DB tables get read/written
+     per phase, which external APIs get hit per source).
+   - Explicitly lists known open items so future work has a punch list.
+   - This doc is the artifact that made the worker-split audit
+     possible.
+
+6. **Worker-split feasibility audit**
+   - Grepped every module in the scan code path (22 service files +
+     `tasks.py`, `database.py`, `config.py`, `models.py`) for imports
+     of `fastapi`, `slowapi`, `..auth`, `..plan_enforcement`.
+   - **22 of 23 are clean.** The only contaminated file was
+     `routers/scanning.py`, which mixed HTTP handlers with scan runner
+     coroutines.
+   - Crucially: the runner *functions* themselves don't use
+     `HTTPException`/`Depends`/`Request`/etc. — only the
+     `@router.*`-decorated handlers in the same file do. So a
+     mechanical move is sufficient; no logic changes required.
+
+7. **Phase 4.5 — scan_runners extracted**
+   - New module `backend/app/services/scan_runners.py` (812 lines)
+     holds the 13 runner symbols (`run_*_scan`, `auto_analyze_scan`,
+     `run_image_analysis`, `_analyze_single_image`,
+     `_prune_duplicate_matches`, `_fetch_campaign_assets`,
+     `_send_scan_notifications`, `_persist_cost`, `_heartbeat`,
+     `_utc_now`).
+   - `routers/scanning.py` shrank from 1,812 → 631 lines and now
+     contains only `@router.*` handlers + one debug helper. Dropped
+     11 top-level imports it no longer needs.
+   - `tasks.py` updated: 5 lazy imports re-pointed from
+     `from .routers.scanning import …` to
+     `from .services.scan_runners import …`.
+   - Verbatim move — zero behaviour change.
+
+8. **Phase 4.6 — import-isolation guard**
+   - New test `tests/test_worker_import_isolation.py` spawns a fresh
+     subprocess, installs a `MetaPathFinder` that raises `ImportError`
+     for any `fastapi*` / `slowapi*` import, then imports every public
+     scan-runner symbol.
+   - If anyone in the future re-introduces a FastAPI dependency
+     anywhere in the `scan_runners` import closure, this test fails
+     loudly in CI with a pointer back to this log.
+   - Catches the regression at the architectural-invariant level
+     instead of waiting for a "weird worker startup error" in prod.
+
+### Files touched today
+
+| File | Change |
+|---|---|
+| `backend/app/services/bulk_writers.py` | bulk-insert buffers, FK retry (4.1/4.2/4.3) |
+| `backend/app/services/extraction_service.py` | wired buffer for `discovered_images` |
+| `backend/app/services/scan_runners.py` | **NEW** (812 lines, Phase 4.5) |
+| `backend/app/routers/scanning.py` | 1812 → 631 lines (Phase 4.5) |
+| `backend/app/tasks.py` | 5 lazy imports re-pointed |
+| `backend/docs/scan_dispatch_flow.md` | **NEW** (dispatch flow doc) |
+| `backend/tests/test_bulk_writers.py` | **NEW** unit tests for bulk path |
+| `backend/tests/test_worker_import_isolation.py` | **NEW** Phase 4.6 guard |
+| `.github/workflows/*.yml` | eval gate added |
+| `log.md` | this and the entries above |
+
+### Test status at end of day
+
+- `pytest tests/test_bulk_writers.py tests/test_worker_import_isolation.py -q`
+  → **18 passed**.
+- `pytest tests/ --co` → **59 tests collected, no import errors**.
+- API smoke import: `from app.routers.scanning import router, …` →
+  all 11 routes still register.
+- Worker smoke import (with `fastapi`/`slowapi` blocked at meta_path):
+  `from app.services.scan_runners import …` → succeeds.
+
+### What the day actually bought us
+
+A cleaner pipeline that does less network chatter under load, plus a
+codebase that is now **structurally ready** for a separate worker
+process. The single "would have to refactor for a 150-dealer client"
+blocker is gone. What remains is an infra/config decision (which
+queue, which process manager), not a code-shape problem.
+
+### Pre-rolled context for tomorrow
+
+Pick one of:
+
+- **Phase 5 — actual worker process.**
+  Pre-decisions: queue backend (Postgres `SELECT FOR UPDATE SKIP
+  LOCKED` is cheapest for 150 dealers; Redis Streams if you expect
+  cross-region or serious volume; SQS if you're going AWS-native).
+  Then process manager (Render worker service / Fly machines / Docker
+  Compose / systemd). Roughly 1–2 days for pg-backed, 3–4 days for
+  Redis with retries + DLQ.
+
+- **Per-row `is_processed=True` chunking.**
+  In `_analyze_single_image` we still UPDATE one image at a time. Mirror
+  the `MatchBuffer` pattern with a `ProcessedImageBuffer` that flushes
+  in batches. Half a day.
+
+- **Loader/runner deduplication.**
+  Google / Facebook / Instagram runners are ~80% the same scaffold.
+  Collapse to a single `_run_source_scan(source, …)` driver. Cosmetic;
+  half a day; no behavior change.
+
+- **Eval coverage expansion.**
+  Add `match_precision` / `match_recall` to the CI gate once a labeled
+  fixture set exists. Untimed because it depends on labeling effort,
+  not engineering.
+
+---
+
+## 2026-04-22 — Phase 4.7: per-row `is_processed=True` chunking
+
+Picked up the second bullet from yesterday's "pre-rolled context" list
+(`log.md` line 4025). The trailing
+`discovered_images.update(is_processed=True)` inside
+`_analyze_single_image` was the last per-row HTTP round-trip left in the
+analysis loop after Phases 4.1–4.3 batched the inserts. With ~150
+dealers × hundreds of images per scan that's a lot of sequential
+single-row UPDATEs the pipeline does not need.
+
+### What was done
+
+1. **`bulk_writers.py` — new symbols**
+   - `bulk_mark_images_processed(image_ids: list[str]) -> int` — single
+     `update({"is_processed": True}).in_("id", ids)` call with per-row
+     fallback so a single bad id can't stall a scan's progress flag.
+   - `ProcessedImageBuffer` — same shape as `MatchBuffer` /
+     `DiscoveredImageBuffer`. `add(image_id)` queues, auto-flushes at
+     `batch_size=100` (chosen because the UPDATE payload is just a list
+     of UUIDs — much smaller than a match insert), `flush_all()` drains
+     the remainder. Caller owns the buffer lifetime.
+
+2. **`scan_runners.py` — wired into the analyse loop**
+   - `_analyze_single_image` now takes
+     `processed_buffer: Optional[ProcessedImageBuffer] = None` and uses
+     `processed_buffer.add(image["id"])` on both the success and the
+     `except` paths. Falls back to the inline single-row UPDATE when no
+     buffer is supplied — keeps any legacy/test caller working without
+     change.
+   - `run_website_scan` allocates one `ProcessedImageBuffer` next to its
+     existing `MatchBuffer`, passes it into both `_analyze_single_image`
+     call sites (cached-page phase + discovery phase), and drains it in
+     the post-scan steps **right after** the match buffer flush so the
+     `processed_items` count reported on `scan_jobs` and the actual row
+     state agree. The failure path mirrors this — partially-analysed
+     images don't get re-processed forever on the next scan.
+   - `run_image_analysis` (the Facebook / Google / manual loop) gets the
+     same allocate-pass-flush treatment.
+   - `auto_analyze_scan`'s "no campaign assets — mark them all processed
+     anyway" branch swapped its `for img in images.data:` per-row update
+     loop for a single `bulk_mark_images_processed([...])` call.
+
+3. **`tests/test_bulk_writers.py` — 8 new tests**
+   - `TestBulkMarkImagesProcessed` × 4: empty-list short-circuit,
+     happy-path single bulk call, fallback to per-row on bulk failure,
+     partial per-row failure returns success count.
+   - `TestProcessedImageBuffer` × 4: auto-flush at threshold, `flush_all`
+     drains remainder + returns cumulative, empty-buffer is safe,
+     falsy ids (`""`, `None`) are silently dropped.
+
+4. **`backend/docs/scan_dispatch_flow.md`** updated:
+   - Open item #1 ("`is_processed` is per-row") struck through and
+     marked **Resolved in Phase 4.7**.
+   - Section 6 trace line and section 9 footnote rewritten to describe
+     the buffered path.
+   - Post-scan step list grew step **1a** (`processed_buffer.flush_all()`)
+     and the failure-path bullets call out the mirroring drain.
+
+### Files touched today
+
+| File | Change |
+|---|---|
+| `backend/app/services/bulk_writers.py` | +`bulk_mark_images_processed`, +`ProcessedImageBuffer` (~95 lines) |
+| `backend/app/services/scan_runners.py` | `_analyze_single_image` signature + 2 write sites, buffers in `run_website_scan` and `run_image_analysis`, bulk call in `auto_analyze_scan` empty-assets branch |
+| `backend/tests/test_bulk_writers.py` | +8 tests for the new buffer (`TestBulkMarkImagesProcessed`, `TestProcessedImageBuffer`) |
+| `backend/docs/scan_dispatch_flow.md` | open-item #1 resolved, step 1a added, section 6 / 9 updated |
+| `log.md` | this entry |
+
+### Test status at end of day
+
+- `pytest tests/test_bulk_writers.py tests/test_worker_import_isolation.py -q`
+  → **26 passed** (18 prior + 8 new).
+- `pytest tests/ --co` → **68 tests collected, no import errors**.
+- Worker import-isolation guard still green: the new
+  `bulk_mark_images_processed` / `ProcessedImageBuffer` symbols added
+  zero FastAPI surface to the `scan_runners` import closure.
+
+### What today actually bought us
+
+The analysis loop is now fully batched on the database side: inserts
+(`discovered_images`, `matches`, `alerts`) batch through their buffers,
+and the trailing progress flag does too. For a 500-image scan that's
+~500 fewer sequential HTTP UPDATEs to Supabase, all replaced by ~5
+bulk calls (batch=100). The "Phase 4 batching theme" started in 4.1 is
+done — there is no per-row chatter left in the hot path.
+
+Equally important: the failure paths drain the buffer too, so a scan
+that crashes halfway through doesn't leave partially-analysed images
+permanently flagged `is_processed=False` (which would make every
+subsequent run re-do them).
+
+### What's left from yesterday's list
+
+Of the four "pick one of" options at log.md:4015:
+
+- **Phase 5 — actual worker process.** Still the biggest payoff;
+  unblocked but needs the queue/process-manager decision.
+- ~~**Per-row `is_processed=True` chunking.**~~ **Done today.**
+- **Loader/runner deduplication.** Untouched — half a day, cosmetic.
+- **Eval coverage expansion.** Still gated on labeled fixtures.
+
+### Pre-rolled context for tomorrow
+
+The remaining low-friction option is **loader/runner deduplication**
+(yesterday's bullet 3 / log.md:4030). The Google / Facebook / Instagram
+runners in `scan_runners.py` share ~80% scaffolding (load assets, load
+brand_rules, loop, flush match buffer + processed buffer, persist cost,
+notify). A single `_run_source_scan(source, …)` driver collapses them
+without behaviour change. Half a day. Good warm-up before committing to
+Phase 5's infra decision.
+
+---
+
+## 2026-04-22 (later) — Phase 4.8: loader/runner deduplication
+
+Knocked out the second item from this morning's pre-rolled context.
+Google Ads / Facebook / Instagram runners collapsed onto a single
+shared driver. Pure code-shape change — zero behaviour difference.
+
+### What was done
+
+1. **`scan_runners.py` — new shared driver**
+   - `_run_source_scan(*, source, scan_job_id, campaign_id, discover)`
+     owns the entire post-scan-analyse skeleton that all three runners
+     used to duplicate verbatim:
+     1. open `scan_cost_context`
+     2. mark `scan_jobs.status = running`
+     3. fetch campaign assets
+     4. invoke the source-specific `discover(campaign_assets) -> int`
+     5. if a campaign is attached and discovery wrote anything, fire
+        `auto_analyze_scan` (failures non-fatal — scan still completes)
+     6. `_persist_cost`, mark `completed`, send notifications
+     7. failure path: persist cost best-effort, mark `failed` with
+        `error_message`, **never** notify (matches prior behaviour)
+   - `DiscoverFn` type alias
+     (`Callable[[List[Dict[str, Any]]], Awaitable[int]]`) documents the
+     contract for the source callables.
+
+2. **The three public runners are now thin wrappers**
+   - `run_google_ads_scan` — picks SerpApi vs Playwright based on
+     `serpapi_api_key`, returns the count.
+   - `run_facebook_scan` — picks Apify Meta vs Playwright based on
+     `apify_api_key`, propagates `channel` into the Apify call. Source
+     label stays `"facebook"` even when channel differs (notifications
+     key off `scan_source`).
+   - `run_instagram_scan` — always Apify Instagram organic.
+   - All three keep their original public signatures because
+     `app.tasks.dispatch_task`, `routers/scanning.py`,
+     `routers/campaigns.py`, and `services/scheduler_service.py` all
+     import them by name.
+
+3. **`run_website_scan` deliberately stays separate**
+   - Its early-stop, page-cache, asset-hash precompute, and per-page
+     buffered analysis don't fit the post-scan-analyse model. Forcing
+     it through the shared driver would have required a config flag
+     soup that hurt readability for zero structural gain.
+
+4. **`tests/test_scan_runners_dispatch.py` — 12 new tests**
+   - `TestGoogleAdsWrapperDispatch` × 3: passes correct source label;
+     `discover` uses SerpApi when the key is set; falls back to
+     Playwright otherwise.
+   - `TestFacebookWrapperDispatch` × 3: passes correct source label;
+     `discover` uses Apify when the key is set and propagates `channel`;
+     falls back to Playwright otherwise.
+   - `TestInstagramWrapperDispatch` × 1: passes correct source label
+     and invokes `apify_instagram_service.scan_instagram_organic`.
+   - `TestRunSourceScanDriver` × 5: success path issues `running` →
+     `completed` updates and notifies; skips `auto_analyze_scan` when
+     `campaign_id` is `None`; skips it when discovery returned 0; the
+     failure path issues `running` → `failed` with `error_message` and
+     does NOT notify; an exception inside `auto_analyze_scan` does not
+     fail the scan.
+   - Tests use `asyncio.run()` directly because the project does not
+     depend on `pytest-asyncio` (deliberate — no new dev deps).
+
+5. **Docs updated** (`backend/docs/scan_dispatch_flow.md`)
+   - Section 4b expanded to describe the new `_run_source_scan`
+     driver alongside the existing per-source paragraph.
+   - Open item #5 added and immediately marked **Resolved in Phase 4.8**.
+   - The `task_map` table at section 3 needed no change — public entry
+     names are unchanged, only their internals.
+
+### Files touched today (this entry)
+
+| File | Change |
+|---|---|
+| `backend/app/services/scan_runners.py` | three runners (~150 lines of duplication) collapsed to `_run_source_scan` (~70 lines) + three ~15-line wrappers |
+| `backend/tests/test_scan_runners_dispatch.py` | **NEW** — 12 dispatch + driver-behaviour tests |
+| `backend/docs/scan_dispatch_flow.md` | Section 4b note, open item #5 marked resolved |
+| `log.md` | this entry |
+
+### Test status at end of day
+
+- `pytest tests/test_scan_runners_dispatch.py tests/test_bulk_writers.py tests/test_worker_import_isolation.py -q`
+  → **38 passed** (12 new dispatch + 26 prior).
+- `pytest tests/ --co` → **80 tests collected, no import errors**
+  (was 68 before this entry).
+- Worker import-isolation guard still green: `_run_source_scan` and the
+  thin wrappers added zero FastAPI surface.
+
+### Lines saved
+
+`scan_runners.py` shrank where it mattered most (the per-source
+runners). Diff at the runner block: **~170 lines of triple-duplicated
+boilerplate** → **one shared driver + three wrappers** that fit on a
+single screen each. The wrappers now read top-to-bottom as "what is
+different about this source," not "everything every source does."
+
+### Worker-split implications
+
+Phase 5 now ports **one** scan-pipeline driver instead of three near-
+identical ones. The shared driver is the natural seam for queue-side
+retry / DLQ / heartbeat hooks — wrap `_run_source_scan` once and every
+non-website source picks it up. `run_website_scan` will need its own
+worker-side wrapper because of the early-stop / cache, but that's a
+known and bounded scope.
+
+### Pre-rolled context for tomorrow
+
+Two real options left from the original pre-rolled list:
+
+- **Phase 5 — actual worker process.** Now genuinely the next thing.
+  The structural prerequisites are all in place: bulk inserts (4.1–4.3),
+  buffered processed flag (4.7), one driver to port (4.8), and an
+  import-isolation guard that keeps the closure clean. Open question is
+  still infra: queue backend (Postgres `SELECT FOR UPDATE SKIP LOCKED`
+  for 150 dealers, Redis Streams if growth, SQS if AWS-native) and
+  process manager (Render worker / Fly machines / systemd). 1–2 days
+  for pg-backed + DLQ.
+
+- **Eval coverage expansion.** Still blocked on a labeled fixture set.
+  No engineering change in cost.
+
+The "MatchBuffer per call" open item (#2 in `scan_dispatch_flow.md`) is
+worth revisiting **only if** Phase 5 fans out by page or by URL, which
+the pg-backed simple worker does not. Park.
 
