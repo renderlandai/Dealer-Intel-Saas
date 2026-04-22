@@ -35,8 +35,14 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" className={`dark ${inter.variable} ${jakarta.variable} ${mono.variable}`} suppressHydrationWarning>
+    <html
+      lang="en"
+      translate="no"
+      className={`dark ${inter.variable} ${jakarta.variable} ${mono.variable}`}
+      suppressHydrationWarning
+    >
       <head>
+        <meta name="google" content="notranslate" />
         <link
           href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css"
           rel="stylesheet"
