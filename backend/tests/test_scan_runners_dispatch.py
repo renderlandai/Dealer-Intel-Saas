@@ -238,6 +238,24 @@ def driver_collaborators():
         )
 
 
+def _status_transitions(update_calls) -> list:
+    """Filter `scan_jobs` update calls down to status-bearing ones.
+
+    Phase 5-minimal added periodic heartbeat updates that only set
+    `last_heartbeat_at` (no `status`). These tests care about the visible
+    state machine (running → completed / failed), not the heartbeat
+    cadence — which has its own coverage elsewhere.
+    """
+    return [
+        c.args[0]["status"]
+        for c in update_calls
+        if isinstance(c.args, tuple)
+        and c.args
+        and isinstance(c.args[0], dict)
+        and "status" in c.args[0]
+    ]
+
+
 class TestRunSourceScanDriver:
     def test_success_path_persists_cost_marks_completed_notifies(self, driver_collaborators):
         from app.services.scan_runners import _run_source_scan
@@ -255,10 +273,11 @@ class TestRunSourceScanDriver:
         col.auto.assert_awaited_once_with(SCAN_JOB_ID, CAMPAIGN_ID)
         col.persist.assert_called_once()
         col.notify.assert_called_once()
-        # Two scan_jobs.update calls: running + completed.
+        # Two scan_jobs.update calls bear a status: running + completed.
+        # The driver also fires heartbeat-only updates between phases —
+        # those carry only `last_heartbeat_at` and are filtered here.
         update_calls = col.supabase.table.return_value.update.call_args_list
-        statuses = [c.args[0].get("status") for c in update_calls]
-        assert statuses == ["running", "completed"]
+        assert _status_transitions(update_calls) == ["running", "completed"]
 
     def test_skips_auto_analyze_when_no_campaign(self, driver_collaborators):
         from app.services.scan_runners import _run_source_scan
@@ -304,10 +323,12 @@ class TestRunSourceScanDriver:
         col.persist.assert_called_once()
         col.notify.assert_not_called()  # never notify on failure
         update_calls = col.supabase.table.return_value.update.call_args_list
-        statuses = [c.args[0].get("status") for c in update_calls]
-        assert statuses == ["running", "failed"]
-        # The error message must propagate onto scan_jobs.
-        failed_payload = update_calls[-1].args[0]
+        assert _status_transitions(update_calls) == ["running", "failed"]
+        # The error message must propagate onto scan_jobs (last status-bearing call).
+        failed_payload = next(
+            c.args[0] for c in reversed(update_calls)
+            if isinstance(c.args[0], dict) and c.args[0].get("status") == "failed"
+        )
         assert failed_payload.get("error_message") == "apify down"
 
     def test_auto_analyze_failure_does_not_fail_the_scan(self, driver_collaborators):
@@ -326,6 +347,5 @@ class TestRunSourceScanDriver:
 
         # Scan still completes — analysis errors are non-fatal.
         update_calls = col.supabase.table.return_value.update.call_args_list
-        statuses = [c.args[0].get("status") for c in update_calls]
-        assert statuses == ["running", "completed"]
+        assert _status_transitions(update_calls) == ["running", "completed"]
         col.notify.assert_called_once()

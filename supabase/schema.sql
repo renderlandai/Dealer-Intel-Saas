@@ -47,11 +47,15 @@ CREATE TABLE assets (
     height INTEGER,
     file_size INTEGER,
     metadata JSONB DEFAULT '{}',
+    -- Channels this creative is approved for. Empty array = all channels.
+    -- Values mirror app.models.ScanSource: google_ads, facebook, instagram, youtube, website.
+    target_platforms TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 CREATE INDEX idx_assets_campaign ON assets(campaign_id);
+CREATE INDEX idx_assets_target_platforms ON assets USING GIN (target_platforms);
 
 -- ============================================
 -- DISTRIBUTORS (Dealers)
@@ -87,6 +91,7 @@ CREATE TABLE scan_jobs (
     source VARCHAR(50) NOT NULL, -- google_ads, facebook, instagram, website
     started_at TIMESTAMP WITH TIME ZONE,
     completed_at TIMESTAMP WITH TIME ZONE,
+    last_heartbeat_at TIMESTAMP WITH TIME ZONE, -- bumped each page by the runner; cleanup keys off this
     total_items INTEGER DEFAULT 0, -- Total images discovered during scan
     processed_items INTEGER DEFAULT 0, -- Images that have been analyzed
     matches_count INTEGER DEFAULT 0, -- Actual matches found against campaign assets
@@ -98,6 +103,7 @@ CREATE TABLE scan_jobs (
 
 CREATE INDEX idx_scan_jobs_org ON scan_jobs(organization_id);
 CREATE INDEX idx_scan_jobs_status ON scan_jobs(status);
+CREATE INDEX idx_scan_jobs_status_heartbeat ON scan_jobs(status, last_heartbeat_at);
 
 -- ============================================
 -- DISCOVERED IMAGES (Scraped content)

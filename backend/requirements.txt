@@ -22,6 +22,16 @@ httpx==0.28.1
 aiohttp==3.13.3
 imagehash==4.3.2
 opencv-python-headless==4.13.0.92
+psd-tools==1.10.10
+
+# CLIP visual pre-filter (Stage 2 of the AI pipeline).
+# Per the 2026-04-13 audit, omitting these makes ai_service silently skip
+# Stage 2 and route every relevance-pass image straight to Opus, which
+# kills both cost and wall-clock on 50+ dealer scans. The Dockerfile
+# installs the CPU-only torch wheel from PyTorch's index URL so the image
+# does not balloon with the default CUDA build.
+sentence-transformers==3.3.1
+torch==2.5.1
 
 # Browser Automation
 playwright==1.58.0

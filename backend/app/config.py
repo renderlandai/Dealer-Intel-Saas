@@ -139,7 +139,15 @@ class Settings(BaseSettings):
     # Page Discovery
     enable_page_discovery: bool = Field(default=True, description="Auto-discover subpages on dealer sites")
     max_pages_per_site: int = Field(default=15, description="Max pages to scan per dealer website")
-    max_concurrent_pages: int = Field(default=4, description="Max pages to extract in parallel per site")
+    max_concurrent_pages: int = Field(default=4, description="Max pages to extract in parallel per site (legacy scan_dealer_websites only)")
+    # Phase 5-minimal: how many dealers `run_website_scan` processes in
+    # parallel. Each dealer owns its own MatchBuffer / ProcessedImageBuffer
+    # and a per-dealer pipeline_stats dict; the runner aggregates after the
+    # gather. Browser memory is the practical ceiling — Chromium contexts
+    # are cheap, but each concurrent dealer also keeps a hash + embedding
+    # working set in flight. 4 fits comfortably on a 4 GB worker; bump to
+    # 6–8 if you move the worker to professional-l (8 GB).
+    max_concurrent_dealers: int = Field(default=4, description="Max dealers processed in parallel inside run_website_scan")
     
     # ===========================================
     # Reports

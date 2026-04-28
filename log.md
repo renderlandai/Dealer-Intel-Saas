@@ -4276,3 +4276,1083 @@ The "MatchBuffer per call" open item (#2 in `scan_dispatch_flow.md`) is
 worth revisiting **only if** Phase 5 fans out by page or by URL, which
 the pg-backed simple worker does not. Park.
 
+---
+
+## 2026-04-22 (later still) — Deep links in scan-completion notifications
+
+Followed Phase 4 with a small UX-leverage win that wasn't in the
+original roadmap. Every scan-completion notification (email, Slack,
+Salesforce Task, Jira issue) now embeds working dashboard links so the
+recipient can act on a violation in one click instead of hunting for
+it in the UI.
+
+### Why this, why now
+
+Audit of `notification_service.py` found that all four channels were
+**linkless**: nice summary stats, no way to drill in. For a tool whose
+whole job is "tell you what needs fixing," that was a dead-end for the
+user. Lower-leverage items remaining (router test backfill, eval
+fixtures) are either internal hygiene or blocked on data — this one is
+customer-facing, isolated to the notification builders, and ships in
+under a day.
+
+### What was done
+
+1. **`scan_runners.py` — surface match_id**
+   - `_send_scan_notifications` already queries `matches` to build the
+     `violations_formatted` list. Added `"match_id": m.get("id")` to
+     each row so every channel can build a per-match URL.
+
+2. **`notification_service.py` — link helpers**
+   - `_dashboard_link(path)`, `_matches_url()`, `_violations_url()`,
+     `_match_detail_url(id)` — single source of truth for the four URL
+     shapes the rest of the file uses.
+   - All four read `settings.frontend_url` (already used by OAuth +
+     Stripe redirects). Per-scan deep linking via `?scan_job_id=` was
+     intentionally deferred — `routers/matches.py` does not yet accept
+     that filter, so adding it would have meant a backend + frontend
+     change for a marginal ergonomics gain.
+
+3. **Email (`_build_scan_report_email`)**
+   - New CTA block before the footer: "Review N Violations" (primary
+     button to `/matches?status=violation`) when violations > 0,
+     "Open Dashboard" otherwise. "View all matches" secondary link
+     always shown.
+   - Violation table gained a sixth column with a per-row "Review"
+     anchor pointing at `/matches/{match_id}`. Falls back to a dash
+     when `match_id` is missing (e.g., legacy data).
+   - Truncation footer ("Showing 20 of N") now contains a link to the
+     full violations list instead of asking users to log in manually.
+
+4. **Slack (`_build_scan_slack_blocks`)**
+   - Replaced the single "Top Violations" markdown bullet block with
+     **one section per violation**, each carrying a `Review` button
+     accessory pointing at `/matches/{match_id}`. Slack only allows
+     one accessory per section — hence the per-row layout.
+   - Added an `actions` block before the divider with two buttons:
+     primary "Review N Violations" (or "Open Dashboard") and secondary
+     "View All Matches". Ten-block cap on per-violation sections is
+     unchanged; overflow rendered as a context note as before.
+
+5. **Salesforce (`notify_salesforce_scan_complete`)**
+   - Salesforce Task UI auto-linkifies plain URLs in the description,
+     so no API-format change was needed. Description now lists
+     "Review violations: {url}" (when relevant) and "Open dashboard:
+     {url}", and each violation row appends its `/matches/{id}` URL.
+     Truncation footer points at the violations list.
+
+6. **Jira (`notify_jira_scan_complete` + helpers)**
+   - Jira's description field is ADF — plain text nodes don't render
+     as clickable. Refactored `_create_jira_issue` to accept either
+     `description` (legacy plain string, used by the test issue) or
+     `description_doc` (a fully built ADF doc, used by the scan path).
+   - Added `_adf_text(text, href=None)`, `_adf_paragraph(*nodes)`,
+     `_adf_doc_from_text(s)` builders.
+   - `notify_jira_scan_complete` now constructs the doc directly so
+     "Review violations" / "Open dashboard" / per-match "Review" links
+     carry proper ADF link marks.
+   - `send_jira_test` is unchanged (still passes plain `description`,
+     wrapped automatically).
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `backend/app/services/scan_runners.py` | one-line addition: `match_id` in violations dict |
+| `backend/app/services/notification_service.py` | link helpers + email CTA + Slack actions block + per-violation Slack buttons + Salesforce URLs + Jira ADF refactor |
+| `backend/tests/test_notification_links.py` | **NEW** — 23 tests covering all four channels |
+| `log.md` | this entry |
+
+### Test status
+
+- `pytest tests/test_notification_links.py -v` → **23 passed**.
+- `pytest tests/test_notification_links.py tests/test_bulk_writers.py
+  tests/test_worker_import_isolation.py tests/test_scan_runners_dispatch.py -q`
+  → **61 passed** (no regressions in the Phase 4 surface).
+- `pytest tests/ --co` → **103 tests collected, no import errors**
+  (was 80 before this entry).
+- Worker import-isolation guard still green: the helper additions in
+  `notification_service` did not change the closure that
+  `scan_runners` already had on it.
+
+### What was deliberately NOT done
+
+- **Per-scan deep linking** (`?scan_job_id=…`). Would need a new query
+  filter on `routers/matches.py` and a corresponding frontend change.
+  Real value but materially larger scope; revisit if a customer asks
+  for "show me what this specific scan found."
+- **Salesforce Task `WhatId` / Custom URL fields.** Plain URLs in the
+  description already render as clickable in the SF UI. Custom-object
+  linkage would require config-by-config schema knowledge per tenant.
+- **Slack message updates / threading.** Out of scope — current
+  behaviour posts one new message per scan, which is what users
+  expect.
+
+### Pre-rolled context for tomorrow
+
+The "what's left" list from yesterday is unchanged:
+
+- **Phase 5 — actual worker process.** Still gated on a metric
+  trigger. The deep-link work doesn't change that calculus.
+- **Eval coverage expansion.** Still blocked on labeled fixtures.
+
+The new candidate that surfaced from this work: when Phase 5 happens
+and notifications fire from a worker process, the
+`settings.frontend_url` lookup needs to be present in the worker's
+environment too (it already is, since the worker would inherit the
+same env), but worth eyeballing during the worker extraction.
+
+---
+
+## 2026-04-22 — Playwright "browser missing" error normalisation
+
+### Problem
+
+A scan failed locally with this Playwright error:
+
+```
+BrowserType.launch: Executable doesn't exist at
+/var/folders/.../T/cursor-sandbox-cache/.../chrome-headless-shell
+Looks like Playwright was just installed or updated.
+Please run: playwright install
+```
+
+Two compounding UX problems:
+
+1. **Backend** stored the raw multi-line traceback verbatim in
+   `scan_jobs.error_message` via three `str(e)` sites in
+   `services/scan_runners.py`. That made the dashboard render an
+   unreadable wall of text and made the failure mode hard to grep
+   for in logs.
+2. **Frontend** had a substring heuristic in `app/scans/page.tsx`
+   that matched timeout / rate / url / 404 — and fell through to a
+   generic "Check your campaign assets and dealer URLs, then retry."
+   That hint was actively misleading: the dealer URLs and campaign
+   assets were fine; the worker was missing its Chromium binary.
+
+The pattern recurs in two real environments:
+
+- **Local dev** in Cursor's sandbox cache, where Playwright's
+  per-version binary directory disappears between sessions.
+- **Production** if a Docker image is rebuilt without the
+  `playwright install chromium --with-deps` step (the Dockerfile
+  has it today, but a future split-out worker image could regress).
+
+### What was done
+
+**Backend** (`services/scan_runners.py`):
+
+- Added `_normalize_scan_error(exc) -> str`. It scans the exception
+  text (case-insensitive) for any of:
+    - `browsertype.launch: executable doesn't exist`
+    - `looks like playwright was just installed or updated`
+    - `playwright install`
+    - `chrome-headless-shell`
+  When matched, returns a stable, single-line, actionable message:
+  ```
+  Browser runtime not installed: the scan worker cannot launch
+  Chromium because Playwright browser binaries are missing. If
+  running locally, execute backend/scripts/install_playwright.sh;
+  in production, redeploy the worker so the Docker image runs
+  `playwright install chromium --with-deps`. Original: <≤240 chars>
+  ```
+  Everything else falls through unchanged so we never silently hide
+  a meaningful error.
+- Replaced the three `error_message: str(e)` (and one
+  `f"Analysis failed: {str(e)}"`) sites in `run_website_scan` /
+  `_run_source_scan` / `auto_analyze_scan` / `run_image_analysis`
+  with `_normalize_scan_error(e)`.
+
+**Frontend** (`app/scans/page.tsx`):
+
+- Replaced the inline ternary chain in the failure card with a
+  small IIFE that adds a Playwright branch *first*, matching on:
+    - `browser runtime not installed` (the new normalised prefix)
+    - `browsertype.launch`
+    - `chrome-headless-shell`
+    - `playwright install`
+  When matched it shows: "The scan worker is missing browser
+  binaries (Playwright Chromium). If running locally, run
+  backend/scripts/install_playwright.sh; in production, redeploy
+  the worker so the image installs Chromium."
+  All existing branches (timeout / rate / url / 404 / fallback)
+  preserved unchanged.
+
+### Tests
+
+New file `tests/test_scan_error_normalizer.py` — **16 tests, all
+green**:
+
+- `TestPlaywrightDetection` (8): full real-world traceback,
+  each substring marker individually, case-insensitivity, original
+  message preserved, 240-char snippet truncation, hint mentions
+  both local and prod paths.
+- `TestNonPlaywrightPassthrough` (5): timeout, 404, rate-limit,
+  generic runtime errors, and an unrelated Playwright nav
+  timeout — all returned verbatim.
+- `TestEdgeCases` (3): empty `str(exc)` falls back to class name,
+  `KeyError()` with no args, custom `__str__` still detected.
+
+Regression run: `test_scan_runners_dispatch.py` (12),
+`test_worker_import_isolation.py` (1), `test_bulk_writers.py` (24),
+`test_notification_links.py` (23) — **61 / 61 pass**, no
+import-isolation breakage from the new helper.
+
+### Why this approach over the alternatives
+
+- **Why a string-match normaliser instead of catching
+  `playwright._impl._errors.Error`?** Two reasons. First, the
+  scan runner shouldn't import Playwright internals just to
+  classify errors — that would re-couple the worker-safe layer
+  to a heavy optional dep. Second, the same failure can surface
+  from a subprocess wrapper, an asyncio shielded task, or a
+  thread executor where the original exception class is wrapped
+  or replaced. Substring matching on the message is the only
+  layer that survives all of those.
+- **Why keep the original message inside the normalised
+  output?** So the dashboard, Sentry, and `grep` over logs all
+  still find the verbatim Playwright text. The 240-char cap
+  prevents the box-drawing banner from blowing out the UI.
+- **Why update the frontend at all if the backend now writes a
+  stable string?** Three reasons:
+    1. Existing failed `scan_jobs` rows in the DB still have the
+       raw traceback; the frontend heuristic handles them too.
+    2. If the normaliser ever misses a new Playwright variant,
+       the frontend still degrades gracefully to the right
+       hint instead of the misleading generic one.
+    3. Defence in depth — the frontend is the user's last line
+       of "what do I do now."
+
+### What was deliberately NOT done
+
+- **No new exception class.** Considered raising a
+  `BrowserRuntimeMissingError` from the screenshot service so the
+  runners could `except` it explicitly. Rejected: the screenshot
+  service runs deep inside an async stack and the wrapping cost
+  isn't worth it for a single error class. The substring approach
+  covers the same ground with no new types.
+- **No retry-on-detection.** The runners do *not* try to
+  auto-install Chromium when this error is detected. That belongs
+  in deployment / dev-onboarding scripts (which already exist:
+  `backend/scripts/install_playwright.sh` and the Dockerfile's
+  `playwright install` step).
+- **No telemetry counter.** Could increment a Sentry tag or a
+  Prometheus counter on each detection. Skipped — the volume
+  here is "0 in prod, occasional in local dev." If we ever see
+  this fire in production, that itself will be the signal.
+
+### Pre-rolled context for tomorrow
+
+Unchanged from yesterday — Phase 5 still gated on metric trigger,
+eval coverage still blocked on labeled fixtures. This change is
+purely an error-message quality improvement; it does not touch
+the scan pipeline, dispatch contract, or worker-isolation
+boundary.
+
+---
+
+## 2026-04-22 (later) — Self-hosted fonts, EMFILE watcher fix
+
+### Symptom
+
+After restarting the Next.js dev server (to pick up the Playwright
+heuristic change above), the dashboard rendered with the wrong
+typeface — system stack instead of Inter / Plus Jakarta / JetBrains
+Mono. Two layered issues, surfaced in this order:
+
+1. **Watchpack EMFILE.** The long-running `next dev` process had
+   been spawned with the default macOS soft fd limit (256). After
+   ~5 hours of HMR churn the watcher exhausted file descriptors:
+   ```
+   Watchpack Error (watcher): Error: EMFILE: too many open files, watch
+   ```
+   With the watcher dead, HMR couldn't see new file edits, so my
+   `app/scans/page.tsx` Playwright-heuristic change above wasn't
+   being picked up by the browser at all.
+2. **Google Fonts 3-second timeout.** A clean restart (with
+   `ulimit -n 49152`) fixed EMFILE but uncovered the real culprit:
+   `next/font/google` fetches woff2 files from `fonts.gstatic.com`
+   at dev/build time with a hardcoded 3 s per-request timeout and
+   3 retries. From this network the cold TLS+TTFB to gstatic
+   measured **7.16 s** (verified with `curl -w "%{time_total}"`).
+   Every retry timed out, Next.js fell back to the system stack,
+   and logged:
+   ```
+   ⨯ Failed to download `Inter` from Google Fonts.
+     Using fallback font instead.
+   ```
+   The previous (long-running) dev server had succeeded once on
+   boot hours ago and held the fonts in its in-memory cache, which
+   is why the issue never appeared until the restart.
+
+### What was done
+
+**Fonts (durable fix, not a workaround):**
+
+- Created `frontend/public/fonts/` with three latin-subset variable
+  woff2 files pulled directly from Google Fonts:
+    - `Inter-latin-variable.woff2`        (47 KB, Inter v20)
+    - `PlusJakartaSans-latin-variable.woff2` (27 KB, Plus Jakarta v12)
+    - `JetBrainsMono-latin-variable.woff2`   (40 KB, JetBrains Mono v24)
+  Total payload ~114 KB on disk, served from `/fonts/` by Next.js.
+- Rewrote `frontend/app/layout.tsx` to use `next/font/local` instead
+  of `next/font/google`. Same three CSS variables (`--font-sans`,
+  `--font-display`, `--font-mono`), same `display: "swap"`, same
+  weight ranges expressed as variable-axis ranges (`100 900` for
+  Inter, `200 800` for Plus Jakarta, `100 800` for JetBrains).
+  Header comment in `layout.tsx` documents how to refresh the woff2
+  files if a Google Fonts version bump is ever needed.
+
+**Dev server (transient fix):**
+
+- Killed both stale `next dev` processes (terminals 238315 / 631935)
+  and their child `next-server` workers.
+- Restarted with `ulimit -n 49152 && npm run dev`. macOS's
+  `kern.maxfilesperproc` is 61440 here, so 49152 is comfortably
+  under the kernel cap and well above whatever Watchpack's
+  long-tail watching ever needs. No EMFILE on boot.
+- Verified clean boot: ready in **1.58 s** (vs 7.8 s previously
+  when Google Fonts had to download), no font fetch warnings, no
+  Watchpack errors.
+- Verified runtime: `curl http://localhost:3000/scans` returns
+  200 in 4 s (first compile of 2886 modules), zero font errors
+  in the dev log.
+
+### Why self-hosted instead of bumping the timeout
+
+`@next/font/google`'s 3 s timeout is hardcoded inside
+`node_modules/next/dist/compiled/@next/font/dist/google/fetch-font-file.js`
+with no public env var or config knob to override it. Patching
+`node_modules` would survive ~30 seconds before the next install
+wiped it out. Self-hosting is the only durable answer:
+
+- **No network at dev/build time.** woff2 read straight from disk,
+  shipped to the browser from the same origin.
+- **No third-party SLA.** A 7 s gstatic response or a Google
+  Fonts outage no longer changes whether the app boots.
+- **Smaller production bundle.** We were already only requesting
+  the latin subset, and variable axes mean one file per family
+  covers every weight we use today (and any we add later).
+- **Same DX.** `next/font/local` produces the same CSS variable
+  output and works identically with Tailwind / shadcn — zero
+  changes needed in `globals.css`, `tailwind.config.*`, or any
+  consumer component.
+
+### What was deliberately NOT done
+
+- **No Tailwind / shadcn config changes.** The CSS variable names
+  are unchanged, so every `font-sans` / `font-display` / `font-mono`
+  utility in the codebase keeps working without edits.
+- **No latin-ext / cyrillic / greek subsets.** The original
+  `next/font/google` config only requested `subsets: ["latin"]`.
+  We kept parity. If a customer ever needs accented characters
+  beyond U+0000–00FF, add the relevant subset woff2 alongside
+  the existing one and pass an array to `localFont({ src: [...] })`.
+- **No system-wide `launchctl limit maxfiles` bump.** Per-shell
+  `ulimit -n 49152` in the dev launch command is enough. A
+  permanent global raise would need a launchctl plist or
+  `/etc/launchd.conf` and is out of scope.
+- **Did not touch the Sentry deprecation warnings** that appear
+  on every Next.js boot. They predate this work and require a
+  full instrumentation-file migration; tracked separately.
+
+### Pre-rolled context for tomorrow
+
+If the dev server ever hits Watchpack EMFILE again, the launch
+command of record is now `ulimit -n 49152 && npm run dev` — bake
+that into any new terminal you start for `frontend/`. If a Google
+Fonts version bump (Inter v21, etc.) is ever desired, follow the
+recipe in `app/layout.tsx`'s header comment: re-curl the latin
+src URL out of `https://fonts.googleapis.com/css2?family=...` and
+overwrite the matching .woff2 file. No code change needed.
+
+---
+
+## 2026-04-22 (future work) — Platform admin dashboard (deferred)
+
+Captured here as a future-build item, not implemented. Triggered by
+this observation: every operational pain point hit during today's
+session (stuck scans, Playwright Chromium missing, sandboxed
+backend's JWKS network failure, stale React Query errors masquerading
+as "Could not connect") would have been visible in seconds from a
+platform-admin view, but instead required `ps`, `lsof`, `curl`,
+backend log greps, and reading `cursor-sandbox-cache/<hash>/`
+overlay paths. That cost is going to scale linearly with paying
+customers and is the single biggest reason to plan this work.
+
+### Current state of "admin" in the codebase
+
+- `auth_user_profiles.role IN ('owner', 'admin', 'member')`
+  (migration 013) — but this is **org-scoped only**. An "admin"
+  manages their own tenant's team via `routers/team.py:45`. There
+  is **no platform-level superuser concept** anywhere.
+- No `frontend/app/admin/` directory exists.
+- All 15 backend routers (campaigns, scanning, matches, compliance,
+  distributors, schedules, integrations, reports, alerts, billing,
+  team, organizations, dashboard, feedback, compliance_rules) are
+  tenant-scoped — they all filter by `organization_id` extracted
+  from the verified JWT. Zero cross-tenant query surface today.
+- The service-role Supabase client is already used everywhere
+  (`from ..database import supabase`), with RLS bypassed at the
+  API layer in favor of explicit `organization_id` filters in
+  Python. Good substrate for admin views — no second DB client
+  needed, no RLS rewrites required. The flip side: a single
+  missing auth dependency on an admin route leaks every tenant.
+
+### Why this is the right next "internal tooling" investment
+
+Concrete inventory of pain that admin tooling would have eliminated
+today (and will keep eliminating):
+
+| Pain hit today                              | What admin dashboard surfaces |
+|---------------------------------------------|-------------------------------|
+| Scans failing on missing Playwright binary  | Cross-tenant "failed scans, last 24h" with `error_message LIKE 'Browser runtime not installed%'` count |
+| Backend sandbox blocking Supabase JWKS      | Auth error rate by minute (PyJWKClientConnectionError spike) |
+| Customer asks "is my scan stuck?"           | Search by org → live job state, cost so far, pipeline funnel |
+| Runaway OpenAI / SerpApi / Apify spend      | Per-tenant `cost_usd` rollup over N days (already on every `scan_jobs` row from migration 027 — zero new instrumentation) |
+| Stale Salesforce / Jira / HubSpot tokens    | Per-tenant integration health (`last_sync_at`, `connected_at`, error counts) |
+| "Did Phase 5 worker hang?"                  | Queue depth, in-flight count, worker heartbeats (fits naturally with the worker work that's still gated below) |
+
+None of these are visible from any tenant's own dashboard. All
+require shell + SQL today.
+
+### Why NOT to build it before there's a forcing function
+
+- Pre-PMF / pilot. Manual SQL works at N=1–5 customers.
+- Building before you know which queries you actually run produces
+  the wrong abstractions. Today's pain inventory is the right
+  starting list precisely because it came from a real session, not
+  a whiteboard.
+- Engineering hours that ship customer-visible value beat internal
+  tooling at this stage. The trigger to build Phase A below is
+  "first paying customer pings you about a stuck scan on a weekend"
+  — not before.
+
+### Phased plan (build in order; do NOT skip ahead)
+
+#### Phase A — Read-only operator console (~3–5 hours)
+
+Trigger: 2–3 paying tenants, OR Phase 5 worker ships (whichever
+comes first — worker queues without operator visibility get
+painful fast).
+
+Scope:
+
+1. **DB migration** — add `platform_admin BOOLEAN NOT NULL
+   DEFAULT false` to `auth_user_profiles`. Set via SQL only.
+   **Never** expose in any user-facing API, even guarded — that
+   route would be the entire system's compromise vector.
+2. **Auth dependency** — add `require_platform_admin()` in
+   `app/auth.py`, mirroring the existing `get_current_user` /
+   `get_current_user_organization_id` pattern. Single test
+   asserting "every route in `routers/admin.py` declares the
+   dependency" — cheapest possible RLS-bypass guardrail.
+3. **Backend router** — new `backend/app/routers/admin.py` with
+   exactly these read-only endpoints, no more:
+   - `GET /admin/scans?status=failed&since_hours=24&limit=100`
+   - `GET /admin/orgs` (id, name, plan, last_scan_at, total_cost_30d, scan_count_30d)
+   - `GET /admin/costs?days=30&group_by=vendor|tenant`
+   - `GET /admin/integrations/health` (per tenant: salesforce/jira/hubspot/dropbox/slack connection state + last sync)
+4. **Frontend** — single route `frontend/app/admin/page.tsx`.
+   shadcn DataTable + tabs (Scans / Orgs / Costs / Integrations).
+   No charts. Hidden from nav unless `platform_admin === true`
+   on the user profile.
+5. **Audit logging** — every admin route writes one row to a new
+   `platform_admin_actions` table: `(operator_user_id, action,
+   target_org_id NULL, query_params JSONB, created_at)`.
+   Cheap to add now, brutal to retrofit when SOC2/GDPR audit
+   demands it.
+
+That's the entire Phase A. ~4 hours. Replaces the next ~100
+"let me SSH in and run a query" moments.
+
+#### Phase B — Operations console (when ~10+ paying tenants)
+
+- Scan retry / cancel buttons (calls existing `tasks.dispatch_task`).
+- Per-tenant cost alerts (nightly job → Slack if any tenant
+  exceeded threshold; threshold is a column on `organizations`
+  or a global setting).
+- Plan / limit changes from UI — `014_billing_plan.sql` already
+  has the schema; just needs an admin-only mutation.
+- Worker queue depth + heartbeat panel — this dovetails with the
+  Phase 5 worker work. If Phase 5 ships first, build this *with*
+  it, not after.
+- "Reprocess stuck scan" button — sets `status=pending` and
+  re-dispatches. Today this is a manual SQL UPDATE.
+
+#### Phase C — Real product (50+ tenants, multi-operator team)
+
+- Audit-log viewer (consume the `platform_admin_actions` table
+  added in Phase A).
+- Eval drift trends — match accuracy / compliance precision over
+  time, per AI model version. Gated on the "labeled fixtures"
+  blocker in the eval coverage workstream.
+- "View as tenant" mode — legal/privacy implications, must be
+  in TOS first, must be audit-logged.
+- A/B test framework for prompts.
+- This is the point at which Retool / Forest Admin / similar
+  become a credible alternative to in-house. Until ~50 tenants
+  the per-seat licensing + duplicated auth model isn't worth it.
+
+### Build vs buy (Retool / Metabase / Forest Admin)
+
+Stay DIY through Phase A and probably Phase B because:
+
+- Auth, RLS, and queries already live in Python. Reusing them is
+  faster than re-modeling them in a third-party tool.
+- Retool needs per-seat licensing + a separate set of DB
+  credentials sprawl; great when 5+ non-engineers operate, not
+  before.
+- Metabase is excellent for charts, clumsy for transactional
+  actions ("click to retry this scan"). Good complement for
+  Phase B/C cost dashboards, not a replacement.
+
+Re-evaluate at Phase C, when there are non-engineer operators
+who need self-serve custom views.
+
+### Risks to design around from day one
+
+- **Single missed `Depends(require_platform_admin)`** = total
+  cross-tenant data leak. Write the static-analysis test (Phase
+  A item 2) on day one. AST-walk `routers/admin.py`, assert each
+  function decorator chain includes the dependency.
+- **`platform_admin` flag must be unwritable from any API.** Set
+  via SQL migration or one-shot CLI script in `backend/scripts/`
+  only. Document in the migration comment and in the script's
+  docstring.
+- **Audit logging from day one**, not retrofitted. Phase A item 5.
+- **Performance of cross-tenant queries.** Verify migrations
+  005 / 018 cover `(status, created_at DESC)` on `scan_jobs`
+  before Phase A's `/admin/scans` endpoint relies on it. If not,
+  add the index in the same migration that adds `platform_admin`.
+- **Notification noise.** Cost-alert thresholds (Phase B) need
+  per-tenant configurability or the operator inbox dies fast.
+
+### Decision
+
+Deferred. Re-trigger this entry when:
+
+1. First paying customer reports an issue you can't immediately
+   answer from the existing tenant UI, OR
+2. Phase 5 worker process is ready to ship (whichever first).
+
+When the trigger fires, Phase A's scope above is intentionally
+sized to fit a single 4-hour focused session. Don't expand it.
+The whole point of starting small is that the *next* batch of
+admin work is justified by real operator usage, not by guessing
+what'll be useful.
+
+---
+
+## 2026-04-27 — Per-channel creative tagging
+
+User-visible problem: when a user uploaded a creative, every scan
+(Google Ads / Facebook / Instagram / Website / YouTube) treated
+it as a candidate. So an Instagram-only graphic was hashed,
+embedded, and CV-matched against website crawls — producing
+wasted vendor cost and the occasional false positive when a
+square IG asset coincidentally resembled a website hero.
+
+The fix: let users tag each creative with the channels it's
+actually approved for, and have the scan runner filter the
+candidate set per source. Empty tags = "all channels," so the
+rollout is safe for every existing row in production.
+
+### What was done
+
+1. **Schema — migration `028_asset_target_platforms.sql`**
+   - `assets.target_platforms TEXT[] NOT NULL DEFAULT '{}'`.
+   - `idx_assets_target_platforms` GIN index so per-source
+     filtering (`target_platforms && ARRAY['facebook']`) stays
+     fast on orgs with thousands of creatives.
+   - Allowed values mirror `app.models.ScanSource`:
+     `google_ads | facebook | instagram | youtube | website`.
+   - `supabase/schema.sql` updated to match (column + index)
+     so fresh setups get it without replaying migrations.
+
+2. **Backend — Pydantic models** (`app/models.py`)
+   - `AssetBase.target_platforms: List[str]` (default `[]`).
+   - `AssetUpdate.target_platforms: Optional[List[str]]` —
+     finally gives `AssetUpdate` a use; previously the symbol
+     was imported into the router but never wired.
+
+3. **Backend — routes** (`app/routers/campaigns.py`)
+   - `_normalize_target_platforms()` helper validates against
+     `ScanSource`, lower-cases, dedupes, rejects unknown
+     values with `400`.
+   - `POST /campaigns/{id}/assets` and
+     `POST /campaigns/{id}/assets/upload` accept
+     `target_platforms`. Upload uses repeated multipart fields
+     (`target_platforms=facebook&target_platforms=instagram`)
+     so each file in a batch can carry its own tags.
+   - **NEW** `PATCH /campaigns/assets/{asset_id}` for
+     post-upload re-tagging (and rename / metadata edits).
+
+4. **Backend — scan runner filtering**
+   (`app/services/scan_runners.py`)
+   - `_fetch_campaign_assets(campaign_id, source=...)` filters
+     out assets tagged for *other* channels. Rule (enforced
+     in code, not the DB):
+       - empty `target_platforms` → eligible for every source
+         (legacy / "all channels" semantics)
+       - non-empty → eligible only if `source` is in the array
+   - Skipped-count logged so operators can see filter impact:
+     `Channel filter for facebook: using 7 of 12 asset(s)
+     (5 skipped — tagged for other channels)`.
+   - Threaded through every call site:
+     - `_run_source_scan` (Google Ads / Facebook / Instagram)
+       passes its `source` param.
+     - `run_website_scan` passes `"website"`.
+     - `auto_analyze_scan` reads `scan_jobs.source` and
+       applies the same filter before precomputing hashes /
+       embeddings — so the savings land on the post-scan
+       analyse path too, not just discovery.
+
+5. **Frontend — types and helpers** (`frontend/lib/api.ts`)
+   - New `TargetPlatform` union, `ALL_TARGET_PLATFORMS`
+     ordering constant, `TARGET_PLATFORM_LABELS` map.
+   - `Asset.target_platforms: TargetPlatform[]` added.
+   - `uploadAsset(campaignId, file, { name?, targetPlatforms? })`
+     — back-compat with the prior single-arg call style.
+   - **NEW** `updateAsset(assetId, payload)` calls the new
+     `PATCH` route.
+
+6. **Frontend — UX iteration**
+   (`frontend/app/campaigns/[id]/page.tsx`)
+
+   First pass shipped a single per-batch picker above the
+   dropzone. After review the model was wrong: real batches
+   are mixed (one IG-only, one website hero, one
+   everywhere), so a batch-level default silently encourages
+   users to over-tag or leave everything as "all channels."
+
+   Second pass replaced it with a staged-upload flow:
+   - Drop / Select Files → files land in a "Ready to upload"
+     queue, no network calls yet. Each row has a thumbnail
+     (`URL.createObjectURL`), filename, **its own** pill
+     multi-select, and a delete button.
+   - The card-level pill row was reframed as a *default*
+     applied to newly-staged rows, with a one-click "Apply
+     default to all" affordance for homogeneous batches.
+   - Commit-all button POSTs each row with its own
+     `targetPlatforms`. Per-row status flips to
+     `uploading` (spinner) → either disappears on success or
+     stays in the queue with an inline error so the user can
+     edit channels and retry only the failures.
+   - Object-URL hygiene: `pendingUploadsRef` mirrors the
+     queue so the unmount cleanup can revoke any leftover
+     blobs without re-running on every state change;
+     `removePendingRow`, `clearPendingUploads`, and the
+     success branch of `commitPendingUploads` each revoke
+     the rows they drop.
+
+7. **Frontend — existing-asset surface**
+   - Each asset card now shows its target-channel badges
+     (or an "All channels" outline badge if empty). Clicking
+     opens an inline pill editor that calls the new
+     `PATCH /campaigns/assets/{id}` route and patches state
+     in place — no full reload.
+   - The per-source scan buttons in the Scans tab now show
+     `"3 of 12 will be scanned"` underneath. If a source has
+     zero eligible creatives, the button is disabled with
+     `"No matching creatives"` plus a tooltip — protects
+     users from launching a scan that can't possibly match.
+
+### Why this approach over the alternatives
+
+- **Why a `TEXT[]` column and not normalised
+  `asset_platforms` join table?** Two reasons. First, the
+  cardinality is tiny (5 source values, capped). A join
+  table would add a second query (or a join) on every scan
+  fetch with no benefit. Second, GIN over `TEXT[]` makes the
+  one query that matters — `target_platforms && ARRAY[$1]`
+  per-source — both indexable and trivial to write. A join
+  table would have made the same query a `WHERE EXISTS`
+  subquery for every candidate.
+- **Why empty-array = "all channels" instead of `NULL`?**
+  Defensive. With `NOT NULL DEFAULT '{}'` the migration
+  cannot leave any row with ambiguous semantics, and the
+  filter rule (`empty OR contains source`) collapses to a
+  single readable line in Python. `NULL` would have meant
+  three states and the inevitable bug where one branch
+  forgot to handle it.
+- **Why a staged-upload queue instead of "tag each file in a
+  modal as you pick it"?** The modal pattern looks cheap on
+  paper but kills batch upload UX — every file blocks. The
+  queue lets users drop 12 files at once, eyeball the
+  thumbnails, fix the two that need different channels, and
+  commit. Most batches are homogeneous, so the "Apply
+  default to all" button is the one-click escape hatch.
+- **Why separate `auto_analyze_scan` filter from the
+  `_fetch_campaign_assets` filter?** They serve different
+  paths: discovery vs post-scan analyse. `auto_analyze_scan`
+  reads the source from the `scan_jobs` row directly because
+  by the time it runs, the dispatch context is gone. Both
+  paths apply the **same rule** but from different sources
+  of truth — duplicating the predicate is cheaper and
+  clearer than threading the source through a queue handoff.
+
+### What was deliberately NOT done
+
+- **No off-channel violation rule yet.** The data is now
+  there to flag "creative was tagged for IG only but
+  appeared on the dealer's website" as a first-class
+  compliance signal. Deferred — it's a separate compliance
+  rule type that wants its own UI, not a freebie inside this
+  slice.
+- **No backfill of existing assets.** Every existing row
+  keeps `target_platforms = '{}'` and remains "all channels"
+  until users start tagging. This preserves prior scan
+  behaviour exactly.
+- **No Dropbox folder-name → tag inference.** The
+  `dropbox_service.py` sync is the obvious next place to
+  surface auto-tagging (folder `/Creatives/Instagram/` →
+  `[instagram]`), but it touches a sync path that needs its
+  own thinking about ambiguous folder names. Logged for the
+  next session.
+- **No filename sanitisation in the upload endpoint.** The
+  user's first test-upload triggered Supabase Storage's
+  `InvalidKey` because a macOS screenshot filename contained
+  `U+202F NARROW NO-BREAK SPACE`. The endpoint already
+  catches storage failures and falls back to a base64 data
+  URL, so this didn't break the user-visible flow — but the
+  fallback is wasteful (~250KB image bytes inlined in a JSON
+  row). Worth fixing in a follow-up:
+  `re.sub(r'[^a-zA-Z0-9._-]+', '_', file_name)` before
+  building `unique_filename`.
+- **No pre-flight POST validation.** Validation happens
+  per-request inside `_normalize_target_platforms`. The
+  picker only emits valid values, so a separate validation
+  endpoint would be ceremony.
+
+### Verification
+
+- Backend: `pytest tests/test_campaigns.py
+  tests/test_scan_runners_dispatch.py -q` → **19 passed**.
+  No new tests added in this slice — the existing campaign
+  + dispatch tests cover the routes that changed, and the
+  filter logic is a pure function of the rows fetched. New
+  tests for `_normalize_target_platforms` and
+  `_fetch_campaign_assets(source=...)` are owed and noted
+  for follow-up.
+- Frontend: `tsc --noEmit` → clean.
+- ReadLints across all touched files → no errors.
+- Both dev servers hot-reloaded without restart.
+
+### Runtime gotcha discovered live
+
+After shipping the staging-queue UI, the user's first real
+upload returned 500 with:
+
+```
+PGRST204: Could not find the 'target_platforms' column of
+'assets' in the schema cache
+```
+
+Migration 028 had been authored but not applied to dev
+Supabase — the SQL files in `supabase/migrations/` are only
+auto-applied on merge to `main` via the GitHub Actions
+`supabase db push` step. For local dev the column has to be
+applied manually (`supabase db push` from repo root, or paste
+the SQL into Studio's editor).
+
+Worth remembering: PostgREST caches its schema, so even
+after the `ALTER TABLE` runs you may need
+`NOTIFY pgrst, 'reload schema';` (or a project restart in
+Studio) before the new column is visible to the API. The
+migration body now ends with that NOTIFY for safety.
+
+### Files touched this entry
+
+| File | Change |
+|---|---|
+| `supabase/migrations/028_asset_target_platforms.sql` | **NEW** — `target_platforms TEXT[]` + GIN index |
+| `supabase/schema.sql` | mirror column + index for fresh setups |
+| `backend/app/models.py` | `AssetBase.target_platforms`, `AssetUpdate.target_platforms` |
+| `backend/app/routers/campaigns.py` | `_normalize_target_platforms()`, upload + create accept tags, **NEW** `PATCH /campaigns/assets/{id}` |
+| `backend/app/services/scan_runners.py` | `_fetch_campaign_assets(source=...)` + threaded through `_run_source_scan`, `run_website_scan`, `auto_analyze_scan` |
+| `frontend/lib/api.ts` | `TargetPlatform` types, `Asset.target_platforms`, new `uploadAsset` signature, **NEW** `updateAsset()` |
+| `frontend/app/campaigns/[id]/page.tsx` | staged-upload queue, per-row pill picker, post-upload inline editor, "X of Y will be scanned" banner |
+| `log.md` | this entry |
+
+### Pre-rolled context for tomorrow
+
+Three follow-ups queued out of this session, in priority order:
+
+1. **Off-channel violation as a compliance signal.** The
+   data is there. Needs a new `compliance_rules` rule type
+   (`channel_mismatch`) and a small UI in the rules editor.
+   This is the highest-leverage next step because it turns
+   a passive cost-saver into an active product feature
+   ("we caught your dealer running the IG-only creative on
+   their website").
+2. **Filename sanitisation in `upload_asset`.** Five-line
+   `re.sub` plus a regression test. Stops the base64
+   fallback path from being silently exercised by macOS
+   screenshot filenames. Tiny but worth a focused PR.
+3. **Tests for `_normalize_target_platforms` and the
+   per-source filter in `_fetch_campaign_assets`.** Pure
+   functions, easy to cover, owed.
+
+Phase 5 (worker process) status: unchanged. This change
+added zero scan-pipeline shape — only filtering — so the
+4.8 driver / 4.7 buffer / 4.1–4.3 bulk-insert prerequisites
+are still the only things to port when Phase 5 starts.
+
+---
+
+## 2026-04-28 — Phase 5-minimal: 50-dealer cold-scan readiness
+
+First paying client wants to start a 50-dealer cold website scan. The
+existing build was documented as topping out at ~15–20 dealers with the
+2026-04-10 scaling roadmap (`log.md:2334`); the gap was Phase 5 (a
+separate worker process) plus a handful of timeout / cleanup / browser
+defaults that would actively kill a long scan. Today's sprint closes
+that gap with the minimum code required — no Redis queue, no chunked
+parent/child jobs, no ARQ revival.
+
+### What shipped (in order)
+
+**Day 1 — config and cleanup safety (a half day)**
+
+1. **Migration 029 — `last_heartbeat_at` column on `scan_jobs`.**
+   The original `_heartbeat()` was made a no-op on 2026-04-01 because
+   it was clobbering `started_at`. Adding a dedicated column means we
+   can re-instate a real heartbeat without breaking the dashboard's
+   scan-duration metrics. The column is nullable (existing rows
+   unaffected) and indexed on `(status, last_heartbeat_at)` for the
+   cleanup query. `supabase/schema.sql` mirrors the column + index so
+   fresh setups skip the migration. NOTIFY pgrst at the end so
+   PostgREST's schema cache picks the column up immediately (lesson
+   from migration 028's runtime gotcha).
+2. **`scan_runners._heartbeat()` re-implemented.** Writes ONLY
+   `last_heartbeat_at`; never touches `started_at`. Best-effort with
+   debug-level error swallowing so a transient Supabase hiccup never
+   fails an otherwise-healthy scan. Now called once per page in the
+   discovery loop, once after page-discovery, once after asset
+   pre-compute, once after the `discover()` callable in
+   `_run_source_scan` — every place a long blocking step lives.
+3. **`scheduler_service._cleanup_stale_scans()` rewritten.** Cutoff
+   raised from 60 min → 4 hours. Predicate is now heartbeat-aware:
+   * If `last_heartbeat_at` is set, fail only when the heartbeat
+     itself has not advanced in 4h.
+   * If NULL (older rows or runners that died in prep), fall back to
+     the old `created_at`-based check at the same 4h horizon.
+   The cleanup is the safety net; the runner's own
+   `SCAN_TIMEOUT_SECONDS` is the primary backstop.
+4. **`tasks.py::SCAN_TIMEOUT_SECONDS` 7200 → 14400** (2h → 4h). Cold
+   50-dealer scans on a fresh tenant measure 1–2h end-to-end on the
+   new concurrent runner; doubling that gives headroom for an outlier
+   slow dealer.
+5. **`extraction_service::_BROWSER_MAX_AGE_SECONDS` 600 → 3600**
+   (10 min → 60 min). The 10-minute recycle was a single-process
+   defensive choice — under per-dealer concurrency it forces a
+   multi-second relaunch in the middle of nearly every long scan and
+   risks tearing down an in-flight page.
+6. **CLIP installed in production.** Added `sentence-transformers`
+   and `torch` to `requirements.txt`; the Dockerfile now installs the
+   CPU-only torch wheel from PyTorch's CPU index (so the image does
+   not balloon with the default CUDA build) and pre-downloads
+   `clip-ViT-B-32` so the first scan does not pay the cold-load
+   latency. Per the 2026-04-13 audit this single change re-enables
+   AI Stage 2 (silently disabled in prod for weeks) and cuts Opus
+   call volume by 50–70%.
+
+**Day 2 — actual worker process (1 day)**
+
+7. **`tasks.py::dispatch_task` now persists dispatch args before
+   running anything.** New `_persist_dispatch_args()` writes
+   `{task_name, args}` onto `scan_jobs.metadata.dispatch` so a worker
+   can replay the row later. New `DISABLE_INPROCESS_DISPATCH=true`
+   env flag short-circuits the `asyncio.create_task` step on the API
+   service — the row is left in `pending` for the worker to claim.
+   New `KNOWN_TASK_NAMES` constant + `execute_persisted_task()`
+   helper give the worker the dispatch surface it needs without
+   duplicating the wrapper map.
+8. **`backend/app/worker.py` — new entry point.** ~250 lines.
+   Designed to be invoked as `python -m app.worker`. Loop:
+   * `SELECT id, source, metadata FROM scan_jobs WHERE status='pending'
+     ORDER BY created_at LIMIT 1`.
+   * Atomic claim via conditional UPDATE
+     (`update({...status='running'...}).eq('id', X).eq('status', 'pending')`)
+     — `len(claim.data) == 1` means we won the race, 0 means another
+     worker (or the API in mixed mode) got it first.
+   * Pull `task_name` + `args` off `metadata.dispatch`, route to
+     `tasks.execute_persisted_task`.
+   * On crash, normalise the error message (reusing
+     `scan_runners._normalize_scan_error`) and mark the row failed.
+   * SIGTERM / SIGINT graceful shutdown — finish the in-flight job
+     before exit (DO sends SIGTERM with ~10s before SIGKILL, plenty
+     for "don't claim the next one").
+   * Pre-warms CLIP at boot via `embedding_service.warmup()` so the
+     first job doesn't pay model-load latency on top of its own scan
+     time.
+9. **`.do/app.yaml` — `workers:` block added** (`scan-worker`).
+   Same Dockerfile, `instance_size_slug: professional-m` (8 GB —
+   Chromium + CLIP + image cache + per-scan buffers fit comfortably),
+   `instance_count: 1`, `run_command: python -m app.worker`,
+   `SCHEDULER_ENABLED=false` (scheduler stays in API, holds the
+   Redis lock). The API `service` got `DISABLE_INPROCESS_DISPATCH=true`
+   so it stops running scans itself — it now just persists args and
+   moves on. Removing that flag (or setting "false") flips back to the
+   legacy in-process mode for local dev and small tenants.
+10. **`tests/test_worker_import_isolation.py` extended.** New test
+    `test_worker_entrypoint_imports_without_fastapi_or_slowapi`
+    spawns a fresh subprocess with a `MetaPathFinder` blocking
+    fastapi/slowapi, imports `app.worker.main` and
+    `app.tasks.execute_persisted_task`. If either ever pulls in the
+    HTTP layer, CI fails with a pointer to this entry. The
+    isolation-subprocess builder was rewritten to plain string
+    concat — the previous `textwrap.dedent` + multi-line f-string
+    interpolation broke the dedent's "common prefix" detection when
+    the new test passed a multi-line import block.
+
+**Day 3 — concurrency in `run_website_scan` (1 day)**
+
+11. **Per-dealer parallelism in the website runner.** Replaced the
+    flat `for page in expanded_urls` loop with a per-dealer
+    `asyncio.gather` driven by `asyncio.Semaphore(max_concurrent_dealers)`
+    (new config knob, default 4). Each dealer task:
+    * Holds the semaphore for the duration of its work, bounding
+      both Playwright contexts and in-flight AI batches.
+    * Owns its own `MatchBuffer` and `ProcessedImageBuffer` — the
+      bulk writers are explicitly NOT coroutine-safe per the
+      2026-04-21 / 2026-04-22 entries; sharing across dealers would
+      race on `_pending`.
+    * Owns its own `pipeline_increments` dict and returns it to the
+      caller for aggregation — avoids a contended Lock around ints
+      that fire dozens of times per page.
+    * Honours global early-stop via `asyncio.Event` + `asyncio.Lock`
+      around the shared `matched_asset_ids` set. The Event is the
+      cheap notify channel, the Lock+set is the source of truth.
+    Phase 1 (cached-page warm-up) stays sequential — cached pages
+    are short, and serialising them keeps cache-hit accounting
+    simple. The shared cache-phase buffer drains at end-of-function
+    next to the per-dealer flushes.
+12. **`config.max_concurrent_dealers` (new, default 4)** added
+    alongside the existing `max_concurrent_pages` (clarified in its
+    description as legacy / `scan_dealer_websites`-only). 4 fits
+    a 4 GB worker comfortably; bump to 6–8 if the worker is sized up
+    to professional-l (8 GB).
+
+### Wall-clock impact
+
+Pre-sprint expectation for a cold 50-dealer scan with no warm cache
+and 15 pages per dealer (Professional-tier defaults):
+
+* Sequential (today's main): ~75–150 min, hits the 60-min cleanup
+  cutoff and gets auto-failed.
+* Sequential without cleanup: ~75–150 min wall clock, blocks the API
+  process for the duration.
+
+Post-sprint estimate (same workload):
+
+* Per-dealer concurrency × 4 + worker process + heartbeat-aware
+  cleanup: **~25–45 min** wall clock, API stays fully responsive,
+  cleanup safety net kicks in only on truly stuck runners.
+* On a warm cache (subsequent scans): **~10–15 min**.
+
+These are extrapolations from the pipeline math in the
+2026-04-10 / 2026-04-13 entries, not measured. Day-3 dry-run with
+5 dealers will give the first real per-dealer number to extrapolate
+the full 50-dealer estimate from.
+
+### What this sprint deliberately did NOT do
+
+* **No Phase 3 parent/child chunking.** Right answer at 150+
+  dealers; overkill at 50. The single-process worker with intra-job
+  per-dealer concurrency is correct for the first client.
+* **No queue migration to Redis Streams / SQS.** Two prior failed
+  attempts on 2026-03-28; postgres-polled worker is the path the
+  team converged on. The polling interval (default 2s) is plenty for
+  a single-tenant pilot.
+* **No multi-worker scaling.** `instance_count: 1` for the pilot.
+  The atomic-claim UPDATE in `worker._claim_pending_job` is
+  race-safe so adding more workers later is config-only.
+* **No platform-admin dashboard.** The 2026-04-22 entry already
+  deferred this with a clear trigger; that trigger ("first paying
+  customer pings you about a stuck scan on a weekend") still hasn't
+  fired.
+* **No `is_processed` UPDATE batching change.** Already shipped in
+  Phase 4.7; the per-dealer buffers picked it up for free.
+
+### Tests
+
+* `pytest tests/ -q` → **120 passed** (was 119 — net +1 from the new
+  worker-isolation test, with 4 existing dispatch tests adjusted to
+  filter to status-bearing updates because of the new heartbeat
+  cadence).
+* `ReadLints` across all 13 touched files → clean.
+* Worker import-isolation guard green for both `app.services.scan_runners`
+  and the new `app.worker` entry point.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `supabase/migrations/029_scan_heartbeat.sql` | **NEW** — `last_heartbeat_at` column + composite index |
+| `supabase/schema.sql` | mirror column + index for fresh setups |
+| `backend/app/services/scheduler_service.py` | cleanup 60min → 4hr, heartbeat-aware predicate |
+| `backend/app/services/scan_runners.py` | `_heartbeat()` re-implemented; new `_process_one_dealer()` + `page_discovery_discover()` helpers; Phase 2 of `run_website_scan` rewritten for per-dealer concurrency |
+| `backend/app/services/extraction_service.py` | `_BROWSER_MAX_AGE_SECONDS` 600 → 3600 |
+| `backend/app/config.py` | new `max_concurrent_dealers` (default 4); existing `max_concurrent_pages` description clarified |
+| `backend/app/tasks.py` | `_persist_dispatch_args`, `KNOWN_TASK_NAMES`, `execute_persisted_task`, `DISABLE_INPROCESS_DISPATCH` env flag, `SCAN_TIMEOUT_SECONDS` 7200 → 14400 |
+| `backend/app/worker.py` | **NEW** — `python -m app.worker` entry point with atomic-claim polling loop |
+| `backend/Dockerfile` | install CPU-only torch; pre-download CLIP model into image |
+| `backend/requirements.txt` | + `sentence-transformers==3.3.1`, `torch==2.5.1` |
+| `.do/app.yaml` | new `workers:` block (`scan-worker`); API service gains `DISABLE_INPROCESS_DISPATCH=true` |
+| `backend/tests/test_worker_import_isolation.py` | new `test_worker_entrypoint_imports_without_fastapi_or_slowapi`; subprocess builder rewritten |
+| `backend/tests/test_scan_runners_dispatch.py` | added `_status_transitions()` filter; 3 driver tests updated to ignore heartbeat-only updates |
+| `log.md` | this entry |
+
+### What the operator must do before the first 50-dealer scan
+
+1. **Apply migrations 028 and 029** to the production Supabase
+   (`supabase db push` or paste each file into Studio's SQL editor).
+   Migration 028 was authored 2026-04-27 but only auto-applied on
+   merge to main; 029 is brand new today.
+2. **Set the client's org `subscription_tier` to `business`** (or
+   `enterprise`) in the `organizations` table. Professional caps
+   `max_dealers` at 40, which would block creation of the 50th
+   distributor. Business caps at 100 and is sufficient.
+3. **Deploy** — DO App Platform will pick up the new `scan-worker`
+   component on the next push to `main`. Verify both `api` and
+   `scan-worker` reach RUNNING in the DO dashboard.
+4. **Sanity-check env vars on `scan-worker`** in the DO dashboard:
+   the `app.yaml` declares them with `value: "PLACEHOLDER"` so DO
+   will prompt for the real secrets on first deploy. Mirror the
+   existing API secrets exactly. Critical ones for the worker:
+   `SUPABASE_*`, `ANTHROPIC_API_KEY`, `SCREENSHOTONE_*`,
+   `SERPAPI_API_KEY`, `APIFY_API_KEY`, `RESEND_API_KEY`.
+5. **Verify CLIP loaded** by tailing the worker logs at boot — look
+   for `CLIP model warmed up`. If it says `Stage 2 will be skipped`
+   the torch install failed; check the build log.
+6. **Dry-run with 5 dealers from this client first.** Watch:
+   * Does the API insert the `scan_jobs` row and return 200? (Yes
+     means dispatch-args persistence worked.)
+   * Does the worker log `Worker running job=...` within 2-3s?
+     (Yes means the polling claim worked.)
+   * Does `last_heartbeat_at` advance in the DB once per page?
+   * Does `pipeline_stats.clip_rejected` appear non-zero in the
+     completed scan? (Yes confirms Stage 2 is firing.)
+   * Per-dealer wall clock × 50 ÷ 4 ≈ full-scan estimate.
+7. **Run the full 50.** Frontend already shows scan progress;
+   notifications already deep-link per the 2026-04-22 work.
+
+### What's left for after the pilot lands
+
+* **Heartbeat cadence inside `_process_one_dealer`.** Currently the
+  heartbeat fires at the start of each page; for a dealer with 15
+  pages × 30s/page that's 7.5 min between heartbeats — well under
+  the 4h cleanup horizon, so no urgency.
+* **Multi-worker scaling.** `.do/app.yaml::workers[0].instance_count`
+  bumped from 1 → N. Atomic-claim already race-safe.
+* **Phase 3 parent/child chunking.** Not needed for 50; revisit at
+  150+ when one worker can no longer finish a single tenant's scan
+  in a reasonable window.
+* **Scan-job `metadata` retention sweep.** The persisted dispatch
+  args now live on every scan_jobs row; retention_service should
+  consider purging them after the row reaches `completed` /
+  `failed` to keep the JSONB column small. Probably a quarter's
+  worth of work before it matters.
+

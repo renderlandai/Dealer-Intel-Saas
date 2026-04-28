@@ -29,6 +29,15 @@ services:
       - key: SCHEDULER_ENABLED
         scope: RUN_TIME
         value: "true"
+      # Phase 5-minimal: API never runs scans in-process. The `scan-worker`
+      # worker component below claims pending scan_jobs rows and runs them
+      # in its own process, with its own Chromium / CLIP / image-cache
+      # memory budget. Removing this line (or setting to "false") flips
+      # the API back to the legacy in-process behaviour, which is fine
+      # for local dev and for tenants under ~10 dealers.
+      - key: DISABLE_INPROCESS_DISPATCH
+        scope: RUN_TIME
+        value: "true"
       - key: SUPABASE_URL
         scope: RUN_TIME
         type: SECRET
@@ -142,6 +151,137 @@ services:
         type: SECRET
         value: "PLACEHOLDER"
       - key: DROPBOX_CLIENT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: JIRA_CLIENT_ID
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: JIRA_CLIENT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: HUBSPOT_CLIENT_ID
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: HUBSPOT_CLIENT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+
+# ----------------------------------------------------------------------------
+# Phase 5-minimal worker — runs the scan pipeline out of the API process.
+#
+# Same Docker image as the `api` service (so the build only happens once),
+# but launched with `python -m app.worker` instead of gunicorn. The worker
+# polls Supabase for scan_jobs.status='pending' rows, atomically claims one
+# at a time, and runs it via `app.tasks.execute_persisted_task`.
+#
+# Sized larger than the API on purpose: the worker owns Chromium (~250 MB),
+# the CLIP model (~200 MB), the image cache (~200 MB), and per-scan buffers.
+# 4 GB / 2 vCPU comfortably fits a 50-dealer concurrent scan; bump to
+# professional-l only if memory pressure shows up in metrics.
+#
+# instance_count = 1 for the pilot. Add more once the per-dealer concurrency
+# inside `run_website_scan` is saturating one worker AND multiple tenants
+# need parallel scans. Two workers polling the same DB are race-safe — the
+# atomic-claim UPDATE in `worker._claim_pending_job` guarantees at-most-once.
+#
+# Scheduler is OFF here (the API owns the APScheduler lock via Redis).
+# DISABLE_INPROCESS_DISPATCH must be ABSENT or "false" on the worker so its
+# own dispatch path can actually execute the runner — the env var only
+# matters when an HTTP handler dispatches.
+# ----------------------------------------------------------------------------
+workers:
+  - name: scan-worker
+    github:
+      repo: renderlandai/Dealer-Intel-Saas
+      branch: main
+      deploy_on_push: true
+    source_dir: backend
+    dockerfile_path: Dockerfile
+    instance_count: 1
+    instance_size_slug: professional-m
+    run_command: python -m app.worker
+    envs:
+      - key: SCHEDULER_ENABLED
+        scope: RUN_TIME
+        value: "false"
+      - key: WORKER_POLL_INTERVAL
+        scope: RUN_TIME
+        value: "2.0"
+      - key: WEB_CONCURRENCY
+        scope: RUN_TIME
+        value: "1"
+      - key: LOG_LEVEL
+        scope: RUN_TIME
+        value: "info"
+      - key: SUPABASE_URL
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SUPABASE_ANON_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SUPABASE_JWT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: ANTHROPIC_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SCREENSHOTONE_ACCESS_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SCREENSHOTONE_SECRET_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SERPAPI_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: APIFY_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: RESEND_API_KEY
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SENTRY_DSN
+        scope: RUN_TIME
+        type: SECRET
+        value: ""
+      - key: FRONTEND_URL
+        scope: RUN_TIME
+        value: "https://dealer-intel-saas.vercel.app"
+      - key: SLACK_CLIENT_ID
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SLACK_CLIENT_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SLACK_SIGNING_SECRET
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SALESFORCE_CLIENT_ID
+        scope: RUN_TIME
+        type: SECRET
+        value: "PLACEHOLDER"
+      - key: SALESFORCE_CLIENT_SECRET
         scope: RUN_TIME
         type: SECRET
         value: "PLACEHOLDER"

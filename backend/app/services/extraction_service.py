@@ -46,7 +46,13 @@ _browser: Optional[Browser] = None
 _pw_instance = None
 _browser_lock = asyncio.Lock()
 _browser_created_at: float = 0.0
-_BROWSER_MAX_AGE_SECONDS = 600  # recycle browser every 10 minutes
+# Recycle browser every 60 min. The previous 10-min cap was a defensive
+# choice from the single-Chromium / single-process era — it forced a
+# multi-second relaunch in the middle of nearly every long scan and risked
+# tearing down an in-flight page. With per-dealer concurrency in the
+# website runner and a separate worker process owning the browser, an hour
+# is comfortable: contexts are short-lived and the leak surface is small.
+_BROWSER_MAX_AGE_SECONDS = 3600
 
 
 async def _get_browser() -> Browser:

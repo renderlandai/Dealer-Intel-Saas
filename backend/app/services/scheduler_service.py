@@ -355,29 +355,65 @@ async def _run_retention() -> None:
 
 
 async def _cleanup_stale_scans() -> None:
-    """Auto-fail scans stuck in 'pending' or 'running' too long."""
+    """Auto-fail scans stuck in 'pending' or 'running' too long.
+
+    Pending cutoff (15 min) — when in-process dispatch is enabled the row
+    moves to 'running' almost immediately, so anything sitting here is a
+    truly dropped task. When a separate worker is doing the dispatch the
+    same window still applies because the worker poll interval is seconds,
+    not minutes.
+
+    Running cutoff (4 hours) — large 50+ dealer scans on the new worker
+    routinely run for ~30–90 min. The runner now writes
+    `scan_jobs.last_heartbeat_at` once per page (see Phase 5-minimal in
+    log.md / migration 029), so we can use a per-row liveness signal:
+        * If `last_heartbeat_at` is set → consider the scan stuck only when
+          the heartbeat itself is >4h old (the runner has actually stopped
+          touching the row).
+        * If `last_heartbeat_at` is NULL → the runner predates the
+          heartbeat or never made it past prep work; fall back to the
+          original `created_at`-based check at the same 4h horizon.
+
+    The hard backstop is the asyncio.wait_for in tasks.py
+    (SCAN_TIMEOUT_SECONDS) — the cleanup job is a safety net, not the
+    primary timeout.
+    """
     try:
-        # Pending scans that were never picked up by a worker.
-        # 15 minutes is generous — the status moves to "running" almost
-        # immediately now (before any heavy prep work).
-        pending_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+        now = datetime.now(timezone.utc)
+        pending_cutoff = (now - timedelta(minutes=15)).isoformat()
         stale_pending = supabase.table("scan_jobs") \
             .select("id") \
             .eq("status", "pending") \
             .lt("created_at", pending_cutoff) \
             .execute()
 
-        # Running/analyzing scans older than 60 min are presumed dead.
-        # Large scans (30+ pages) can take 45+ min legitimately;
-        # the hard limit is the 2-hour asyncio timeout in tasks.py.
-        running_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=60)).isoformat()
-        stale_running = supabase.table("scan_jobs") \
+        running_cutoff = (now - timedelta(hours=4)).isoformat()
+
+        # Heartbeat-based: row has a heartbeat that has not advanced in 4h.
+        stale_by_heartbeat = supabase.table("scan_jobs") \
             .select("id") \
             .in_("status", ["running", "analyzing"]) \
+            .not_.is_("last_heartbeat_at", "null") \
+            .lt("last_heartbeat_at", running_cutoff) \
+            .execute()
+
+        # Fallback: row never wrote a heartbeat AND was created >4h ago.
+        # `is_("last_heartbeat_at", "null")` reads "IS NULL" via PostgREST.
+        stale_no_heartbeat = supabase.table("scan_jobs") \
+            .select("id") \
+            .in_("status", ["running", "analyzing"]) \
+            .is_("last_heartbeat_at", "null") \
             .lt("created_at", running_cutoff) \
             .execute()
 
-        all_stale = (stale_pending.data or []) + (stale_running.data or [])
+        seen_ids: set = set()
+        all_stale = []
+        for bucket in (stale_pending.data, stale_by_heartbeat.data, stale_no_heartbeat.data):
+            for job in (bucket or []):
+                if job["id"] in seen_ids:
+                    continue
+                seen_ids.add(job["id"])
+                all_stale.append(job)
 
         for job in all_stale:
             supabase.table("scan_jobs").update({
