@@ -2,7 +2,7 @@
 import base64
 import logging
 from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Request
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends, Request, Query
 from fastapi.responses import Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -457,11 +457,42 @@ async def delete_asset(request: Request, asset_id: UUID, user: AuthUser = Depend
 # CAMPAIGN SCANS
 # ============================================
 
+def _resolve_scan_distributors(
+    org_id: UUID,
+    distributor_ids: Optional[List[UUID]],
+) -> list[dict]:
+    """Resolve which dealers a campaign scan should target.
+
+    If `distributor_ids` is provided, restrict to those (still scoped to the
+    org) without enforcing `status = 'active'` — explicit user picks override
+    the active filter so paused dealers can be re-checked on demand. When
+    omitted, fall back to every active dealer in the org.
+    """
+    if distributor_ids:
+        unique_ids = list({str(d) for d in distributor_ids})
+        result = supabase.table("distributors")\
+            .select("*")\
+            .in_("id", unique_ids)\
+            .eq("organization_id", str(org_id))\
+            .execute()
+        return result.data or []
+
+    result = supabase.table("distributors")\
+        .select("*")\
+        .eq("organization_id", str(org_id))\
+        .eq("status", "active")\
+        .execute()
+    return result.data or []
+
+
 @router.post("/{campaign_id}/scans/start", response_model=ScanJob, summary="Start campaign scan")
 async def start_campaign_scan(
     campaign_id: UUID,
     source: ScanSource,
-    distributor_ids: Optional[List[UUID]] = None,
+    distributor_ids: Optional[List[UUID]] = Query(
+        None,
+        description="Optional dealer IDs to scan. Omit to scan every active dealer in the org.",
+    ),
     user: AuthUser = Depends(get_current_user),
     op: OrgPlan = Depends(get_org_plan),
 ):
@@ -484,35 +515,30 @@ async def start_campaign_scan(
     
     if not campaign.data:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    
+
+    distributor_list = _resolve_scan_distributors(user.org_id, distributor_ids)
+
+    if distributor_ids and not distributor_list:
+        # User explicitly picked dealers but none belonged to this org — bail
+        # before we create a doomed scan job.
+        raise HTTPException(
+            status_code=400,
+            detail="None of the selected dealers belong to this organization.",
+        )
+
     organization_id = user.org_id
-    
+
     job_data = {
         "organization_id": str(organization_id),
         "campaign_id": str(campaign_id),
         "source": source.value,
         "status": "pending"
     }
-    
+
     result = supabase.table("scan_jobs").insert(job_data).execute()
     scan_job = result.data[0]
     scan_job_id = scan_job["id"]
-    
-    if distributor_ids:
-        distributors = supabase.table("distributors")\
-            .select("*")\
-            .in_("id", [str(d) for d in distributor_ids])\
-            .eq("organization_id", str(user.org_id))\
-            .execute()
-    else:
-        distributors = supabase.table("distributors")\
-            .select("*")\
-            .eq("organization_id", str(organization_id))\
-            .eq("status", "active")\
-            .execute()
-    
-    distributor_list = distributors.data
-    
+
     if not distributor_list:
         supabase.table("scan_jobs").update({
             "status": "failed",
@@ -581,6 +607,10 @@ async def start_campaign_scan(
 async def batch_campaign_scan(
     request: Request,
     campaign_id: UUID,
+    distributor_ids: Optional[List[UUID]] = Query(
+        None,
+        description="Optional dealer IDs to scan. Omit to scan every active dealer in the org.",
+    ),
     user: AuthUser = Depends(get_current_user),
     op: OrgPlan = Depends(get_org_plan),
 ):
@@ -598,13 +628,13 @@ async def batch_campaign_scan(
     if not campaign.data:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    distributors = supabase.table("distributors")\
-        .select("*")\
-        .eq("organization_id", str(user.org_id))\
-        .eq("status", "active")\
-        .execute()
-    dist_list = distributors.data or []
+    dist_list = _resolve_scan_distributors(user.org_id, distributor_ids)
     if not dist_list:
+        if distributor_ids:
+            raise HTTPException(
+                400,
+                "None of the selected dealers belong to this organization.",
+            )
         raise HTTPException(400, "No active distributors found. Add dealers first.")
 
     allowed_channels = op.limits.get("allowed_channels", [])

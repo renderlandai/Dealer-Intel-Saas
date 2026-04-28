@@ -24,7 +24,10 @@ import {
   Plus,
   Power,
   PowerOff,
-  Layers
+  Layers,
+  Users,
+  Search,
+  X
 } from "lucide-react";
 import Link from "next/link";
 import { Header } from "@/components/layout/header";
@@ -50,10 +53,12 @@ import {
   createSchedule,
   updateSchedule,
   deleteSchedule,
+  getDistributors,
   ScanSchedule,
   ALL_TARGET_PLATFORMS,
   TARGET_PLATFORM_LABELS,
   type TargetPlatform,
+  type Distributor,
 } from "@/lib/api";
 import { formatDate } from "@/lib/utils";
 
@@ -165,6 +170,14 @@ export default function CampaignDetailPage() {
   const [scanning, setScanning] = useState(false);
   const [scanningAll, setScanningAll] = useState(false);
   const [selectedSource, setSelectedSource] = useState<string | null>(null);
+  // Dealer selector for the Scans tab. Empty selection = scan every active
+  // dealer (matches backend default). The selection persists per-campaign in
+  // localStorage so a user running repeated scans doesn't re-tick boxes.
+  const [distributors, setDistributors] = useState<Distributor[]>([]);
+  const [distributorsLoading, setDistributorsLoading] = useState(false);
+  const [selectedDealerIds, setSelectedDealerIds] = useState<string[]>([]);
+  const [dealerSearch, setDealerSearch] = useState("");
+  const [dealerPickerOpen, setDealerPickerOpen] = useState(false);
   const [activeTab, setActiveTab] = useState(initialTab);
   const [pollingScanId, setPollingScanId] = useState<string | null>(null);
   const [deletingAssetId, setDeletingAssetId] = useState<string | null>(null);
@@ -267,12 +280,39 @@ export default function CampaignDetailPage() {
   useEffect(() => {
     if (activeTab === "scans") {
       loadScans();
+      loadDistributors();
     } else if (activeTab === "results") {
       loadMatches();
     } else if (activeTab === "schedules") {
       loadSchedules();
     }
   }, [activeTab, campaignId]);
+
+  // Restore the dealer selection saved for this campaign (if any).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = window.localStorage.getItem(`campaign:${campaignId}:dealers`);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
+        setSelectedDealerIds(parsed);
+      }
+    } catch { /* ignore corrupt entries */ }
+  }, [campaignId]);
+
+  // Persist the dealer selection. We intentionally write the empty list too
+  // so "explicitly cleared" survives reloads instead of falling back to the
+  // last non-empty value.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        `campaign:${campaignId}:dealers`,
+        JSON.stringify(selectedDealerIds),
+      );
+    } catch { /* quota / private mode — non-fatal */ }
+  }, [campaignId, selectedDealerIds]);
 
   // Poll for scan status when a scan is running or analyzing
   useEffect(() => {
@@ -339,6 +379,71 @@ export default function CampaignDetailPage() {
     }
   };
 
+  const loadDistributors = async () => {
+    setDistributorsLoading(true);
+    try {
+      const data = await getDistributors();
+      setDistributors(data);
+      // Drop stale selections (deleted dealers, dealers from another org).
+      setSelectedDealerIds((prev) => {
+        const valid = new Set(data.map((d) => d.id));
+        const next = prev.filter((id) => valid.has(id));
+        return next.length === prev.length ? prev : next;
+      });
+    } catch (error) {
+      console.error("Failed to load dealers:", error);
+    } finally {
+      setDistributorsLoading(false);
+    }
+  };
+
+  const toggleDealer = (id: string) => {
+    setSelectedDealerIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+    );
+  };
+
+  const filteredDealers = distributors.filter((d) => {
+    if (!dealerSearch.trim()) return true;
+    const q = dealerSearch.trim().toLowerCase();
+    return (
+      d.name.toLowerCase().includes(q) ||
+      (d.code ?? "").toLowerCase().includes(q) ||
+      (d.region ?? "").toLowerCase().includes(q)
+    );
+  });
+
+  const selectAllVisible = () => {
+    setSelectedDealerIds((prev) => {
+      const next = new Set(prev);
+      filteredDealers.forEach((d) => next.add(d.id));
+      return Array.from(next);
+    });
+  };
+
+  const clearDealerSelection = () => setSelectedDealerIds([]);
+
+  // How many dealers a given channel will actually hit, given the current
+  // dealer selection. Mirrors the URL-availability checks in the backend
+  // dispatch (e.g. Instagram skips dealers without `instagram_url`).
+  const dealersForChannel = (channel: string): number => {
+    const pool = selectedDealerIds.length === 0
+      ? distributors.filter((d) => d.status === "active")
+      : distributors.filter((d) => selectedDealerIds.includes(d.id));
+    switch (channel) {
+      case "google_ads":
+        return pool.length;
+      case "instagram":
+        return pool.filter((d) => !!d.instagram_url).length;
+      case "facebook":
+        return pool.filter((d) => !!d.facebook_url).length;
+      case "website":
+        return pool.filter((d) => !!d.website_url).length;
+      default:
+        return pool.length;
+    }
+  };
+
   const handleStartScan = async (source: string) => {
     if (assets.length === 0) {
       alert("Please upload at least one asset before starting a scan.");
@@ -348,15 +453,20 @@ export default function CampaignDetailPage() {
     setScanning(true);
     setSelectedSource(source);
     try {
-      const scanJob = await startCampaignScan(campaignId, source);
+      const scanJob = await startCampaignScan(
+        campaignId,
+        source,
+        selectedDealerIds.length > 0 ? selectedDealerIds : undefined,
+      );
       // Start polling for this scan
       setPollingScanId(scanJob.id);
       // Refresh scans and stats
       await Promise.all([loadScans(), loadCampaign()]);
       setActiveTab("scans");
-    } catch (error) {
+    } catch (error: any) {
       console.error("Failed to start scan:", error);
-      alert("Failed to start scan. Please try again.");
+      const detail = error?.response?.data?.detail;
+      alert(detail || "Failed to start scan. Please try again.");
     } finally {
       setScanning(false);
       setSelectedSource(null);
@@ -371,7 +481,10 @@ export default function CampaignDetailPage() {
 
     setScanningAll(true);
     try {
-      const result = await startCampaignBatchScan(campaignId);
+      const result = await startCampaignBatchScan(
+        campaignId,
+        selectedDealerIds.length > 0 ? selectedDealerIds : undefined,
+      );
       const jobs = result.jobs || [];
 
       if (jobs.length > 0) {
@@ -1160,6 +1273,137 @@ export default function CampaignDetailPage() {
                   </div>
                 ) : (
                   <div className="space-y-4">
+                    {/* Dealer selector */}
+                    <div className="rounded-lg border bg-muted/30 p-3 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <Users className="h-4 w-4 text-muted-foreground" />
+                          <span className="text-sm font-medium">Dealers to scan</span>
+                          <Badge variant="outline" className="text-[11px]">
+                            {selectedDealerIds.length === 0
+                              ? distributorsLoading
+                                ? "Loading…"
+                                : `All active (${distributors.filter((d) => d.status === "active").length})`
+                              : `${selectedDealerIds.length} selected`}
+                          </Badge>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {selectedDealerIds.length > 0 && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs"
+                              onClick={clearDealerSelection}
+                            >
+                              <X className="h-3 w-3 mr-1" />
+                              Clear (use all)
+                            </Button>
+                          )}
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            className="h-7 text-xs"
+                            onClick={() => setDealerPickerOpen((v) => !v)}
+                            disabled={distributorsLoading || distributors.length === 0}
+                          >
+                            {dealerPickerOpen ? "Hide picker" : "Choose dealers"}
+                          </Button>
+                        </div>
+                      </div>
+
+                      {distributors.length === 0 && !distributorsLoading && (
+                        <p className="text-xs text-muted-foreground">
+                          No dealers found yet.{" "}
+                          <Link href="/distributors" className="text-primary hover:underline">
+                            Add dealers
+                          </Link>{" "}
+                          to start scanning.
+                        </p>
+                      )}
+
+                      {dealerPickerOpen && distributors.length > 0 && (
+                        <div className="space-y-2">
+                          <div className="relative">
+                            <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                            <input
+                              type="text"
+                              value={dealerSearch}
+                              onChange={(e) => setDealerSearch(e.target.value)}
+                              placeholder="Search dealers by name, code, or region…"
+                              className="flex h-8 w-full rounded-md border border-input bg-background pl-8 pr-2 text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            />
+                          </div>
+                          <div className="flex items-center justify-between text-xs text-muted-foreground">
+                            <span>
+                              {filteredDealers.length} of {distributors.length} shown
+                            </span>
+                            <div className="flex items-center gap-1">
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="h-6 px-2 text-[11px]"
+                                onClick={selectAllVisible}
+                              >
+                                Select visible
+                              </Button>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="sm"
+                                className="h-6 px-2 text-[11px]"
+                                onClick={clearDealerSelection}
+                              >
+                                Clear all
+                              </Button>
+                            </div>
+                          </div>
+                          <div className="max-h-56 overflow-y-auto rounded-md border bg-background divide-y">
+                            {filteredDealers.length === 0 ? (
+                              <p className="p-3 text-xs text-muted-foreground text-center">
+                                No dealers match &ldquo;{dealerSearch}&rdquo;.
+                              </p>
+                            ) : (
+                              filteredDealers.map((d) => {
+                                const checked = selectedDealerIds.includes(d.id);
+                                return (
+                                  <label
+                                    key={d.id}
+                                    className="flex items-center gap-2 px-2 py-1.5 cursor-pointer hover:bg-muted/50"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() => toggleDealer(d.id)}
+                                      className="h-3.5 w-3.5"
+                                    />
+                                    <span className="flex-1 truncate text-xs">
+                                      {d.name}
+                                      {d.code && (
+                                        <span className="text-muted-foreground ml-1">
+                                          ({d.code})
+                                        </span>
+                                      )}
+                                    </span>
+                                    {d.status !== "active" && (
+                                      <Badge variant="outline" className="text-[10px]">
+                                        {d.status}
+                                      </Badge>
+                                    )}
+                                  </label>
+                                );
+                              })
+                            )}
+                          </div>
+                          <p className="text-[11px] text-muted-foreground">
+                            Tip: leave the selection empty to scan every active dealer in your org.
+                          </p>
+                        </div>
+                      )}
+                    </div>
+
                     <Button
                       className="w-full h-auto py-3 flex items-center justify-center gap-2"
                       onClick={handleScanAllChannels}
@@ -1179,17 +1423,25 @@ export default function CampaignDetailPage() {
                         const eligible = eligibleAssetsForSource(source.value);
                         const total = assets.length;
                         const noneEligible = eligible === 0;
+                        const dealerCount = dealersForChannel(source.value);
+                        const noDealers = dealerCount === 0;
+                        const disabled = scanning || scanningAll || noneEligible || noDealers;
+                        const dealerLabel = selectedDealerIds.length === 0
+                          ? `${dealerCount} active dealer${dealerCount === 1 ? "" : "s"}`
+                          : `${dealerCount} of ${selectedDealerIds.length} dealer${selectedDealerIds.length === 1 ? "" : "s"}`;
                         return (
                           <Button
                             key={source.value}
                             variant="outline"
                             className="h-auto py-4 flex flex-col items-center gap-2 hover:border-primary hover:bg-primary/5"
                             onClick={() => handleStartScan(source.value)}
-                            disabled={scanning || scanningAll || noneEligible}
+                            disabled={disabled}
                             title={
                               noneEligible
                                 ? `No creatives are tagged for ${source.label}. Tag at least one asset (or leave it untagged) to scan this channel.`
-                                : `${eligible} of ${total} creative${total === 1 ? "" : "s"} will be checked on ${source.label}.`
+                                : noDealers
+                                  ? `None of the ${selectedDealerIds.length === 0 ? "active" : "selected"} dealers have a ${source.label} URL configured.`
+                                  : `${eligible} of ${total} creative${total === 1 ? "" : "s"} will be checked on ${source.label} across ${dealerLabel}.`
                             }
                           >
                             <img src={source.logo} alt={source.label} className="h-8 w-8 object-contain" />
@@ -1197,12 +1449,14 @@ export default function CampaignDetailPage() {
                             <span className="text-2xs text-muted-foreground">{source.desc}</span>
                             <span
                               className={`text-2xs ${
-                                noneEligible ? "text-yellow-600" : "text-muted-foreground"
+                                noneEligible || noDealers ? "text-yellow-600" : "text-muted-foreground"
                               }`}
                             >
                               {noneEligible
                                 ? "No matching creatives"
-                                : `${eligible} of ${total} will be scanned`}
+                                : noDealers
+                                  ? "No dealers configured"
+                                  : `${eligible} creative${eligible === 1 ? "" : "s"} · ${dealerLabel}`}
                             </span>
                             {scanning && selectedSource === source.value && (
                               <RefreshCw className="h-4 w-4 animate-spin" />

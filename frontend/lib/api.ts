@@ -751,9 +751,18 @@ export const startCampaignScan = async (
 };
 
 export const startCampaignBatchScan = async (
-  campaignId: string
+  campaignId: string,
+  distributorIds?: string[]
 ): Promise<{ message: string; jobs: ScanJob[] }> => {
-  const { data } = await api.post(`/campaigns/${campaignId}/scans/batch`);
+  const params = new URLSearchParams();
+  if (distributorIds && distributorIds.length > 0) {
+    distributorIds.forEach((id) => params.append("distributor_ids", id));
+  }
+  const qs = params.toString();
+  const url = qs
+    ? `/campaigns/${campaignId}/scans/batch?${qs}`
+    : `/campaigns/${campaignId}/scans/batch`;
+  const { data } = await api.post(url);
   return data;
 };
 
