@@ -647,15 +647,34 @@ export default function ScansPage() {
                               {job.error_message}
                             </p>
                           )}
-                          <p className="text-xs text-muted-foreground mt-1.5">
-                            {job.error_message?.toLowerCase().includes("timeout")
+                          {(() => {
+                            const msg = job.error_message?.toLowerCase() ?? "";
+                            // If the backend already produced a normalised,
+                            // self-explanatory message (currently only the
+                            // Playwright "browser runtime not installed"
+                            // prefix), don't add a second redundant hint —
+                            // the verbatim error_message above already tells
+                            // the user exactly what to do.
+                            if (msg.startsWith("browser runtime not installed")) {
+                              return null;
+                            }
+                            const hint = msg.includes("timeout")
                               ? "The scan timed out. Try scanning fewer dealers or a different channel."
-                              : job.error_message?.toLowerCase().includes("rate")
+                              : msg.includes("rate")
                               ? "API rate limit hit. Wait a few minutes and retry."
-                              : job.error_message?.toLowerCase().includes("url") || job.error_message?.toLowerCase().includes("404")
+                              : msg.includes("browsertype.launch") ||
+                                msg.includes("chrome-headless-shell") ||
+                                msg.includes("playwright install")
+                              ? "The scan worker is missing browser binaries (Playwright Chromium). Run backend/scripts/install_playwright.sh, then retry."
+                              : msg.includes("url") || msg.includes("404")
                               ? "A dealer URL may be invalid. Check your distributor settings."
-                              : "Check your campaign assets and dealer URLs, then retry."}
-                          </p>
+                              : "Check your campaign assets and dealer URLs, then retry.";
+                            return (
+                              <p className="text-xs text-muted-foreground mt-1.5">
+                                {hint}
+                              </p>
+                            );
+                          })()}
                         </div>
                         <Button
                           size="sm"

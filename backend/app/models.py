@@ -122,6 +122,9 @@ class AssetBase(BaseModel):
     height: Optional[int] = None
     file_size: Optional[int] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # Channels this creative is approved for. Empty list = all channels.
+    # Values must come from ScanSource (google_ads, facebook, instagram, youtube, website).
+    target_platforms: List[str] = Field(default_factory=list)
 
 
 class AssetCreate(AssetBase):
@@ -131,6 +134,7 @@ class AssetCreate(AssetBase):
 class AssetUpdate(BaseModel):
     name: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+    target_platforms: Optional[List[str]] = None
 
 
 class Asset(AssetBase):

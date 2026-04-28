@@ -1,0 +1,4 @@
+name,code,region,website_url,facebook_url,instagram_url,youtube_url,google_ads_advertiser_id,status
+Mustang CAT,MCAT001,Texas,https://www.mustangcat.com,https://facebook.com/MustangCat,,,AR12345678901234567,active
+Holt Cat,HOLT01,Texas,https://www.holtcat.com,https://facebook.com/HoltCat,https://instagram.com/holtcat,,,active
+Example Distributor,,California,https://example.com,,,,,inactive

@@ -16,6 +16,35 @@ export const distributorCreateSchema = z.object({
 
 export const distributorUpdateSchema = distributorCreateSchema.partial();
 
+const optionalUrl = z
+  .string()
+  .trim()
+  .url("Invalid URL")
+  .or(z.literal(""))
+  .optional()
+  .default("");
+
+export const distributorCsvRowSchema = z.object({
+  name: z.string().trim().min(1, "Name is required").max(100, "Name too long"),
+  code: z.string().trim().max(50, "Code too long").optional().default(""),
+  website_url: optionalUrl,
+  facebook_url: optionalUrl,
+  instagram_url: optionalUrl,
+  youtube_url: optionalUrl,
+  google_ads_advertiser_id: z
+    .string()
+    .trim()
+    .regex(/^(AR\d+)?$/, "Must start with AR followed by numbers")
+    .or(z.literal(""))
+    .optional()
+    .default(""),
+  region: z.string().trim().max(100).optional().default(""),
+  status: z
+    .enum(["active", "inactive"], { message: "status must be active or inactive" })
+    .optional()
+    .default("active"),
+});
+
 export const scheduleCreateSchema = z.object({
   campaign_id: z.string().uuid("Invalid campaign"),
   source: z.enum(["google_ads", "facebook", "instagram", "website"], { message: "Invalid scan source" }),
@@ -39,6 +68,7 @@ export const orgSettingsSchema = z.object({
 export type CampaignCreateInput = z.infer<typeof campaignCreateSchema>;
 export type DistributorCreateInput = z.infer<typeof distributorCreateSchema>;
 export type DistributorUpdateInput = z.infer<typeof distributorUpdateSchema>;
+export type DistributorCsvRowInput = z.infer<typeof distributorCsvRowSchema>;
 export type ScheduleCreateInput = z.infer<typeof scheduleCreateSchema>;
 export type TeamInviteInput = z.infer<typeof teamInviteSchema>;
 export type OrgSettingsInput = z.infer<typeof orgSettingsSchema>;

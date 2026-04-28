@@ -21,6 +21,7 @@ import {
   getScanJobs,
   createCampaign,
   createDistributor,
+  bulkCreateDistributors,
   updateDistributor,
   deleteCampaign,
   deleteDistributor,
@@ -251,6 +252,17 @@ export function useCreateDistributor() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: createDistributor,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.distributors.all });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });
+    },
+  });
+}
+
+export function useBulkCreateDistributors() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: bulkCreateDistributors,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.distributors.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });

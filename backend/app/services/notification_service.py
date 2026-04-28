@@ -14,6 +14,46 @@ RESEND_URL = "https://api.resend.com/emails"
 SLACK_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 
 
+# ─── Deep-link helpers ──────────────────────────────────────────
+#
+# Every notification points back into the dashboard so recipients can act on
+# the result without hunting for it. The URLs are built from
+# `settings.frontend_url` (already used by OAuth + Stripe redirects) and the
+# routes that exist today in `frontend/app/`:
+#
+#   /matches                    — full match list
+#   /matches?status=violation   — filtered to violations only
+#   /matches/{id}               — per-match detail
+#
+# Per-scan filtering (`?scan_job_id=…`) is intentionally NOT used here because
+# `routers/matches.py` does not yet accept that query param. If/when it does,
+# add it to `_dashboard_link` and the per-channel callers below.
+
+
+def _dashboard_link(path: str = "") -> str:
+    """Return an absolute URL into the dashboard for the given relative path."""
+    base = get_settings().frontend_url.rstrip("/")
+    if not path:
+        return base
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{base}{path}"
+
+
+def _matches_url() -> str:
+    return _dashboard_link("/matches")
+
+
+def _violations_url() -> str:
+    return _dashboard_link("/matches?status=violation")
+
+
+def _match_detail_url(match_id: Optional[str]) -> Optional[str]:
+    if not match_id:
+        return None
+    return _dashboard_link(f"/matches/{match_id}")
+
+
 def _get_org_notify_email(organization_id: UUID) -> Optional[str]:
     """Return the org's notification email if notifications are enabled."""
     try:
@@ -130,6 +170,12 @@ def _build_scan_report_email(
     if violations:
         rows = ""
         for v in violations[:20]:
+            detail_url = _match_detail_url(v.get("match_id"))
+            review_cell = (
+                f'<a href="{detail_url}" style="color:#334155;text-decoration:underline;font-size:12px;">Review</a>'
+                if detail_url
+                else '<span style="color:#9ca3af;font-size:12px;">—</span>'
+            )
             rows += f"""
             <tr>
               <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;">{v.get('asset_name', 'Unknown')}</td>
@@ -137,11 +183,17 @@ def _build_scan_report_email(
               <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;">{v.get('channel', channel)}</td>
               <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;">{v.get('confidence_score', 0)}%</td>
               <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;font-size:12px;color:#6b7280;">{v.get('compliance_summary', '')}</td>
+              <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:right;">{review_cell}</td>
             </tr>"""
 
         truncation = ""
         if violation_count > 20:
-            truncation = f'<p style="color:#6b7280;font-size:12px;margin-top:8px;">Showing 20 of {violation_count} violations. Log in to view all.</p>'
+            truncation = (
+                f'<p style="color:#6b7280;font-size:12px;margin-top:8px;">'
+                f'Showing 20 of {violation_count} violations. '
+                f'<a href="{_violations_url()}" style="color:#334155;">View all in the dashboard</a>.'
+                f'</p>'
+            )
 
         violations_html = f"""
         <h3 style="font-size:14px;color:#dc2626;margin:20px 0 10px 0;">Violation Details</h3>
@@ -153,11 +205,34 @@ def _build_scan_report_email(
               <th style="padding:8px 12px;text-align:left;border-bottom:2px solid #fecaca;color:#991b1b;">Channel</th>
               <th style="padding:8px 12px;text-align:left;border-bottom:2px solid #fecaca;color:#991b1b;">Confidence</th>
               <th style="padding:8px 12px;text-align:left;border-bottom:2px solid #fecaca;color:#991b1b;">Details</th>
+              <th style="padding:8px 12px;text-align:right;border-bottom:2px solid #fecaca;color:#991b1b;"></th>
             </tr>
           </thead>
           <tbody>{rows}</tbody>
         </table>
         {truncation}"""
+
+    # Primary CTA — violations link if any, otherwise the matches dashboard.
+    if violation_count > 0:
+        cta_label = f"Review {violation_count} Violation{'s' if violation_count != 1 else ''}"
+        cta_href = _violations_url()
+    else:
+        cta_label = "Open Dashboard"
+        cta_href = _matches_url()
+
+    cta_html = f"""
+    <div style="margin:24px 0 8px 0;">
+      <a href="{cta_href}"
+         style="display:inline-block;background:#334155;color:#ffffff;text-decoration:none;
+                padding:11px 22px;font-size:14px;font-weight:600;border-radius:4px;">
+        {cta_label}
+      </a>
+      <a href="{_matches_url()}"
+         style="display:inline-block;margin-left:12px;color:#334155;text-decoration:underline;
+                font-size:13px;line-height:38px;vertical-align:top;">
+        View all matches
+      </a>
+    </div>"""
 
     pages_line = f" across {pages} pages" if pages > 0 else ""
 
@@ -175,6 +250,7 @@ def _build_scan_report_email(
         </p>
         {stats_html}
         {violations_html}
+        {cta_html}
       </div>
       <div style="padding:16px 24px;background:#f8fafc;border-top:1px solid #e5e7eb;">
         <p style="color:#9ca3af;font-size:11px;margin:0;">
@@ -387,17 +463,65 @@ def _build_scan_slack_blocks(
     ]
 
     if violations:
-        lines = "\n".join(
-            f"• *{v.get('asset_name', '?')}* at {v.get('distributor_name', '?')} "
-            f"— {v.get('confidence_score', 0)}% confidence"
-            for v in violations[:10]
-        )
-        if violation_count > 10:
-            lines += f"\n_...and {violation_count - 10} more_"
         blocks.append({
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*Top Violations:*\n{lines}"},
+            "text": {"type": "mrkdwn", "text": "*Top Violations:*"},
         })
+        # One section per violation so each row can carry its own "Review"
+        # button accessory pointing at /matches/{id}. Slack allows only one
+        # accessory per section, hence the per-row layout.
+        for v in violations[:10]:
+            text = (
+                f"• *{v.get('asset_name', '?')}* at {v.get('distributor_name', '?')} "
+                f"— {v.get('confidence_score', 0)}% confidence"
+            )
+            section: Dict[str, Any] = {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": text},
+            }
+            detail_url = _match_detail_url(v.get("match_id"))
+            if detail_url:
+                section["accessory"] = {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "Review", "emoji": True},
+                    "url": detail_url,
+                    "action_id": f"match_review_{v.get('match_id')}",
+                }
+            blocks.append(section)
+        if violation_count > 10:
+            blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": f"_...and {violation_count - 10} more_"}],
+            })
+
+    # Always include a final actions block so users land in the dashboard
+    # even when there are no violations to review individually.
+    primary_text = (
+        f"Review {violation_count} Violation{'s' if violation_count != 1 else ''}"
+        if violation_count > 0
+        else "Open Dashboard"
+    )
+    primary_url = _violations_url() if violation_count > 0 else _matches_url()
+
+    actions_block: Dict[str, Any] = {
+        "type": "actions",
+        "elements": [
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": primary_text, "emoji": True},
+                "url": primary_url,
+                "style": "primary",
+                "action_id": "scan_primary_cta",
+            },
+            {
+                "type": "button",
+                "text": {"type": "plain_text", "text": "View All Matches", "emoji": True},
+                "url": _matches_url(),
+                "action_id": "scan_view_all_matches",
+            },
+        ],
+    }
+    blocks.append(actions_block)
 
     blocks.append({"type": "divider"})
     blocks.append({
@@ -604,18 +728,29 @@ def notify_salesforce_scan_complete(
         f"Matches: {summary.get('matches', 0)}",
         f"Violations: {violation_count}",
         f"Compliance Rate: {compliance_rate}%",
+        "",
     ]
+
+    # Plain URLs auto-linkify in the Salesforce Task UI, so listing them in
+    # the description is enough — no rich-text payload needed.
+    if violation_count > 0:
+        lines.append(f"Review violations: {_violations_url()}")
+    lines.append(f"Open dashboard: {_matches_url()}")
 
     if violations:
         lines.append("")
         lines.append("--- Top Violations ---")
         for v in violations[:15]:
-            lines.append(
+            base = (
                 f"• {v.get('asset_name', '?')} at {v.get('distributor_name', '?')} "
                 f"— {v.get('confidence_score', 0)}% confidence"
             )
+            detail_url = _match_detail_url(v.get("match_id"))
+            if detail_url:
+                base += f" — {detail_url}"
+            lines.append(base)
         if violation_count > 15:
-            lines.append(f"...and {violation_count - 15} more")
+            lines.append(f"...and {violation_count - 15} more — {_violations_url()}")
 
     description = "\n".join(lines)
 
@@ -722,20 +857,54 @@ def _jira_api_request(
     return resp
 
 
+def _adf_text(text: str, href: Optional[str] = None) -> Dict[str, Any]:
+    """Build an ADF text node, optionally wrapped in a clickable link mark."""
+    node: Dict[str, Any] = {"type": "text", "text": text}
+    if href:
+        node["marks"] = [{"type": "link", "attrs": {"href": href}}]
+    return node
+
+
+def _adf_paragraph(*nodes: Dict[str, Any]) -> Dict[str, Any]:
+    """Build an ADF paragraph block from one or more text/link nodes."""
+    return {"type": "paragraph", "content": list(nodes)}
+
+
+def _adf_doc_from_text(text: str) -> Dict[str, Any]:
+    """Wrap a plain string in a minimal ADF doc — one paragraph per line so
+    multi-line plain content (like the test issue) renders correctly."""
+    paragraphs: List[Dict[str, Any]] = []
+    for line in text.split("\n"):
+        if line:
+            paragraphs.append(_adf_paragraph(_adf_text(line)))
+        else:
+            paragraphs.append({"type": "paragraph", "content": []})
+    return {"type": "doc", "version": 1, "content": paragraphs}
+
+
 def _create_jira_issue(
     *,
     organization_id: UUID,
     integration: Dict[str, Any],
     summary: str,
-    description: str,
+    description: Optional[str] = None,
+    description_doc: Optional[Dict[str, Any]] = None,
     priority: str = "Medium",
     issue_type: str = "Task",
 ) -> bool:
-    """Create an issue in the selected Jira project."""
+    """Create an issue in the selected Jira project.
+
+    Pass either *description* (plain text — wrapped in a minimal ADF doc) or
+    *description_doc* (a fully-built ADF document, used by the scan-complete
+    flow to embed clickable links).
+    """
     project_key = integration.get("project_key")
     if not project_key:
         log.warning("Jira project_key not set for org %s", organization_id)
         return False
+
+    if description_doc is None:
+        description_doc = _adf_doc_from_text(description or "")
 
     resp = _jira_api_request(
         organization_id=organization_id,
@@ -746,16 +915,7 @@ def _create_jira_issue(
             "fields": {
                 "project": {"key": project_key},
                 "summary": summary,
-                "description": {
-                    "type": "doc",
-                    "version": 1,
-                    "content": [
-                        {
-                            "type": "paragraph",
-                            "content": [{"type": "text", "text": description}],
-                        }
-                    ],
-                },
+                "description": description_doc,
                 "issuetype": {"name": issue_type},
                 "priority": {"name": priority},
             }
@@ -796,31 +956,52 @@ def notify_jira_scan_complete(
         f"({compliance_rate}% compliance)"
     )
 
-    lines = [
-        f"Scan Source: {channel}",
-        f"Total Images Analyzed: {total}",
-        f"Compliance Rate: {compliance_rate}%",
-        f"Violations: {len(violations)}",
-        "",
-        "--- Violations ---",
+    # Build an ADF doc so the dashboard / per-match links are clickable in
+    # the Jira issue — plain-string descriptions render as inert text.
+    doc_content: List[Dict[str, Any]] = [
+        _adf_paragraph(_adf_text(f"Scan Source: {channel}")),
+        _adf_paragraph(_adf_text(f"Total Images Analyzed: {total}")),
+        _adf_paragraph(_adf_text(f"Compliance Rate: {compliance_rate}%")),
+        _adf_paragraph(_adf_text(f"Violations: {len(violations)}")),
+        _adf_paragraph(
+            _adf_text("Review violations: "),
+            _adf_text(_violations_url(), href=_violations_url()),
+        ),
+        _adf_paragraph(
+            _adf_text("Open dashboard: "),
+            _adf_text(_matches_url(), href=_matches_url()),
+        ),
+        _adf_paragraph(_adf_text("--- Violations ---")),
     ]
+
+    # One paragraph per violation; per-match link rendered as a trailing
+    # "Review" hyperlink so the row stays scannable.
     for v in violations[:20]:
-        lines.append(
+        row_text = (
             f"• {v.get('asset_name', '?')} at {v.get('distributor_name', '?')} "
             f"— {v.get('confidence_score', 0)}% confidence"
         )
+        nodes: List[Dict[str, Any]] = [_adf_text(row_text)]
+        detail_url = _match_detail_url(v.get("match_id"))
+        if detail_url:
+            nodes.append(_adf_text(" — "))
+            nodes.append(_adf_text("Review", href=detail_url))
+        doc_content.append(_adf_paragraph(*nodes))
+
     if len(violations) > 20:
-        lines.append(f"...and {len(violations) - 20} more")
+        doc_content.append(_adf_paragraph(
+            _adf_text(f"...and {len(violations) - 20} more — "),
+            _adf_text("View all", href=_violations_url()),
+        ))
 
-    description = "\n".join(lines)
-
+    description_doc = {"type": "doc", "version": 1, "content": doc_content}
     priority = "High" if len(violations) >= 5 else "Medium"
 
     return _create_jira_issue(
         organization_id=organization_id,
         integration=integration,
         summary=issue_summary,
-        description=description,
+        description_doc=description_doc,
         priority=priority,
     )
 

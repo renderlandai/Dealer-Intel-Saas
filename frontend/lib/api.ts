@@ -34,6 +34,29 @@ export interface CampaignCreate {
   organization_id?: string;
 }
 
+export type TargetPlatform =
+  | "google_ads"
+  | "facebook"
+  | "instagram"
+  | "youtube"
+  | "website";
+
+export const ALL_TARGET_PLATFORMS: TargetPlatform[] = [
+  "website",
+  "facebook",
+  "instagram",
+  "google_ads",
+  "youtube",
+];
+
+export const TARGET_PLATFORM_LABELS: Record<TargetPlatform, string> = {
+  website: "Website",
+  facebook: "Facebook",
+  instagram: "Instagram",
+  google_ads: "Google Ads",
+  youtube: "YouTube",
+};
+
 export interface Asset {
   id: string;
   campaign_id: string;
@@ -45,6 +68,7 @@ export interface Asset {
   height: number | null;
   file_size: number | null;
   metadata: Record<string, unknown>;
+  target_platforms: TargetPlatform[];
   created_at: string;
   updated_at: string;
 }
@@ -510,15 +534,32 @@ export const getCampaignAssets = async (campaignId: string): Promise<Asset[]> =>
   return data;
 };
 
-export const uploadAsset = async (campaignId: string, file: File, name?: string): Promise<Asset> => {
+export const uploadAsset = async (
+  campaignId: string,
+  file: File,
+  options?: { name?: string; targetPlatforms?: TargetPlatform[] },
+): Promise<Asset> => {
   const formData = new FormData();
   formData.append("file", file);
-  if (name) formData.append("name", name);
-  
+  if (options?.name) formData.append("name", options.name);
+  if (options?.targetPlatforms && options.targetPlatforms.length > 0) {
+    for (const platform of options.targetPlatforms) {
+      formData.append("target_platforms", platform);
+    }
+  }
+
   const { data } = await api.post(`/campaigns/${campaignId}/assets/upload`, formData, {
     headers: { "Content-Type": "multipart/form-data" },
     timeout: 60000,
   });
+  return data;
+};
+
+export const updateAsset = async (
+  assetId: string,
+  payload: { name?: string; target_platforms?: TargetPlatform[]; metadata?: Record<string, unknown> },
+): Promise<Asset> => {
+  const { data } = await api.patch(`/campaigns/assets/${assetId}`, payload);
   return data;
 };
 
@@ -541,6 +582,13 @@ export const getDistributor = async (id: string): Promise<Distributor> => {
 
 export const createDistributor = async (distributor: DistributorCreate): Promise<Distributor> => {
   const { data } = await api.post("/distributors", distributor);
+  return data;
+};
+
+export const bulkCreateDistributors = async (
+  distributors: DistributorCreate[],
+): Promise<Distributor[]> => {
+  const { data } = await api.post("/distributors/bulk", distributors);
   return data;
 };
 

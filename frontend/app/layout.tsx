@@ -1,27 +1,34 @@
 import type { Metadata } from "next";
-import { Inter, Plus_Jakarta_Sans, JetBrains_Mono } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
 import { QueryProvider } from "@/lib/query-provider";
 import { AuthGate } from "@/components/layout/auth-gate";
 
-const inter = Inter({
-  subsets: ["latin"],
+// Self-hosted fonts (latin subset, variable weight axis) so a slow link to
+// fonts.gstatic.com can't make Next.js's 3s font-fetch timeout fall back to
+// the system stack. The .woff2 files live in `frontend/public/fonts/` and
+// were sourced from Google Fonts (Inter v20, Plus Jakarta Sans v12,
+// JetBrains Mono v24). To refresh them, re-download the latin subset URL
+// from each family's `https://fonts.googleapis.com/css2?family=...` CSS.
+const inter = localFont({
+  src: "../public/fonts/Inter-latin-variable.woff2",
   variable: "--font-sans",
   display: "swap",
+  weight: "100 900",
 });
 
-const jakarta = Plus_Jakarta_Sans({
-  subsets: ["latin"],
+const jakarta = localFont({
+  src: "../public/fonts/PlusJakartaSans-latin-variable.woff2",
   variable: "--font-display",
   display: "swap",
-  weight: ["500", "600", "700", "800"],
+  weight: "200 800",
 });
 
-const mono = JetBrains_Mono({
-  subsets: ["latin"],
+const mono = localFont({
+  src: "../public/fonts/JetBrainsMono-latin-variable.woff2",
   variable: "--font-mono",
   display: "swap",
-  weight: ["400", "500", "600"],
+  weight: "100 800",
 });
 
 export const metadata: Metadata = {

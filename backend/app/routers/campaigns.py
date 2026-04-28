@@ -170,6 +170,31 @@ async def list_campaign_assets(campaign_id: UUID, user: AuthUser = Depends(get_c
     return result.data
 
 
+_VALID_TARGET_PLATFORMS = {s.value for s in ScanSource}
+
+
+def _normalize_target_platforms(values: Optional[List[str]]) -> List[str]:
+    """Validate and de-duplicate platform tags. Empty list = all channels."""
+    if not values:
+        return []
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        if not raw:
+            continue
+        v = str(raw).strip().lower()
+        if v in seen:
+            continue
+        if v not in _VALID_TARGET_PLATFORMS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid target platform '{raw}'. Allowed: {', '.join(sorted(_VALID_TARGET_PLATFORMS))}",
+            )
+        seen.add(v)
+        cleaned.append(v)
+    return cleaned
+
+
 @router.post("/{campaign_id}/assets", response_model=Asset, summary="Create asset")
 @limiter.limit("10/minute")
 async def create_asset(request: Request, campaign_id: UUID, asset: AssetCreate, user: AuthUser = Depends(get_current_user)):
@@ -177,7 +202,8 @@ async def create_asset(request: Request, campaign_id: UUID, asset: AssetCreate, 
     _verify_campaign_ownership(campaign_id, user.org_id)
     data = asset.model_dump()
     data["campaign_id"] = str(campaign_id)
-    
+    data["target_platforms"] = _normalize_target_platforms(data.get("target_platforms"))
+
     result = supabase.table("assets").insert(data).execute()
     return result.data[0]
 
@@ -189,21 +215,48 @@ async def upload_asset(
     campaign_id: UUID,
     file: UploadFile = File(...),
     name: Optional[str] = Form(None),
+    target_platforms: Optional[List[str]] = Form(None),
     user: AuthUser = Depends(get_current_user),
 ):
-    """Upload an asset file."""
+    """Upload an asset file.
+
+    `target_platforms` (optional, multipart-repeatable) tags this creative
+    with the channels it's approved for. Empty/omitted = all channels.
+    Allowed values mirror `ScanSource`: google_ads, facebook, instagram,
+    youtube, website. Send as repeated form fields, e.g.
+    `target_platforms=facebook&target_platforms=instagram`.
+    """
     _verify_campaign_ownership(campaign_id, user.org_id)
+    normalized_platforms = _normalize_target_platforms(target_platforms)
     import uuid as uuid_lib
     import time
     import base64
+    import io
+    import os
 
     ALLOWED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp", "image/svg+xml"}
-    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+    PSD_TYPES = {"image/vnd.adobe.photoshop", "image/x-photoshop", "application/x-photoshop"}
+    MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB (PSDs are larger than flat images)
 
-    if file.content_type and file.content_type not in ALLOWED_TYPES:
+    raw_filename = file.filename or "unnamed"
+    incoming_ext = os.path.splitext(raw_filename)[1].lower()
+    is_psd_by_ext = incoming_ext == ".psd"
+    is_psd_by_type = (file.content_type or "").lower() in PSD_TYPES
+
+    content_type = (file.content_type or "").lower()
+    accepted = (
+        content_type in ALLOWED_TYPES
+        or is_psd_by_type
+        or is_psd_by_ext
+        or not content_type  # browsers occasionally omit the type — defer to extension/magic-bytes check below
+    )
+    if not accepted:
         raise HTTPException(
             status_code=400,
-            detail=f"File type '{file.content_type}' not allowed. Accepted: {', '.join(sorted(ALLOWED_TYPES))}",
+            detail=(
+                f"File type '{file.content_type}' not allowed. "
+                f"Accepted: {', '.join(sorted(ALLOWED_TYPES))}, image/vnd.adobe.photoshop (.psd)."
+            ),
         )
 
     content = await file.read()
@@ -217,50 +270,84 @@ async def upload_asset(
     if len(content) == 0:
         raise HTTPException(status_code=400, detail="File is empty.")
 
-    file_name = file.filename or "unnamed"
+    # Detect PSD by magic bytes ("8BPS") in case the MIME/extension lied.
+    is_psd = is_psd_by_ext or is_psd_by_type or content[:4] == b"8BPS"
+
+    # If the upload is a PSD, rasterize to a flat PNG so the rest of the
+    # pipeline (browser previews, AI matching) keeps working unchanged.
+    # The original PSD bytes are discarded; we keep only the composite PNG.
+    stored_content = content
+    stored_content_type = file.content_type or "application/octet-stream"
+    file_name = raw_filename
+
+    if is_psd:
+        try:
+            from psd_tools import PSDImage  # type: ignore
+
+            psd = PSDImage.open(io.BytesIO(content))
+            composite = psd.composite()
+            if composite is None:
+                raise ValueError("PSD has no rasterizable composite layer")
+            png_buf = io.BytesIO()
+            composite.convert("RGBA").save(png_buf, format="PNG", optimize=True)
+            stored_content = png_buf.getvalue()
+            stored_content_type = "image/png"
+            base, _ = os.path.splitext(raw_filename)
+            file_name = f"{base or 'asset'}.png"
+        except Exception as psd_error:
+            log.error("PSD rasterization failed: %s", psd_error)
+            raise HTTPException(
+                status_code=400,
+                detail="Could not read this .psd file. Please re-export it from Photoshop and try again.",
+            )
+
+    if not is_psd and stored_content_type not in ALLOWED_TYPES:
+        # Final guard for unknown/missing MIMEs that slipped past the early check.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"File type '{stored_content_type}' not allowed. "
+                f"Accepted: {', '.join(sorted(ALLOWED_TYPES))}, image/vnd.adobe.photoshop (.psd)."
+            ),
+        )
+
     asset_name = name or file_name
-    
-    # Generate unique filename with timestamp to avoid conflicts
+
     timestamp = int(time.time() * 1000)
     random_id = uuid_lib.uuid4().hex[:12]
     unique_filename = f"{timestamp}_{random_id}_{file_name}"
     storage_path = f"assets/{campaign_id}/{unique_filename}"
-    
+
     file_url = None
-    
+
     try:
-        # Try Supabase Storage first
         bucket = supabase.storage.from_("campaign-assets")
-        
-        # Upload file with overwrite
         bucket.upload(
             path=storage_path,
-            file=content,
-            file_options={"contentType": file.content_type, "upsert": "true"}
+            file=stored_content,
+            file_options={"contentType": stored_content_type, "upsert": "true"}
         )
-        
-        # Get public URL
         file_url = bucket.get_public_url(storage_path)
-        
+
     except Exception as storage_error:
         log.error("Storage upload failed: %s", storage_error)
-        # Fallback: use base64 data URL (works without storage bucket)
-        base64_content = base64.b64encode(content).decode('utf-8')
-        file_url = f"data:{file.content_type};base64,{base64_content}"
-    
+        # Fallback: inline data URL (works without a storage bucket configured).
+        base64_content = base64.b64encode(stored_content).decode('utf-8')
+        file_url = f"data:{stored_content_type};base64,{base64_content}"
+
     try:
-        # Create asset record
         asset_data = {
             "campaign_id": str(campaign_id),
             "name": asset_name,
             "file_url": file_url,
-            "file_type": file.content_type,
-            "file_size": len(content)
+            "file_type": stored_content_type,
+            "file_size": len(stored_content),
+            "target_platforms": normalized_platforms,
         }
-        
+
         result = supabase.table("assets").insert(asset_data).execute()
         return result.data[0]
-        
+
     except Exception as e:
         error_str = str(e)
         log.error("Database error: %s: %s", type(e).__name__, error_str)
@@ -310,6 +397,39 @@ async def get_asset_thumbnail(asset_id: UUID, user: AuthUser = Depends(get_curre
         media_type=media_type or "image/png",
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+
+@router.patch("/assets/{asset_id}", response_model=Asset, summary="Update asset")
+@limiter.limit("20/minute")
+async def update_asset(
+    request: Request,
+    asset_id: UUID,
+    payload: AssetUpdate,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Update an asset's mutable fields (name, metadata, target_platforms)."""
+    asset = supabase.table("assets")\
+        .select("id, campaigns!inner(organization_id)")\
+        .eq("id", str(asset_id))\
+        .eq("campaigns.organization_id", str(user.org_id))\
+        .maybe_single()\
+        .execute()
+    if not asset.data:
+        raise HTTPException(status_code=404, detail="Asset not found")
+
+    update_data = payload.model_dump(exclude_unset=True)
+    if "target_platforms" in update_data:
+        update_data["target_platforms"] = _normalize_target_platforms(update_data["target_platforms"])
+    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+    result = supabase.table("assets")\
+        .update(update_data)\
+        .eq("id", str(asset_id))\
+        .execute()
+
+    if not result.data:
+        raise HTTPException(status_code=500, detail="Failed to update asset")
+    return result.data[0]
 
 
 @router.delete("/assets/{asset_id}", summary="Delete asset")
