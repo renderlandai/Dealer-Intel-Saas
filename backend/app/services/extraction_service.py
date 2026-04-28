@@ -19,10 +19,11 @@ import io
 import logging
 import time
 import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from uuid import UUID
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from PIL import Image
 
@@ -39,6 +40,44 @@ from ..services.bulk_writers import (
 log = logging.getLogger("dealer_intel.extraction")
 
 settings = get_settings()
+
+
+# ---------------------------------------------------------------------------
+# Extraction outcomes (Task A: truthful counters)
+# ---------------------------------------------------------------------------
+#
+# Every page-extraction attempt resolves to exactly one of these. The runner
+# uses the outcome — not just the image count — to decide what to count as a
+# real "page scanned" vs. a blocked / failed page that should be surfaced in
+# the report. Adding a screenshot-fallback row no longer silently inflates
+# the "pages scanned" metric.
+OUTCOME_IMAGES = "images"          # got >=1 real <img>
+OUTCOME_EMPTY = "empty"            # page loaded fine but had no extractable images
+OUTCOME_BLOCKED = "blocked"        # WAF / anti-bot / 4xx / ERR_ABORTED
+OUTCOME_TIMEOUT = "timeout"        # navigation never completed within playwright_timeout
+OUTCOME_CRASHED = "crashed"        # playwright/browser exception we didn't classify
+
+
+@dataclass
+class ExtractionResult:
+    """Structured outcome of a single page-extraction attempt.
+
+    Fields:
+      count:        number of new images inserted into ``discovered_images``
+      evidence_url: URL of the full-page screenshot uploaded to storage
+                    (None when even the screenshot failed)
+      outcome:      one of OUTCOME_* above; the runner uses this to bin the
+                    page into "scanned with images / empty page / blocked /
+                    timeout / crashed"
+      block_reason: short human-readable reason when outcome=BLOCKED
+                    (e.g. "ERR_ABORTED", "HTTP 403", "challenge_page")
+      http_status:  response status from the initial navigation, if known
+    """
+    count: int = 0
+    evidence_url: Optional[str] = None
+    outcome: str = OUTCOME_EMPTY
+    block_reason: Optional[str] = None
+    http_status: Optional[int] = None
 
 
 # Shared browser instance to avoid repeated cold starts
@@ -74,11 +113,42 @@ async def _get_browser() -> Browser:
             _pw_instance = await async_playwright().start()
             _browser = await _pw_instance.chromium.launch(
                 headless=True,
-                args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
+                args=[
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    # Stealth: hide the "I'm an automation" flag that many
+                    # WAFs (Akamai/Cloudflare/Imperva, including the one
+                    # protecting rent.cat.com) check in the very first
+                    # navigator probe.
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
             _browser_created_at = time.monotonic()
             log.info("Launched fresh Playwright browser")
     return _browser
+
+
+# Lightweight stealth init script — applied to every new context. This is
+# *not* full evasion, but it bypasses the cheapest WAF fingerprints
+# (navigator.webdriver === true, empty navigator.plugins, languages mismatch)
+# without pulling in playwright-stealth as a dependency.
+_STEALTH_INIT_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {
+    get: () => [1, 2, 3, 4, 5].map(() => ({name: 'Chrome PDF Plugin'}))
+});
+window.chrome = window.chrome || {runtime: {}};
+const originalQuery = window.navigator.permissions && window.navigator.permissions.query;
+if (originalQuery) {
+    window.navigator.permissions.query = (parameters) => (
+        parameters.name === 'notifications'
+            ? Promise.resolve({state: Notification.permission})
+            : originalQuery(parameters)
+    );
+}
+"""
 
 
 async def _new_page(browser: Browser, mobile: bool = False) -> Page:
@@ -94,6 +164,8 @@ async def _new_page(browser: Browser, mobile: bool = False) -> Page:
             is_mobile=True,
             has_touch=True,
             device_scale_factor=3,
+            locale="en-US",
+            timezone_id="America/New_York",
         )
     else:
         context = await browser.new_context(
@@ -103,7 +175,15 @@ async def _new_page(browser: Browser, mobile: bool = False) -> Page:
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
+            locale="en-US",
+            timezone_id="America/New_York",
         )
+    try:
+        await context.add_init_script(_STEALTH_INIT_JS)
+    except Exception:
+        # Stealth is best-effort — a Playwright/Chromium version mismatch
+        # shouldn't block extraction.
+        pass
     page = await context.new_page()
     return page
 
@@ -228,6 +308,21 @@ async def _capture_evidence_screenshot(
     except Exception as e:
         log.error("Evidence screenshot failed: %s", e)
         return None
+
+
+async def _screenshotone_fallback(url: str, scan_job_id: UUID) -> Optional[str]:
+    """Capture a blocked page via ScreenshotOne's hosted renderer.
+
+    Used when both Playwright viewports came back BLOCKED — ScreenshotOne
+    runs from rotating residential-style IPs that are typically not on
+    Cat/Akamai's headless-Chromium denylist. Returns the storage URL of
+    the uploaded PNG, or None on any failure.
+    """
+    if not getattr(settings, "screenshotone_access_key", ""):
+        return None
+    # Late import to avoid a circular dependency between services.
+    from . import screenshot_service
+    return await screenshot_service.capture_and_upload(url, scan_job_id)
 
 
 async def _extract_images_from_page(page: Page) -> List[Dict[str, Any]]:
@@ -450,59 +545,130 @@ def _classify_location(y: int, page_height: int) -> str:
     return "footer"
 
 
-async def _extract_from_viewport(
+# --- Block / failure classification helpers ---------------------------------
+#
+# These are heuristics that turn raw Playwright/Chromium errors into the
+# normalized OUTCOME_* values the runner can act on. The strings come from
+# Chromium's net error names; full list:
+# https://chromium.googlesource.com/chromium/src/+/refs/heads/main/net/base/net_error_list.h
+_BLOCK_NET_ERRORS = (
+    "ERR_ABORTED",                  # WAF / cancelled by server
+    "ERR_BLOCKED_BY_CLIENT",
+    "ERR_BLOCKED_BY_RESPONSE",
+    "ERR_HTTP_RESPONSE_CODE_FAILURE",
+    "ERR_TOO_MANY_REDIRECTS",
+    "ERR_SSL_PROTOCOL_ERROR",
+    "ERR_CERT_",                    # any cert error
+)
+
+_TARGET_CLOSED_MARKERS = (
+    "Target page, context or browser has been closed",
+    "Target closed",
+    "TargetClosedError",
+)
+
+
+def _classify_playwright_error(exc: BaseException) -> Tuple[str, Optional[str]]:
+    """Map a Playwright exception to (outcome, block_reason).
+
+    Returns (OUTCOME_TIMEOUT, None) for navigation timeouts,
+    (OUTCOME_BLOCKED, "ERR_XYZ") for known anti-bot signatures,
+    (OUTCOME_CRASHED, "browser_closed") if the browser was torn down under
+    us, or (OUTCOME_CRASHED, str(exc)[:200]) for anything else.
+    """
+    if isinstance(exc, PlaywrightTimeout):
+        return OUTCOME_TIMEOUT, None
+    msg = str(exc)
+    for marker in _TARGET_CLOSED_MARKERS:
+        if marker in msg:
+            return OUTCOME_CRASHED, "browser_closed"
+    for sig in _BLOCK_NET_ERRORS:
+        if sig in msg:
+            return OUTCOME_BLOCKED, sig
+    return OUTCOME_CRASHED, msg.splitlines()[0][:200] if msg else "unknown"
+
+
+async def _attempt_extraction(
     url: str,
     scan_job_id: UUID,
     distributor_id: Optional[UUID],
     mobile: bool,
     seen_srcs: set,
-    campaign_assets: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[int, Optional[str], set]:
-    """
-    Load a URL in a single viewport (desktop or mobile), extract images,
-    and insert unseen ones into discovered_images.
+    campaign_assets: Optional[List[Dict[str, Any]]],
+    img_buffer: DiscoveredImageBuffer,
+) -> ExtractionResult:
+    """Single end-to-end attempt: open page, navigate, extract, screenshot.
 
-    When campaign_assets are provided, also runs OpenCV-based localization
-    to find and crop composed creatives from the full-page screenshot.
-
-    Returns (extracted_count, evidence_screenshot_url, updated_seen_srcs).
+    Always closes its own context. Never recycles the shared browser.
+    The caller decides whether to retry, switch viewport, or fall back to
+    a hosted screenshot service.
     """
     viewport_label = "mobile" if mobile else "desktop"
     browser = await _get_browser()
-    page = await _new_page(browser, mobile=mobile)
-    img_buffer = DiscoveredImageBuffer()
-    first_pass_added = 0  # tracks whether the first pass added anything (for retry trigger)
-    evidence_url = None
+    try:
+        page = await _new_page(browser, mobile=mobile)
+    except Exception as e:
+        # Most commonly: TargetClosedError because another task triggered
+        # a recycle. Re-acquire and try one more time before giving up.
+        outcome, reason = _classify_playwright_error(e)
+        if outcome == OUTCOME_CRASHED and reason == "browser_closed":
+            browser = await _get_browser()
+            try:
+                page = await _new_page(browser, mobile=mobile)
+            except Exception as e2:
+                outcome2, reason2 = _classify_playwright_error(e2)
+                return ExtractionResult(
+                    outcome=outcome2, block_reason=reason2 or reason,
+                )
+        else:
+            return ExtractionResult(outcome=outcome, block_reason=reason)
+
+    evidence_url: Optional[str] = None
+    nav_status: Optional[int] = None
+    nav_outcome: Optional[str] = None
+    nav_reason: Optional[str] = None
+    added = 0
 
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=settings.playwright_timeout)
+        try:
+            response = await page.goto(
+                url, wait_until="domcontentloaded",
+                timeout=settings.playwright_timeout,
+            )
+            if response is not None:
+                nav_status = response.status
+                if nav_status >= 400:
+                    nav_outcome = OUTCOME_BLOCKED
+                    nav_reason = f"HTTP {nav_status}"
+        except Exception as nav_exc:
+            outcome, reason = _classify_playwright_error(nav_exc)
+            log.error(
+                "Navigation failed for %s (%s) — outcome=%s reason=%s",
+                url, viewport_label, outcome, reason,
+            )
+            return ExtractionResult(outcome=outcome, block_reason=reason)
+
         await asyncio.sleep(2)
         await _dismiss_overlays(page)
         await _scroll_to_bottom(page)
-
-        # Wait for lazy images to finish loading after scroll
         try:
             await page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
             pass
 
-        # Extract images before carousel advancement (captures initial slide)
         images = await _extract_images_from_page(page)
         pre_carousel_srcs = {img["src"] for img in images}
-
-        # Click through carousel/slider controls, extracting after each step
         carousel_images = await _advance_carousels(page)
         for img in carousel_images:
             if img["src"] not in pre_carousel_srcs:
                 images.append(img)
 
         page_height = await page.evaluate("document.body.scrollHeight")
-
-        # Take full-page screenshot (used for evidence AND localization)
         screenshot_bytes = await page.screenshot(full_page=True, type="png")
-        evidence_url = await _upload_screenshot(screenshot_bytes, scan_job_id, f"{url}#_{viewport_label}")
+        evidence_url = await _upload_screenshot(
+            screenshot_bytes, scan_job_id, f"{url}#_{viewport_label}",
+        )
 
-        # OpenCV localization: find and crop composed creatives
         if campaign_assets:
             localized = await _localize_and_crop_assets(
                 screenshot_bytes, scan_job_id, campaign_assets,
@@ -510,13 +676,15 @@ async def _extract_from_viewport(
             images.extend(localized)
             log.info("CV localization added %d cropped creative(s)", len(localized))
 
-        log.info("Found %d images+sections (%s) on %s", len(images), viewport_label, url)
+        log.info(
+            "Found %d images+sections (%s) on %s",
+            len(images), viewport_label, url,
+        )
 
         for img in images:
             if img["src"] in seen_srcs:
                 continue
             seen_srcs.add(img["src"])
-
             location = _classify_location(img["y"], page_height)
             img_buffer.add({
                 "scan_job_id": str(scan_job_id),
@@ -538,107 +706,122 @@ async def _extract_from_viewport(
                     "evidence_screenshot_url": evidence_url,
                 },
             })
-            first_pass_added += 1
+            added += 1
 
-    except PlaywrightTimeout:
-        log.error("Timeout loading %s (%s) — will retry with fresh browser", url, viewport_label)
     except Exception as e:
-        log.error("Error on %s (%s): %s — will retry with fresh browser", url, viewport_label, e, exc_info=True)
+        outcome, reason = _classify_playwright_error(e)
+        log.error(
+            "Mid-extraction error on %s (%s): %s (outcome=%s)",
+            url, viewport_label, e, outcome,
+        )
+        return ExtractionResult(
+            count=added, evidence_url=evidence_url,
+            outcome=outcome, block_reason=reason,
+            http_status=nav_status,
+        )
     finally:
         try:
             await page.context.close()
         except Exception:
             pass
 
-    # Retry once with a recycled browser when extraction failed completely
-    if first_pass_added == 0 and evidence_url is None:
-        log.info("Retrying %s (%s) with fresh browser", url, viewport_label)
-        global _browser, _pw_instance, _browser_created_at
-        async with _browser_lock:
-            if _browser is not None:
-                try:
-                    await _browser.close()
-                except Exception:
-                    pass
-            if _pw_instance is not None:
-                try:
-                    await _pw_instance.stop()
-                except Exception:
-                    pass
-            _pw_instance = await async_playwright().start()
-            _browser = await _pw_instance.chromium.launch(
-                headless=True,
-                args=["--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            _browser_created_at = time.monotonic()
-            log.info("Browser recycled for retry")
+    if nav_outcome == OUTCOME_BLOCKED:
+        # Navigation returned 4xx/5xx. We may have a screenshot of the
+        # error page; surface that as block evidence rather than as a
+        # successful scan.
+        return ExtractionResult(
+            count=0, evidence_url=evidence_url,
+            outcome=OUTCOME_BLOCKED, block_reason=nav_reason,
+            http_status=nav_status,
+        )
 
-        retry_page = await _new_page(_browser, mobile=mobile)
-        try:
-            await retry_page.goto(url, wait_until="domcontentloaded", timeout=settings.playwright_timeout)
-            await asyncio.sleep(2)
-            await _dismiss_overlays(retry_page)
-            await _scroll_to_bottom(retry_page)
+    if added > 0:
+        return ExtractionResult(
+            count=added, evidence_url=evidence_url,
+            outcome=OUTCOME_IMAGES, http_status=nav_status,
+        )
+    return ExtractionResult(
+        count=0, evidence_url=evidence_url,
+        outcome=OUTCOME_EMPTY, http_status=nav_status,
+    )
 
-            try:
-                await retry_page.wait_for_load_state("networkidle", timeout=5000)
-            except Exception:
-                pass
 
-            images = await _extract_images_from_page(retry_page)
-            carousel_images = await _advance_carousels(retry_page)
-            for img in carousel_images:
-                if img["src"] not in {i["src"] for i in images}:
-                    images.append(img)
+async def _extract_from_viewport(
+    url: str,
+    scan_job_id: UUID,
+    distributor_id: Optional[UUID],
+    mobile: bool,
+    seen_srcs: set,
+    campaign_assets: Optional[List[Dict[str, Any]]] = None,
+) -> ExtractionResult:
+    """Try once, retry once on transient failure, return a structured result.
 
-            page_height = await retry_page.evaluate("document.body.scrollHeight")
-            screenshot_bytes = await retry_page.screenshot(full_page=True, type="png")
-            evidence_url = await _upload_screenshot(screenshot_bytes, scan_job_id, f"{url}#_{viewport_label}")
+    The retry uses a fresh BrowserContext — and re-acquires the shared
+    browser if a TargetClosedError was raised — but never tears down the
+    process-wide browser singleton. That avoids the friendly-fire cascade
+    where one slow site's recycle would close every other in-flight page.
+    """
+    img_buffer = DiscoveredImageBuffer()
 
-            if campaign_assets:
-                localized = await _localize_and_crop_assets(screenshot_bytes, scan_job_id, campaign_assets)
-                images.extend(localized)
+    result = await _attempt_extraction(
+        url=url, scan_job_id=scan_job_id, distributor_id=distributor_id,
+        mobile=mobile, seen_srcs=seen_srcs, campaign_assets=campaign_assets,
+        img_buffer=img_buffer,
+    )
 
-            log.info("Retry found %d images+sections (%s) on %s", len(images), viewport_label, url)
+    # Retry once if the first attempt was transient (timeout / crashed /
+    # blocked-with-no-evidence). We do NOT retry blocks that already have
+    # a screenshot — those are real WAF responses, not flakes.
+    transient = (
+        result.outcome in (OUTCOME_TIMEOUT, OUTCOME_CRASHED)
+        or (result.outcome == OUTCOME_BLOCKED and result.evidence_url is None)
+    )
+    if transient and result.count == 0:
+        log.info(
+            "Retrying %s (%s) — first attempt outcome=%s reason=%s",
+            url, "mobile" if mobile else "desktop",
+            result.outcome, result.block_reason,
+        )
+        retry = await _attempt_extraction(
+            url=url, scan_job_id=scan_job_id, distributor_id=distributor_id,
+            mobile=mobile, seen_srcs=seen_srcs, campaign_assets=campaign_assets,
+            img_buffer=img_buffer,
+        )
+        # Prefer the retry result, but keep the more informative
+        # block_reason if the retry didn't find one.
+        if retry.outcome != OUTCOME_CRASHED or result.outcome == OUTCOME_CRASHED:
+            result = retry
+        if result.block_reason is None:
+            result.block_reason = retry.block_reason or result.block_reason
 
-            for img in images:
-                if img["src"] in seen_srcs:
-                    continue
-                seen_srcs.add(img["src"])
-                location = _classify_location(img["y"], page_height)
-                img_buffer.add({
-                    "scan_job_id": str(scan_job_id),
-                    "distributor_id": str(distributor_id) if distributor_id else None,
-                    "source_url": url,
-                    "image_url": img["src"],
-                    "source_type": "extracted_image",
-                    "channel": "website",
-                    "metadata": {
-                        "extraction_method": "playwright",
-                        "viewport": viewport_label,
-                        "element_tag": img["tag"],
-                        "original_width": img["width"],
-                        "original_height": img["height"],
-                        "position": {"x": img["x"], "y": img["y"]},
-                        "page_location": location,
-                        "alt_text": img["alt"],
-                        "css_classes": img["classes"],
-                        "evidence_screenshot_url": evidence_url,
-                    },
-                })
+    flushed = img_buffer.flush_all()
+    if flushed and result.outcome == OUTCOME_EMPTY:
+        # Retry succeeded after first-pass empty.
+        result.count = flushed
+        result.outcome = OUTCOME_IMAGES
+    else:
+        result.count = max(result.count, flushed)
+    return result
 
-        except PlaywrightTimeout:
-            log.error("Retry also timed out for %s (%s)", url, viewport_label)
-        except Exception as e:
-            log.error("Retry also failed for %s (%s): %s", url, viewport_label, e)
-        finally:
-            try:
-                await retry_page.context.close()
-            except Exception:
-                pass
 
-    extracted_count = img_buffer.flush_all()
-    return extracted_count, evidence_url, seen_srcs
+# Hosts where headless-Chromium-as-desktop is reliably blocked but the
+# mobile variant works. Try mobile first to avoid burning ~30s on a
+# guaranteed timeout. Configurable via the WEBSITE_MOBILE_FIRST_HOSTS env
+# var (comma-separated list of hostnames) — defaults below.
+import os as _os
+_MOBILE_FIRST_DEFAULT = "rent.cat.com"
+MOBILE_FIRST_HOSTS = {
+    h.strip().lower()
+    for h in _os.getenv("WEBSITE_MOBILE_FIRST_HOSTS", _MOBILE_FIRST_DEFAULT).split(",")
+    if h.strip()
+}
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
 
 
 async def extract_dealer_website(
@@ -646,23 +829,76 @@ async def extract_dealer_website(
     scan_job_id: UUID,
     distributor_id: Optional[UUID] = None,
     campaign_assets: Optional[List[Dict[str, Any]]] = None,
-) -> Tuple[int, Optional[str]]:
-    """
-    Load a dealer website in a desktop viewport, extract individual images,
-    and use OpenCV localization to crop composed creatives.
+) -> ExtractionResult:
+    """Load a dealer page, extract images, and return a structured outcome.
 
-    Returns (total_extracted_images, evidence_screenshot_url).
+    Strategy:
+      1. Decide initial viewport: mobile-first for known anti-bot hosts,
+         desktop everywhere else.
+      2. If the first viewport returns OUTCOME_BLOCKED or OUTCOME_TIMEOUT,
+         try the other viewport once.
+      3. If still blocked and ``settings.screenshotone_fallback_enabled``
+         is on, use the ScreenshotOne hosted renderer to capture the
+         page so the user at least has visual evidence.
     """
     log.info("Dealer website: %s", url)
     seen_srcs: set = set()
+    host = _host_of(url)
 
-    count, evidence_url, seen_srcs = await _extract_from_viewport(
-        url, scan_job_id, distributor_id, mobile=False, seen_srcs=seen_srcs,
+    primary_mobile = host in MOBILE_FIRST_HOSTS
+    primary = await _extract_from_viewport(
+        url, scan_job_id, distributor_id,
+        mobile=primary_mobile, seen_srcs=seen_srcs,
         campaign_assets=campaign_assets,
     )
 
-    log.info("Extracted %d unique images from %s", count, url)
-    return count, evidence_url
+    final = primary
+
+    # Switch viewport on block/timeout — desktop-blocked SPAs sometimes
+    # render server-side for mobile UAs, and vice versa for old-school
+    # sites that refuse mobile.
+    if primary.outcome in (OUTCOME_BLOCKED, OUTCOME_TIMEOUT) and primary.count == 0:
+        secondary = await _extract_from_viewport(
+            url, scan_job_id, distributor_id,
+            mobile=not primary_mobile, seen_srcs=seen_srcs,
+            campaign_assets=campaign_assets,
+        )
+        # Prefer a successful secondary; otherwise keep the primary's
+        # evidence (if any) but adopt the secondary outcome if it's
+        # more informative.
+        if secondary.outcome == OUTCOME_IMAGES:
+            final = secondary
+        elif secondary.evidence_url and not primary.evidence_url:
+            final = secondary
+        elif secondary.outcome == OUTCOME_BLOCKED and primary.outcome != OUTCOME_BLOCKED:
+            final = secondary
+
+    # ScreenshotOne fallback for definitively-blocked pages.
+    if (
+        final.outcome == OUTCOME_BLOCKED
+        and final.count == 0
+        and getattr(settings, "screenshotone_fallback_enabled", False)
+    ):
+        try:
+            shot_url = await _screenshotone_fallback(url, scan_job_id)
+        except Exception as e:
+            log.warning("ScreenshotOne fallback failed for %s: %s", url, e)
+            shot_url = None
+        if shot_url:
+            log.info("ScreenshotOne fallback captured %s", url)
+            final = ExtractionResult(
+                count=0,
+                evidence_url=shot_url,
+                outcome=OUTCOME_BLOCKED,
+                block_reason=final.block_reason or "blocked_screenshotone_only",
+                http_status=final.http_status,
+            )
+
+    log.info(
+        "Dealer page %s — outcome=%s count=%d reason=%s",
+        url, final.outcome, final.count, final.block_reason,
+    )
+    return final
 
 
 async def discover_website_urls(
@@ -755,17 +991,22 @@ async def scan_dealer_websites(
     async def _process_url(url: str) -> int:
         async with semaphore:
             distributor_id = _match_distributor_by_domain(url, distributor_mapping)
-            count, evidence_url = await extract_dealer_website(
+            res = await extract_dealer_website(
                 url, scan_job_id, distributor_id, campaign_assets=campaign_assets,
             )
 
-            if count == 0 and settings.enable_tiling_fallback and evidence_url:
+            if (
+                res.count == 0
+                and settings.enable_tiling_fallback
+                and res.evidence_url
+                and res.outcome != OUTCOME_BLOCKED
+            ):
                 log.info("Zero images extracted from %s — inserting screenshot for tiling fallback", url)
                 _safe_insert_discovered_image({
                     "scan_job_id": str(scan_job_id),
                     "distributor_id": str(distributor_id) if distributor_id else None,
                     "source_url": url,
-                    "image_url": evidence_url,
+                    "image_url": res.evidence_url,
                     "source_type": "page_screenshot",
                     "channel": "website",
                     "metadata": {
@@ -775,7 +1016,7 @@ async def scan_dealer_websites(
                     },
                 })
                 return 1
-            return count
+            return res.count
 
     results = await asyncio.gather(
         *[_process_url(url) for url in website_urls],

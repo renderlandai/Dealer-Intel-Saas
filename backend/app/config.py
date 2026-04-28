@@ -135,6 +135,11 @@ class Settings(BaseSettings):
     enable_tiling_fallback: bool = Field(default=True, description="Tile screenshots when extraction fails")
     tile_height: int = Field(default=1080, description="Height of each screenshot tile in pixels")
     tile_overlap: int = Field(default=200, description="Overlap between adjacent tiles in pixels")
+    # When Playwright is consistently blocked (anti-bot WAF), fall back to
+    # ScreenshotOne's hosted renderer so the user at least has visual
+    # evidence and the page is counted as "blocked, captured externally"
+    # rather than silently lost.
+    screenshotone_fallback_enabled: bool = Field(default=True, description="Use ScreenshotOne to capture pages that Playwright cannot load")
     
     # Page Discovery
     enable_page_discovery: bool = Field(default=True, description="Auto-discover subpages on dealer sites")

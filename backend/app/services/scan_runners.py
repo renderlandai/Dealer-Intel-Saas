@@ -209,6 +209,14 @@ def _send_scan_notifications(
             "violations": violation_count,
             "compliance_rate": rate,
             "pages_scanned": stats.get("pages_scanned", 0),
+            "pages_blocked": stats.get("pages_blocked", 0),
+            "pages_failed": stats.get("pages_failed", 0),
+            "pages_empty": stats.get("pages_empty", 0),
+            "dealers_total": stats.get("dealers_total", 0),
+            "dealers_ok": stats.get("dealers_ok", 0),
+            "dealers_partial": stats.get("dealers_partial", 0),
+            "dealers_blocked": stats.get("dealers_blocked", 0),
+            "dealers_failed": stats.get("dealers_failed", 0),
         }
 
         violations_formatted: List[Dict[str, Any]] = []
@@ -777,10 +785,14 @@ async def _process_one_dealer(
         local_buffer = MatchBuffer()
         local_processed = ProcessedImageBuffer()
         local_total_discovered = 0
-        local_pages_scanned = 0
+        local_pages_scanned = 0       # pages that returned >=1 real image
+        local_pages_empty = 0         # pages that loaded but had no images
+        local_pages_blocked = 0       # WAF / 4xx / ERR_ABORTED
+        local_pages_failed = 0        # timeouts / playwright crashes
         local_total_images = 0
         local_pages_skipped = 0
         local_page_match_tracker: Dict[str, set] = {}
+        local_block_details: List[Dict[str, Any]] = []
         local_pipeline: Dict[str, Any] = {
             "download_failed": 0,
             "hash_rejected": 0,
@@ -809,7 +821,7 @@ async def _process_one_dealer(
                 _heartbeat(scan_job_id)
 
                 try:
-                    count, evidence_url = await extraction_service.extract_dealer_website(
+                    res = await extraction_service.extract_dealer_website(
                         page_url, scan_job_id, distributor_id,
                         campaign_assets=campaign_assets,
                     )
@@ -819,30 +831,94 @@ async def _process_one_dealer(
                         base_url, page_url, page_err, exc_info=True,
                     )
                     local_pipeline["errors"] += 1
+                    local_pages_failed += 1
+                    local_block_details.append({
+                        "page_url": page_url,
+                        "outcome": extraction_service.OUTCOME_CRASHED,
+                        "reason": str(page_err)[:200],
+                    })
                     continue
 
-                if count == 0 and settings.enable_tiling_fallback and evidence_url:
-                    log.info(
-                        "[%s] zero images from %s — inserting screenshot fallback",
-                        base_url, page_url,
-                    )
-                    _safe_insert_discovered_image({
-                        "scan_job_id": str(scan_job_id),
-                        "distributor_id": str(distributor_id) if distributor_id else None,
-                        "source_url": page_url,
-                        "image_url": evidence_url,
-                        "source_type": "page_screenshot",
-                        "channel": "website",
-                        "metadata": {
-                            "capture_method": "playwright_fallback",
-                            "full_page": True,
-                            "reason": "no_images_extracted",
-                        },
-                    })
-                    count = 1
+                count = res.count
+                evidence_url = res.evidence_url
+                outcome = res.outcome
 
-                local_total_discovered += count
-                local_pages_scanned += 1
+                # Bin the page outcome. The inserted screenshot row is now
+                # optional and never bumps `pages_scanned` — it exists only
+                # so the user can see *what* was on the page (a WAF
+                # challenge, a 404, an empty SPA shell, etc.).
+                if outcome == extraction_service.OUTCOME_IMAGES:
+                    local_total_discovered += count
+                    local_pages_scanned += 1
+                elif outcome == extraction_service.OUTCOME_EMPTY:
+                    local_pages_empty += 1
+                    if (
+                        settings.enable_tiling_fallback
+                        and evidence_url
+                    ):
+                        log.info(
+                            "[%s] zero images from %s — inserting screenshot for tiling fallback",
+                            base_url, page_url,
+                        )
+                        _safe_insert_discovered_image({
+                            "scan_job_id": str(scan_job_id),
+                            "distributor_id": str(distributor_id) if distributor_id else None,
+                            "source_url": page_url,
+                            "image_url": evidence_url,
+                            "source_type": "page_screenshot",
+                            "channel": "website",
+                            "metadata": {
+                                "capture_method": "playwright_fallback",
+                                "full_page": True,
+                                "reason": "no_images_extracted",
+                            },
+                        })
+                        # Tiling fallback can produce a usable creative, so
+                        # treat as a real (low-confidence) scanned page.
+                        count = 1
+                        local_total_discovered += 1
+                        local_pages_scanned += 1
+                elif outcome == extraction_service.OUTCOME_BLOCKED:
+                    local_pages_blocked += 1
+                    local_block_details.append({
+                        "page_url": page_url,
+                        "outcome": outcome,
+                        "reason": res.block_reason,
+                        "http_status": res.http_status,
+                    })
+                    if evidence_url:
+                        # Surface the WAF/error page itself so the user can
+                        # see *why* we couldn't scan, but mark it clearly
+                        # as evidence of a block — not as a scanned page.
+                        _safe_insert_discovered_image({
+                            "scan_job_id": str(scan_job_id),
+                            "distributor_id": str(distributor_id) if distributor_id else None,
+                            "source_url": page_url,
+                            "image_url": evidence_url,
+                            "source_type": "page_screenshot",
+                            "channel": "website",
+                            "metadata": {
+                                "capture_method": "blocked_evidence",
+                                "full_page": True,
+                                "reason": res.block_reason or "blocked",
+                                "http_status": res.http_status,
+                            },
+                        })
+                    log.warning(
+                        "[%s] page %s blocked (%s, http=%s)",
+                        base_url, page_url, res.block_reason, res.http_status,
+                    )
+                else:
+                    local_pages_failed += 1
+                    local_block_details.append({
+                        "page_url": page_url,
+                        "outcome": outcome,
+                        "reason": res.block_reason,
+                    })
+                    log.warning(
+                        "[%s] page %s failed (%s, %s)",
+                        base_url, page_url, outcome, res.block_reason,
+                    )
 
                 if can_early_stop and count > 0:
                     page_images = supabase.table("discovered_images")\
@@ -894,13 +970,32 @@ async def _process_one_dealer(
             if marked:
                 log.debug("[%s] processed buffer flushed: %d marked", base_url, marked)
 
+        # Per-dealer status used by the aggregator and email summary.
+        if local_pages_scanned == 0 and local_pages_blocked > 0:
+            dealer_status = "blocked"
+        elif local_pages_scanned == 0 and local_pages_failed > 0:
+            dealer_status = "failed"
+        elif local_pages_scanned == 0:
+            dealer_status = "empty"
+        elif local_pages_blocked > 0 or local_pages_failed > 0:
+            dealer_status = "partial"
+        else:
+            dealer_status = "ok"
+
         return {
             "total_discovered": local_total_discovered,
             "pages_scanned": local_pages_scanned,
+            "pages_empty": local_pages_empty,
+            "pages_blocked": local_pages_blocked,
+            "pages_failed": local_pages_failed,
             "total_images": local_total_images,
             "pages_skipped": local_pages_skipped,
             "pipeline_increments": local_pipeline,
             "page_match_tracker": local_page_match_tracker,
+            "block_details": local_block_details,
+            "dealer_status": dealer_status,
+            "base_url": base_url,
+            "distributor_id": str(distributor_id) if distributor_id else None,
         }
 
 
@@ -1016,11 +1111,18 @@ async def run_website_scan(
 
                 distributor_id = extraction_service._match_distributor_by_domain(
                     page_url, distributor_mapping)
-                count, evidence_url = await extraction_service.extract_dealer_website(
+                res = await extraction_service.extract_dealer_website(
                     page_url, scan_job_id, distributor_id,
                     campaign_assets=campaign_assets,
                 )
-                if count == 0 and _settings.enable_tiling_fallback and evidence_url:
+                count = res.count
+                evidence_url = res.evidence_url
+                if (
+                    count == 0
+                    and _settings.enable_tiling_fallback
+                    and evidence_url
+                    and res.outcome == extraction_service.OUTCOME_EMPTY
+                ):
                     _safe_insert_discovered_image({
                         "scan_job_id": str(scan_job_id),
                         "distributor_id": str(distributor_id) if distributor_id else None,
@@ -1031,6 +1133,21 @@ async def run_website_scan(
                         "metadata": {"capture_method": "playwright_fallback", "full_page": True},
                     })
                     count = 1
+                elif res.outcome == extraction_service.OUTCOME_BLOCKED and evidence_url:
+                    _safe_insert_discovered_image({
+                        "scan_job_id": str(scan_job_id),
+                        "distributor_id": str(distributor_id) if distributor_id else None,
+                        "source_url": page_url,
+                        "image_url": evidence_url,
+                        "source_type": "page_screenshot",
+                        "channel": "website",
+                        "metadata": {
+                            "capture_method": "blocked_evidence",
+                            "full_page": True,
+                            "reason": res.block_reason or "blocked",
+                            "http_status": res.http_status,
+                        },
+                    })
 
                 total_discovered += count
 
@@ -1120,7 +1237,17 @@ async def run_website_scan(
             "errors": 0,
             "pages_discovered": total_pages,
             "pages_scanned": len(cached_pages) if cache_early_stopped else 0,
+            "pages_empty": 0,
+            "pages_blocked": 0,
+            "pages_failed": 0,
             "pages_skipped": 0,
+            "dealers_total": 0,
+            "dealers_ok": 0,
+            "dealers_partial": 0,
+            "dealers_blocked": 0,
+            "dealers_failed": 0,
+            "dealers_empty": 0,
+            "blocked_details": [],   # [{base_url, distributor_id, pages: [{page_url, reason, http_status}]}]
             "early_stopped": cache_early_stopped,
             "cache_hit": cache_early_stopped,
             "cached_pages_used": len(cached_pages),
@@ -1166,15 +1293,33 @@ async def run_website_scan(
                 if isinstance(result, BaseException):
                     log.error("Per-dealer task crashed: %s", result, exc_info=result)
                     pipeline_stats["errors"] += 1
+                    pipeline_stats["dealers_failed"] += 1
+                    pipeline_stats["dealers_total"] += 1
                     continue
                 total_discovered += result["total_discovered"]
                 pipeline_stats["pages_scanned"] += result["pages_scanned"]
+                pipeline_stats["pages_empty"] += result.get("pages_empty", 0)
+                pipeline_stats["pages_blocked"] += result.get("pages_blocked", 0)
+                pipeline_stats["pages_failed"] += result.get("pages_failed", 0)
                 pipeline_stats["total_images"] += result["total_images"]
                 pipeline_stats["pages_skipped"] += result["pages_skipped"]
                 for k, v in result["pipeline_increments"].items():
                     pipeline_stats[k] = pipeline_stats.get(k, 0) + v
                 for page_url, asset_ids in result["page_match_tracker"].items():
                     page_match_tracker.setdefault(page_url, set()).update(asset_ids)
+
+                pipeline_stats["dealers_total"] += 1
+                status = result.get("dealer_status", "ok")
+                key = f"dealers_{status}"
+                pipeline_stats[key] = pipeline_stats.get(key, 0) + 1
+                block_pages = result.get("block_details") or []
+                if block_pages:
+                    pipeline_stats["blocked_details"].append({
+                        "base_url": result.get("base_url"),
+                        "distributor_id": result.get("distributor_id"),
+                        "dealer_status": status,
+                        "pages": block_pages,
+                    })
 
             if early_stop_event.is_set():
                 early_stopped = True

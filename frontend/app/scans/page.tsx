@@ -59,7 +59,27 @@ interface PipelineStats {
   image_cache?: { hits: number; misses: number; hit_rate: number; cached_entries: number; cached_mb: number };
   pages_discovered?: number;
   pages_scanned?: number;
+  pages_empty?: number;
+  pages_blocked?: number;
+  pages_failed?: number;
   pages_skipped?: number;
+  dealers_total?: number;
+  dealers_ok?: number;
+  dealers_partial?: number;
+  dealers_blocked?: number;
+  dealers_failed?: number;
+  dealers_empty?: number;
+  blocked_details?: Array<{
+    base_url?: string;
+    distributor_id?: string | null;
+    dealer_status?: string;
+    pages: Array<{
+      page_url: string;
+      outcome: string;
+      reason?: string | null;
+      http_status?: number | null;
+    }>;
+  }>;
   early_stopped?: boolean;
   cache_hit?: boolean;
   cached_pages_used?: number;
@@ -330,6 +350,18 @@ function PipelineFunnel({ stats }: { stats: PipelineStats }) {
             <span>
               Pages: {stats.pages_scanned}/{stats.pages_discovered} scanned
               {(stats.cached_pages_used ?? 0) > 0 && ` (${stats.cached_pages_used} from cache)`}
+            </span>
+          )}
+          {((stats.pages_blocked ?? 0) > 0 || (stats.pages_failed ?? 0) > 0) && (
+            <span className="text-amber-400">
+              {(stats.pages_blocked ?? 0) > 0 && `${stats.pages_blocked} blocked`}
+              {(stats.pages_blocked ?? 0) > 0 && (stats.pages_failed ?? 0) > 0 && ", "}
+              {(stats.pages_failed ?? 0) > 0 && `${stats.pages_failed} failed`}
+            </span>
+          )}
+          {(stats.dealers_blocked ?? 0) > 0 && (
+            <span className="text-amber-400">
+              {stats.dealers_blocked} dealer{stats.dealers_blocked === 1 ? "" : "s"} blocked
             </span>
           )}
         </div>
