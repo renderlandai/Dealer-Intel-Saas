@@ -804,19 +804,6 @@ async def _extract_from_viewport(
     return result
 
 
-# Hosts where headless-Chromium-as-desktop is reliably blocked but the
-# mobile variant works. Try mobile first to avoid burning ~30s on a
-# guaranteed timeout. Configurable via the WEBSITE_MOBILE_FIRST_HOSTS env
-# var (comma-separated list of hostnames) — defaults below.
-import os as _os
-_MOBILE_FIRST_DEFAULT = "rent.cat.com"
-MOBILE_FIRST_HOSTS = {
-    h.strip().lower()
-    for h in _os.getenv("WEBSITE_MOBILE_FIRST_HOSTS", _MOBILE_FIRST_DEFAULT).split(",")
-    if h.strip()
-}
-
-
 def _host_of(url: str) -> str:
     try:
         return (urlparse(url).hostname or "").lower()
@@ -832,71 +819,53 @@ async def extract_dealer_website(
 ) -> ExtractionResult:
     """Load a dealer page, extract images, and return a structured outcome.
 
-    Strategy:
-      1. Decide initial viewport: mobile-first for known anti-bot hosts,
-         desktop everywhere else.
-      2. If the first viewport returns OUTCOME_BLOCKED or OUTCOME_TIMEOUT,
-         try the other viewport once.
-      3. If still blocked and ``settings.screenshotone_fallback_enabled``
-         is on, use the ScreenshotOne hosted renderer to capture the
-         page so the user at least has visual evidence.
+    Delegates to :mod:`render_strategies` and :mod:`host_policy_service`
+    so the choice of renderer (Playwright desktop, mobile-first,
+    ScreenshotOne, ScreenshotOne+residential) is per-host learned data,
+    not a hand-curated env var. First scan of a brand-new host pays for
+    a 5s preflight probe + the full ladder; every scan after that goes
+    straight to whatever already worked.
+
+    The returned :class:`ExtractionResult` carries an optional
+    ``ladder_attempts`` list on its ``block_reason`` when more than one
+    rung was tried — the runner aggregates these into ``pipeline_stats``
+    so the operator can see the escalation path.
     """
     log.info("Dealer website: %s", url)
-    seen_srcs: set = set()
-    host = _host_of(url)
 
-    primary_mobile = host in MOBILE_FIRST_HOSTS
-    primary = await _extract_from_viewport(
-        url, scan_job_id, distributor_id,
-        mobile=primary_mobile, seen_srcs=seen_srcs,
+    # Late imports to avoid a circular at module load (render_strategies
+    # imports back into this file via late-import-inside-method).
+    from . import host_policy_service, render_strategies
+
+    try:
+        strategy = await host_policy_service.ensure_policy(url)
+    except Exception as e:
+        # Never block a scan on a policy-table outage.
+        log.warning("Host policy lookup failed for %s: %s", url, e)
+        strategy = render_strategies.STRATEGY_PLAYWRIGHT_DESKTOP
+
+    ctx = render_strategies.RenderContext(
+        url=url,
+        scan_job_id=scan_job_id,
+        distributor_id=distributor_id,
         campaign_assets=campaign_assets,
     )
+    ladder = await render_strategies.run_ladder(ctx, strategy=strategy)
+    final = ladder.final
 
-    final = primary
-
-    # Switch viewport on block/timeout — desktop-blocked SPAs sometimes
-    # render server-side for mobile UAs, and vice versa for old-school
-    # sites that refuse mobile.
-    if primary.outcome in (OUTCOME_BLOCKED, OUTCOME_TIMEOUT) and primary.count == 0:
-        secondary = await _extract_from_viewport(
-            url, scan_job_id, distributor_id,
-            mobile=not primary_mobile, seen_srcs=seen_srcs,
-            campaign_assets=campaign_assets,
+    # Stamp the attempt trail onto the block_reason so it lands in the
+    # runner's per-page ``block_details`` row. Cheap to read in the
+    # operator UI, and harmless when only one rung was tried.
+    if len(ladder.attempts) > 1 and final.block_reason is None:
+        trail = " -> ".join(
+            f"{a.attempt}={a.outcome}" for a in ladder.attempts
         )
-        # Prefer a successful secondary; otherwise keep the primary's
-        # evidence (if any) but adopt the secondary outcome if it's
-        # more informative.
-        if secondary.outcome == OUTCOME_IMAGES:
-            final = secondary
-        elif secondary.evidence_url and not primary.evidence_url:
-            final = secondary
-        elif secondary.outcome == OUTCOME_BLOCKED and primary.outcome != OUTCOME_BLOCKED:
-            final = secondary
-
-    # ScreenshotOne fallback for definitively-blocked pages.
-    if (
-        final.outcome == OUTCOME_BLOCKED
-        and final.count == 0
-        and getattr(settings, "screenshotone_fallback_enabled", False)
-    ):
-        try:
-            shot_url = await _screenshotone_fallback(url, scan_job_id)
-        except Exception as e:
-            log.warning("ScreenshotOne fallback failed for %s: %s", url, e)
-            shot_url = None
-        if shot_url:
-            log.info("ScreenshotOne fallback captured %s", url)
-            final = ExtractionResult(
-                count=0,
-                evidence_url=shot_url,
-                outcome=OUTCOME_BLOCKED,
-                block_reason=final.block_reason or "blocked_screenshotone_only",
-                http_status=final.http_status,
-            )
+        final.block_reason = f"ladder({strategy}): {trail}"
 
     log.info(
-        "Dealer page %s — outcome=%s count=%d reason=%s",
-        url, final.outcome, final.count, final.block_reason,
+        "Dealer page %s — strategy=%s succeeded=%s outcome=%s count=%d",
+        url, strategy, ladder.succeeded_attempt or "<none>",
+        final.outcome, final.count,
     )
     return final
 

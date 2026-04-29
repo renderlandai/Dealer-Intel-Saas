@@ -196,6 +196,42 @@ CREATE TABLE alerts (
 CREATE INDEX idx_alerts_org ON alerts(organization_id);
 CREATE INDEX idx_alerts_unread ON alerts(is_read) WHERE is_read = FALSE;
 
+-- Adaptive scan-strategy policy per hostname (mirror of migration 030).
+-- See `services/host_policy_service.py` and
+-- `services/render_strategies.py` for the auto-promotion ladder.
+CREATE TABLE IF NOT EXISTS host_scan_policy (
+    hostname            TEXT PRIMARY KEY,
+    strategy            TEXT NOT NULL DEFAULT 'playwright_desktop',
+    waf_vendor          TEXT,
+    confidence          INTEGER NOT NULL DEFAULT 0,
+    last_outcome        TEXT,
+    last_block_reason   TEXT,
+    last_http_status    INTEGER,
+    success_count_30d   INTEGER NOT NULL DEFAULT 0,
+    blocked_count_30d   INTEGER NOT NULL DEFAULT 0,
+    timeout_count_30d   INTEGER NOT NULL DEFAULT 0,
+    last_seen_at        TIMESTAMPTZ,
+    last_promoted_at    TIMESTAMPTZ,
+    manual_override     BOOLEAN NOT NULL DEFAULT FALSE,
+    notes               TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT host_scan_policy_strategy_check CHECK (
+        strategy IN (
+            'playwright_desktop',
+            'playwright_mobile_first',
+            'playwright_then_screenshotone',
+            'screenshotone_only',
+            'screenshotone_residential',
+            'unreachable'
+        )
+    )
+);
+CREATE INDEX IF NOT EXISTS idx_host_scan_policy_last_seen
+    ON host_scan_policy(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_host_scan_policy_strategy
+    ON host_scan_policy(strategy);
+
 -- ============================================
 -- VIEWS FOR DASHBOARD
 -- ============================================

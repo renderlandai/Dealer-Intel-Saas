@@ -1289,6 +1289,12 @@ async def run_website_scan(
 
             dealer_results = await asyncio.gather(*dealer_tasks, return_exceptions=True)
 
+            # success_pages_by_host feeds host_policy_service after the loop
+            # so a host that scanned cleanly resets its failure-confidence
+            # counter even though it appears in zero `blocked_details` rows.
+            from urllib.parse import urlparse as _urlparse
+            success_pages_by_host: Dict[str, int] = {}
+
             for result in dealer_results:
                 if isinstance(result, BaseException):
                     log.error("Per-dealer task crashed: %s", result, exc_info=result)
@@ -1320,6 +1326,48 @@ async def run_website_scan(
                         "dealer_status": status,
                         "pages": block_pages,
                     })
+
+                # Tally per-host successful pages so host_policy_service can
+                # reset confidence on hosts that worked this scan even when
+                # they have no entries in blocked_details.
+                base_url = result.get("base_url") or ""
+                if base_url and result["pages_scanned"] > 0:
+                    try:
+                        host = (_urlparse(base_url).hostname or "").lower()
+                    except Exception:
+                        host = ""
+                    if host:
+                        success_pages_by_host[host] = (
+                            success_pages_by_host.get(host, 0)
+                            + int(result["pages_scanned"])
+                        )
+
+            # Phase 6: feed observed outcomes back into host_scan_policy so
+            # the next scan of these hosts skips doomed ladder rungs.
+            try:
+                from . import host_policy_service
+                host_aggs = host_policy_service.aggregate_from_pipeline_stats(
+                    pipeline_stats,
+                )
+                host_policy_service.merge_host_successes(
+                    host_aggs, success_pages_by_host,
+                )
+                promotions = host_policy_service.record_host_outcomes(host_aggs)
+                if promotions:
+                    pipeline_stats["host_promotions"] = [
+                        {"hostname": h, "from": old, "to": new}
+                        for (h, old, new) in promotions
+                    ]
+                    log.info(
+                        "host_scan_policy: %d host(s) auto-promoted: %s",
+                        len(promotions),
+                        ", ".join(f"{h} ({old}->{new})" for h, old, new in promotions),
+                    )
+            except Exception as policy_err:
+                # Never fail a scan because the learning layer hiccupped.
+                log.warning(
+                    "host_policy_service aggregation failed: %s", policy_err,
+                )
 
             if early_stop_event.is_set():
                 early_stopped = True
