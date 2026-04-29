@@ -904,6 +904,14 @@ async def _process_one_dealer(
                                 "http_status": res.http_status,
                             },
                         })
+                        # Bump count + total_discovered (but NOT pages_scanned —
+                        # the funnel chip should still distinguish "real
+                        # extraction" from "screenshot fallback") so the
+                        # analyzer block below picks up the SS1 PNG and runs
+                        # it through CLIP/Haiku/asset-detection. Without this
+                        # the screenshot was dead weight in storage.
+                        count = 1
+                        local_total_discovered += 1
                     log.warning(
                         "[%s] page %s blocked (%s, http=%s)",
                         base_url, page_url, res.block_reason, res.http_status,
@@ -1148,6 +1156,10 @@ async def run_website_scan(
                             "http_status": res.http_status,
                         },
                     })
+                    # Match the live-scan path: bump count so the analyzer
+                    # block below queries this page's screenshot and runs it
+                    # through the matcher.
+                    count = 1
 
                 total_discovered += count
 

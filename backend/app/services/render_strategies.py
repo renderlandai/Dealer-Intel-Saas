@@ -151,6 +151,9 @@ class _PlaywrightAttempt:
     name: str
     mobile: bool
     cost_per_render_usd: float = 0.0
+    # When False the ladder must keep trying — Playwright can return
+    # OUTCOME_BLOCKED with no evidence and the next rung might recover.
+    is_screenshot_capture: bool = False
 
     def __init__(self, mobile: bool, name: str):
         self.mobile = mobile
@@ -172,6 +175,10 @@ class _ScreenshotOneAttempt:
     name: str
     cost_per_render_usd: float
     use_residential_proxy: bool
+    # True so ``run_ladder`` stops as soon as this rung produces an
+    # evidence_url. Trying a second SS1 rung on a host that already
+    # rendered cleanly via SS1 just burns money for no new info.
+    is_screenshot_capture: bool = True
 
     def __init__(self, *, residential: bool, name: str, cost: float):
         self.use_residential_proxy = residential
@@ -188,7 +195,10 @@ class _ScreenshotOneAttempt:
             # Adds ~$0.006/render on top of the base $0.004 charge. Empirically
             # the only thing that defeats Akamai's IP-reputation block from
             # a datacenter source.
-            overrides["proxy"] = "residential"
+            #
+            # Param name is `proxy_type` per ScreenshotOne docs — we previously
+            # sent `proxy=residential` and the API returned 400 on every call.
+            overrides["proxy_type"] = "residential"
             overrides["delay"] = 8     # let any challenge-page JS clear
 
         try:
@@ -357,6 +367,25 @@ async def run_ladder(
                 final=res,
                 attempts=log_attempts,
                 succeeded_attempt=attempt.name,
+            )
+
+        # Once a ScreenshotOne rung produces an evidence_url, stop. The next
+        # rung is also a ScreenshotOne (datacenter -> residential) and would
+        # only add cost without changing what we know about the page. If
+        # downstream OCR/match wants more data it can request a re-scan with
+        # a higher-tier strategy explicitly.
+        if (
+            getattr(attempt, "is_screenshot_capture", False)
+            and res.evidence_url is not None
+        ):
+            log.info(
+                "Ladder strategy=%s short-circuit after %s captured evidence",
+                strategy, attempt.name,
+            )
+            return LadderResult(
+                final=res,
+                attempts=log_attempts,
+                succeeded_attempt=None,
             )
 
     return LadderResult(

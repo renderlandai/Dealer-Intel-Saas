@@ -104,7 +104,10 @@ class TestRunLadder:
         # Desktop won — mobile and ScreenshotOne should never run.
         assert calls == ["playwright_desktop"]
 
-    def test_falls_through_to_screenshotone_residential_on_full_block(self):
+    def test_short_circuits_on_first_screenshotone_capture(self):
+        """After Playwright fails on a Cat-style WAF, the datacenter SS1
+        call captures evidence — the ladder MUST NOT then waste an extra
+        residential call (which is what was burning $$ before)."""
         from app.services import render_strategies as rs
 
         calls = []
@@ -130,17 +133,48 @@ class TestRunLadder:
         ):
             res = _run(rs.run_ladder(_ctx(), strategy=rs.STRATEGY_PLAYWRIGHT_DESKTOP))
 
-        # Full ladder: desktop, mobile, SS1 datacenter, SS1 residential.
         assert calls == ["playwright_desktop", "playwright_mobile"]
-        assert len(seen_overrides) == 2
-        # First SS1 call is datacenter — no proxy override.
-        assert "proxy" not in seen_overrides[0]
-        # Second SS1 call is residential — proxy=residential.
-        assert seen_overrides[1].get("proxy") == "residential"
-        # Final result has the latest screenshot URL.
-        assert res.succeeded_attempt is None
-        assert res.final.evidence_url == "https://storage/2.png"
+        # ONLY the datacenter SS1 call ran — residential short-circuited.
+        assert len(seen_overrides) == 1
+        assert "proxy_type" not in seen_overrides[0]
+        # Final result carries the captured screenshot.
+        assert res.final.evidence_url == "https://storage/1.png"
         assert res.final.outcome == "blocked"
+        # No tier produced OUTCOME_IMAGES so succeeded_attempt is None.
+        assert res.succeeded_attempt is None
+
+    def test_residential_uses_proxy_type_param_when_datacenter_fails(self):
+        """If the datacenter SS1 returns no evidence, we must escalate to
+        residential using the correct ScreenshotOne param name (proxy_type,
+        not proxy — the latter caused 400s on every call)."""
+        from app.services import render_strategies as rs
+
+        seen_overrides = []
+        call_count = [0]
+
+        async def fake_viewport(**kwargs):
+            return _result("blocked")
+
+        async def fake_capture_and_upload(target_url, scan_job_id, **overrides):
+            seen_overrides.append(overrides)
+            call_count[0] += 1
+            # Datacenter (1st call) fails — no URL. Residential (2nd call) wins.
+            return None if call_count[0] == 1 else "https://storage/res.png"
+
+        with patch(
+            "app.services.extraction_service._extract_from_viewport",
+            side_effect=fake_viewport,
+        ), patch(
+            "app.services.screenshot_service.capture_and_upload",
+            side_effect=fake_capture_and_upload,
+        ):
+            res = _run(rs.run_ladder(_ctx(), strategy=rs.STRATEGY_SCREENSHOTONE_ONLY))
+
+        assert len(seen_overrides) == 2
+        assert "proxy_type" not in seen_overrides[0]            # datacenter
+        assert seen_overrides[1].get("proxy_type") == "residential"
+        assert seen_overrides[1].get("delay") == 8
+        assert res.final.evidence_url == "https://storage/res.png"
 
     def test_screenshotone_only_strategy_skips_playwright(self):
         from app.services import render_strategies as rs
@@ -167,9 +201,9 @@ class TestRunLadder:
             ))
 
         assert playwright_called is False
-        assert [a.attempt for a in res.attempts] == [
-            "screenshotone_datacenter", "screenshotone_residential",
-        ]
+        # Datacenter SS1 succeeded — short-circuit kicks in, residential skipped.
+        assert [a.attempt for a in res.attempts] == ["screenshotone_datacenter"]
+        assert res.final.evidence_url == "https://storage/x.png"
 
     def test_mobile_first_strategy_orders_attempts_correctly(self):
         from app.services import render_strategies as rs
