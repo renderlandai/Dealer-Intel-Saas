@@ -533,6 +533,92 @@ async def _localize_and_crop_assets(
     return cropped
 
 
+async def localize_screenshot_capture(
+    evidence_url: str,
+    scan_job_id: UUID,
+    page_url: str,
+    distributor_id: Optional[UUID],
+    campaign_assets: Optional[List[Dict[str, Any]]],
+) -> int:
+    """Run CV localization on a captured full-page screenshot and insert
+    each cropped creative as its own ``discovered_images`` row.
+
+    Used when a page was captured via the ScreenshotOne fallback (Playwright
+    couldn't reach it). The matcher is then comparing real banner-sized
+    crops against the campaign assets instead of comparing a 1920x3000
+    full-page screenshot against a 320x50 banner — which previously
+    produced "STRONG MATCH (modified)" verdicts on hosts like
+    ``rent.cat.com`` because the page literally contained the campaign
+    artwork at hero size. See log.md 2026-04-29 for the diagnostic.
+
+    Returns the number of crops inserted. Zero is a valid result (no
+    campaign creatives detected on the page) and is not an error.
+
+    Best-effort: a download failure or a localization failure logs at
+    WARNING and returns 0. The full-page evidence row is unaffected.
+    """
+    if not campaign_assets:
+        return 0
+    if not evidence_url:
+        return 0
+
+    try:
+        screenshot_bytes = await ai_service.download_image(evidence_url)
+    except Exception as e:
+        log.warning(
+            "Could not fetch SS1 capture %s for CV localization: %s",
+            evidence_url[:80], e,
+        )
+        return 0
+
+    try:
+        crops = await _localize_and_crop_assets(
+            screenshot_bytes, scan_job_id, campaign_assets,
+        )
+    except Exception as e:
+        log.warning(
+            "CV localization failed for %s: %s", evidence_url[:80], e,
+        )
+        return 0
+
+    if not crops:
+        return 0
+
+    inserted = 0
+    for crop in crops:
+        try:
+            _safe_insert_discovered_image({
+                "scan_job_id": str(scan_job_id),
+                "distributor_id": str(distributor_id) if distributor_id else None,
+                "source_url": page_url,
+                "image_url": crop["src"],
+                "source_type": "extracted_image",
+                "channel": "website",
+                "metadata": {
+                    "extraction_method": "cv_localized_from_screenshot",
+                    "viewport": "screenshotone_full_page",
+                    "element_tag": crop.get("tag", "cv-localized-crop"),
+                    "original_width": crop.get("width"),
+                    "original_height": crop.get("height"),
+                    "position": {
+                        "x": crop.get("x", 0),
+                        "y": crop.get("y", 0),
+                    },
+                    "css_classes": crop.get("classes", ""),
+                    "evidence_screenshot_url": evidence_url,
+                },
+            })
+            inserted += 1
+        except Exception as e:
+            log.warning("Failed to insert CV crop row: %s", e)
+
+    log.info(
+        "CV localization inserted %d crop(s) from SS1 capture of %s",
+        inserted, page_url,
+    )
+    return inserted
+
+
 def _classify_location(y: int, page_height: int) -> str:
     """Classify an image's position on the page."""
     ratio = y / max(page_height, 1)

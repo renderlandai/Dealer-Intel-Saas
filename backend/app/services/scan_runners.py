@@ -890,6 +890,10 @@ async def _process_one_dealer(
                         # Surface the WAF/error page itself so the user can
                         # see *why* we couldn't scan, but mark it clearly
                         # as evidence of a block — not as a scanned page.
+                        # The "blocked_evidence" capture_method is a sentinel
+                        # the analyzer below uses to skip this row (we don't
+                        # want a 320x50 banner matched against a 1920x3000
+                        # full-page screenshot).
                         _safe_insert_discovered_image({
                             "scan_job_id": str(scan_job_id),
                             "distributor_id": str(distributor_id) if distributor_id else None,
@@ -904,17 +908,26 @@ async def _process_one_dealer(
                                 "http_status": res.http_status,
                             },
                         })
-                        # Bump count + total_discovered (but NOT pages_scanned —
-                        # the funnel chip should still distinguish "real
-                        # extraction" from "screenshot fallback") so the
-                        # analyzer block below picks up the SS1 PNG and runs
-                        # it through CLIP/Haiku/asset-detection. Without this
-                        # the screenshot was dead weight in storage.
-                        count = 1
-                        local_total_discovered += 1
+                        # Layer 1: run CV localization on the SS1 capture so
+                        # the matcher only sees real banner-sized crops, not
+                        # the entire hero section. Each crop becomes its own
+                        # ``extracted_image`` row that the analyzer below
+                        # will pick up.
+                        crops_added = await extraction_service.localize_screenshot_capture(
+                            evidence_url=evidence_url,
+                            scan_job_id=scan_job_id,
+                            page_url=page_url,
+                            distributor_id=distributor_id,
+                            campaign_assets=campaign_assets,
+                        )
+                        if crops_added > 0:
+                            count = crops_added
+                            local_total_discovered += crops_added
                     log.warning(
-                        "[%s] page %s blocked (%s, http=%s)",
-                        base_url, page_url, res.block_reason, res.http_status,
+                        "[%s] page %s blocked (%s, http=%s) — %d cv-crop(s) inserted",
+                        base_url, page_url, res.block_reason,
+                        res.http_status,
+                        count if evidence_url else 0,
                     )
                 else:
                     local_pages_failed += 1
@@ -937,6 +950,14 @@ async def _process_one_dealer(
                         .execute()
 
                     for image in (page_images.data or []):
+                        # Layer 2: never run the matcher against the raw
+                        # full-page screenshot we kept for evidence — the
+                        # localized crops above are the matchable artifacts.
+                        # Letting the full page through produced false
+                        # "modified" verdicts on big hero shots.
+                        meta = image.get("metadata") or {}
+                        if meta.get("capture_method") == "blocked_evidence":
+                            continue
                         local_total_images += 1
                         asset_id = await _analyze_single_image(
                             image, campaign_assets, brand_rules,
@@ -1156,10 +1177,17 @@ async def run_website_scan(
                             "http_status": res.http_status,
                         },
                     })
-                    # Match the live-scan path: bump count so the analyzer
-                    # block below queries this page's screenshot and runs it
-                    # through the matcher.
-                    count = 1
+                    # Layer 1 (cache phase): same CV localization as the
+                    # live-scan path so cached blocked hosts also get
+                    # banner-sized crops instead of full-page evidence.
+                    crops_added = await extraction_service.localize_screenshot_capture(
+                        evidence_url=evidence_url,
+                        scan_job_id=scan_job_id,
+                        page_url=page_url,
+                        distributor_id=distributor_id,
+                        campaign_assets=campaign_assets,
+                    )
+                    count = crops_added
 
                 total_discovered += count
 
@@ -1172,6 +1200,12 @@ async def run_website_scan(
                         .execute()
 
                     for image in (page_images.data or []):
+                        # Layer 2 (cache phase): same exclusion as the
+                        # live-scan loop — full-page evidence stays as
+                        # evidence only, never as matcher input.
+                        meta = image.get("metadata") or {}
+                        if meta.get("capture_method") == "blocked_evidence":
+                            continue
                         asset_id = await _analyze_single_image(
                             image, campaign_assets, brand_rules,
                             org_id, str(scan_job_id),
@@ -1534,6 +1568,46 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             }).eq("id", str(scan_job_id)).execute()
             return
 
+        # Layer 2: split off "evidence only" rows (full-page SS1 captures
+        # of blocked pages) so the AI matcher never compares a 320x50
+        # banner against a 1920x3000 page screenshot. We mark them
+        # processed at the end so they don't accumulate as forever-pending.
+        evidence_only_ids: List[str] = []
+        matchable_images: List[Dict[str, Any]] = []
+        for img in images.data:
+            meta = img.get("metadata") or {}
+            if meta.get("capture_method") == "blocked_evidence":
+                evidence_only_ids.append(img["id"])
+            else:
+                matchable_images.append(img)
+        if evidence_only_ids:
+            log.info(
+                "Auto-analyse: skipping %d full-page evidence row(s); "
+                "%d matchable image(s) remain",
+                len(evidence_only_ids), len(matchable_images),
+            )
+        images.data = matchable_images
+
+        if not matchable_images:
+            # All discovered images were evidence-only — mark them
+            # processed so they don't pile up and exit cleanly.
+            log.info(
+                "No matchable images for scan %s (only evidence rows); "
+                "marking %d evidence row(s) processed and exiting",
+                scan_job_id, len(evidence_only_ids),
+            )
+            if evidence_only_ids:
+                try:
+                    bulk_mark_images_processed(evidence_only_ids)
+                except Exception as e:
+                    log.warning(
+                        "Could not mark evidence rows processed: %s", e,
+                    )
+            supabase.table("scan_jobs").update({
+                "processed_items": len(evidence_only_ids)
+            }).eq("id", str(scan_job_id)).execute()
+            return
+
         # Log discovered images
         log.debug("Discovered images to analyze:")
         for idx, img in enumerate(images.data):
@@ -1619,12 +1693,28 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             str(scan_job_id)  # Pass scan_job_id for matches_count update
         )
 
+        # Mark the full-page evidence rows as processed too — they're
+        # not matchable but we still don't want them coming back in
+        # subsequent unprocessed-image queries.
+        if evidence_only_ids:
+            try:
+                bulk_mark_images_processed(evidence_only_ids)
+            except Exception as e:
+                log.warning(
+                    "Could not mark evidence rows as processed: %s", e,
+                )
+
         # Update scan job with processed count
+        total_processed = len(images.data) + len(evidence_only_ids)
         supabase.table("scan_jobs").update({
-            "processed_items": len(images.data)
+            "processed_items": total_processed
         }).eq("id", str(scan_job_id)).execute()
 
-        log.info("Auto-analysis completed for scan %s — processed %d images", scan_job_id, len(images.data))
+        log.info(
+            "Auto-analysis completed for scan %s — processed %d image(s) (%d analysed, %d evidence)",
+            scan_job_id, total_processed,
+            len(images.data), len(evidence_only_ids),
+        )
 
     except Exception as e:
         log.error("Critical error in auto-analysis for scan %s: %s", scan_job_id, e, exc_info=True)

@@ -5356,3 +5356,221 @@ the full 50-dealer estimate from.
   `failed` to keep the JSONB column small. Probably a quarter's
   worth of work before it matters.
 
+---
+
+## 2026-04-28 (evening) — Per-campaign dealer picker, the missing worker, and the Akamai wall
+
+Continuation of the same day. Phase-5-minimal had just shipped; the
+client immediately tried to drive it. Three problems surfaced in
+sequence — a missing UX affordance, a deployment gap that the
+morning's `app.yaml` change did not actually apply, and the discovery
+that the dealers in question all live behind an Akamai WAF that
+Playwright-from-DigitalOcean cannot defeat.
+
+### What shipped
+
+**1. Per-campaign dealer selection (commit `f5ab71b`)**
+
+Until tonight, "Start scan" on a campaign meant "scan every active
+distributor in the org," which is not what a campaign manager wants
+when they're testing one creative against a regional sub-set.
+
+* **Backend (`backend/app/routers/campaigns.py`).** Both
+  `start_campaign_scan` and `batch_campaign_scan` now accept an
+  optional repeated `distributor_ids` query parameter. New helper
+  `_resolve_scan_distributors()` returns the explicit selection
+  when provided (validated against the org's distributors — bogus
+  IDs raise 400), else falls back to all active distributors.
+* **Frontend API client (`frontend/lib/api.ts`).**
+  `startCampaignBatchScan` now serialises an optional
+  `distributorIds: string[]` as repeated `distributor_ids=…` query
+  params; `startCampaignScan` already did.
+* **Frontend UI (`frontend/app/campaigns/[id]/page.tsx`).** The
+  Scans tab gained a "Dealers to scan" card with a search box,
+  per-dealer checkboxes, and Select-visible / Clear-all buttons.
+  Selection is persisted to `localStorage` keyed by campaign id so
+  it survives reloads. Each scan-source button surfaces "X
+  creatives · Y of Z dealers" and disables itself if there are no
+  matching creatives or no dealers selected. `selectedDealerIds`
+  is forwarded into both single-channel and batch scan calls
+  (empty array → undefined → backend uses all-active fallback).
+
+No DB migration; the `scan_jobs` row still records the resolved
+distributor set in its existing `metadata` field.
+
+**2. The missing `scan-worker` component on DigitalOcean**
+
+Symptom: every scan started after the morning deploy sat in
+`pending` indefinitely until `_cleanup_stale_scans` flipped it to
+`failed`. The morning's commit added `DISABLE_INPROCESS_DISPATCH=true`
+to the API service, so the API correctly handed off to the worker —
+but the worker did not exist. `.do/app.yaml` had a `workers:` block
+declaring `scan-worker`, but DO App Platform's `deploy_on_push` only
+rebuilds **existing** components; it does not create new ones from a
+spec change. The component had to be applied with an explicit
+`doctl apps update`.
+
+What we did:
+
+* Installed `doctl v1.155.0` (`darwin-arm64`) into `~/.local/bin`.
+* `doctl apps list` → app id `aaff4f43-8fc8-4424-be13-35a676818543`.
+* Discovered `doctl apps spec validate` rejects already-encrypted
+  secret values ("must not be encrypted before app is created") —
+  it treats every spec as a *create* spec. `doctl apps update`
+  handles encrypted secrets correctly, so we skipped validation
+  and applied the spec directly.
+* `doctl apps update <id> --spec /tmp/new-spec.yaml` succeeded;
+  both `api` and the new `scan-worker` reached RUNNING. Subsequent
+  scans transitioned `pending → running` within 2-3s of insert
+  (the polling cadence we set).
+
+The previously-stuck `pending` row had already aged past
+`_cleanup_stale_scans`'s 15-min pending horizon and was failed by
+the safety net before the worker came online — expected, not a
+bug. New scans behaved correctly.
+
+**3. Truthful metrics, survivable browser, anti-bot bypass (commit `81f5da1`)**
+
+The first real run after the worker came up was a 46-dealer scan.
+It "completed" in ~10 minutes and reported 52 pages scanned —
+clearly wrong, since 45 of the 46 dealers point at `rent.cat.com`
+and the runner cannot possibly have done a real scan of each in
+~10s. The logs showed three distinct failure modes: silent
+"screenshot fallback" rows being counted as scanned pages,
+`net::ERR_ABORTED` and timeout cascades, and
+`TargetClosedError: BrowserContext.new_page` errors that abandoned
+~10 dealers entirely. Root causes and fixes:
+
+| # | Failure mode                                             | Root cause                                                                                                                                           | Fix                                                                                                                                                                                                                                                |
+|---|-----------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| A | "52 pages scanned" was a lie                             | `enable_tiling_fallback` inserted a blank screenshot row for every page that returned 0 images and then the runner counted that as `pages_scanned += 1`. | Replaced `(count, evidence_url)` tuple return with an `ExtractionResult` dataclass carrying `outcome ∈ {images, empty, blocked, timeout, crashed}`, `block_reason`, `http_status`. Runner only bumps `pages_scanned` for `OUTCOME_IMAGES` (or the tiling fallback for genuinely-empty pages). |
+| B | One slow site killed every other in-flight dealer        | `_extract_from_viewport`'s retry path was *recycling the process-wide browser singleton* (`async with _browser_lock: close+stop+restart`). Concurrent dealer tasks holding the old browser handle then crashed with `Target page, context or browser has been closed`. | Removed the in-place global recycle. Retry now uses a fresh `BrowserContext` only; the shared browser is re-acquired (and only relaunched if `is_connected() == False`) via `_get_browser`. `_attempt_extraction` catches `TargetClosedError` on `new_page()` and re-acquires once before giving up. |
+| C | "Errors" with no actionable reason                       | `extract_dealer_website`'s `except` collapsed every Playwright exception into a single log line; the runner had no way to tell a WAF from a real bug. | New `_classify_playwright_error` maps Chromium net errors (`ERR_ABORTED`, `ERR_BLOCKED_BY_*`, `ERR_HTTP_RESPONSE_CODE_FAILURE`, cert errors) → `OUTCOME_BLOCKED`. HTTP 4xx/5xx navigation responses also flip to BLOCKED with the status code attached. Blocked pages still get a screenshot row but tagged `capture_method: "blocked_evidence"` with `reason` + `http_status` in metadata. |
+| D | Nothing in the codebase actually tries to *bypass* the WAF | Browser was launched with no anti-detect flags; every host got the same desktop UA; no fallback to a residential renderer.                        | Browser launches with `--disable-blink-features=AutomationControlled`. Every context gets a small init script overriding `navigator.webdriver`, `navigator.plugins`, `navigator.languages`, `chrome.runtime`. Hosts in `WEBSITE_MOBILE_FIRST_HOSTS` (env-configurable, default `rent.cat.com`) try mobile viewport first; on block/timeout the runner switches viewport once. New `screenshotone_fallback_enabled` setting (default on): when both viewports return BLOCKED, fall back to the existing ScreenshotOne integration so the user still gets a real screenshot from a non-DO IP. |
+
+Other plumbing the refactor touched:
+
+* `pipeline_stats` gained `pages_empty`, `pages_blocked`,
+  `pages_failed`, `dealers_total/ok/partial/blocked/failed/empty`
+  and `blocked_details[]` (per-dealer list of failed pages with
+  reason / http_status).
+* `_send_scan_notifications` summary dict gained the same counters
+  so the scan-complete email and Slack messages now report
+  truthfully.
+* `/scans` page (`frontend/app/scans/page.tsx`) gained an amber
+  "X blocked, Y failed · N dealers blocked" indicator under the
+  pages line and the matching `PipelineStats` type fields.
+* The legacy in-extraction-service `scan_dealer_websites._process_url`
+  was updated to the new return type so it does not break the
+  (currently-unused) screenshot-mode pipeline.
+* New `screenshotone_fallback_enabled` setting in `config.py`.
+
+Tests: `pytest -q` → 120 passed (no new tests this session;
+existing dispatch / bulk-writer / error-normalizer suites cover the
+runner-shape changes). `frontend/ npx tsc --noEmit` → clean.
+ReadLints across the touched files → clean.
+
+### Diagnostic — what tonight's run actually proved
+
+Second run after the deploy: 46 dealers, 60 pages discovered, run
+took ~10 min (same as before). The new counters tell the actual
+story:
+
+```
+pages_scanned:  15      (yanceybros only)
+pages_empty:     0
+pages_blocked:   9      reason: HTTP 403   ← Akamai sent a clean reject
+pages_failed:   36      reason: timeout    ← Akamai held the TCP connection open and never replied
+dealers_ok:      1
+dealers_blocked: 9
+dealers_failed: 36
+ScreenshotOne cost: $0.036  → exactly 9 renders fired, all on the HTTP-403 dealers
+```
+
+Akamai is doing two-mode protection: a clean 403 for some dealer
+sub-paths and a silent stall for others. The mobile-first switch
+and stealth init-script *did not help* because the block is at the
+**edge** — Chromium never gets a chance to run the JS that those
+overrides patch. Switching UA does not help either because the
+fingerprint that matters is the **DigitalOcean datacenter IP block**,
+which is on Akamai's denylist. ScreenshotOne worked on 9 of them
+precisely because it renders from a different IP pool.
+
+The ScreenshotOne fallback **only fires on `OUTCOME_BLOCKED`** in the
+current code. The 36 silent timeouts return `OUTCOME_TIMEOUT` and so
+never reach the fallback — that is the single biggest win available
+for tomorrow (see next steps).
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `backend/app/routers/campaigns.py` | `Query()` for `distributor_ids` on single + batch scan; `_resolve_scan_distributors` validation helper |
+| `frontend/app/campaigns/[id]/page.tsx` | Dealer-picker card: search, checkboxes, select-visible / clear-all, localStorage persistence; per-source enablement |
+| `frontend/lib/api.ts` | `startCampaignBatchScan(campaignId, distributorIds?)` repeated-param serialisation |
+| `backend/app/services/extraction_service.py` | `ExtractionResult` dataclass; `OUTCOME_*` constants; `_classify_playwright_error`; `_attempt_extraction` (single-shot) + `_extract_from_viewport` (retry) split; `_screenshotone_fallback`; stealth args + init script; `MOBILE_FIRST_HOSTS` (env-overridable); `extract_dealer_website` returns `ExtractionResult`; legacy `scan_dealer_websites._process_url` updated |
+| `backend/app/services/scan_runners.py` | `_process_one_dealer` consumes `ExtractionResult` and bins outcomes; new locals `pages_empty / blocked / failed`, `local_block_details`, `dealer_status`; aggregator rolls up `dealers_*` and `blocked_details` into `pipeline_stats`; `_send_scan_notifications` summary dict carries the new counters; cache-phase `extract_dealer_website` call updated |
+| `backend/app/config.py` | `screenshotone_fallback_enabled: bool = True` |
+| `frontend/app/scans/page.tsx` | `PipelineStats` type extended with the new counters + `blocked_details[]`; amber chip under the pages line |
+| `.do/app.yaml` (operator-only) | applied via `doctl apps update`; `workers:` block now actually present in the live spec |
+| `log.md` | this entry |
+
+### Commits
+
+* `f5ab71b` — Allow per-campaign dealer selection when starting scans
+* `81f5da1` — Truthful website-scan metrics, survivable browser, anti-bot bypass
+
+Both pushed to `main`; DO `deploy_on_push` rebuilt both `api` and
+`scan-worker` automatically (deployment `1d0776aa` for the second
+commit).
+
+### Next steps for tomorrow (ordered by ROI)
+
+1. **Trigger ScreenshotOne fallback on `OUTCOME_TIMEOUT`, not just
+   `OUTCOME_BLOCKED`, when the host is in `MOBILE_FIRST_HOSTS`.**
+   Five-line change in `_attempt_extraction` /
+   `extract_dealer_website`. Would have captured the 36 timed-out
+   cat dealers tonight at +$0.144 cost. Single biggest win.
+2. **Skip Playwright entirely for known-bot-walled hosts.** Add a
+   `WEBSITE_BYPASS_PLAYWRIGHT_HOSTS` env (default
+   `rent.cat.com`); when matched, go straight to ScreenshotOne. Saves
+   ~9 minutes of wasted timeouts per scan and produces the same
+   evidence. Combined with #1 the cat scan should drop from ~10 min
+   → ~3 min and report 45/46 dealers scanned.
+3. **Add `proxy=residential` (and `delay=8`) overrides on the
+   ScreenshotOne fallback for hosts in a new
+   `WEBSITE_RESIDENTIAL_HOSTS` set.** ScreenshotOne already worked
+   on 9/45 with the default datacenter pool; residential should
+   push the rest through. Cost goes from $0.004 → ~$0.01/render —
+   still pocket change.
+4. **Per-host `playwright_timeout` override.** While we still try
+   Playwright on bot-walled hosts (e.g. as a fast probe before the
+   ScreenshotOne fallback), 60s is overkill — Akamai either
+   responds within ~5s or never. A 10s probe timeout for hosts in
+   `MOBILE_FIRST_HOSTS` reclaims most of the wall-clock back.
+5. **Surface `dealers_failed` in the `/scans` chip.** Tonight's UI
+   shows `9 dealers blocked` but not `36 dealers failed`. Trivial
+   addition next to the existing `dealers_blocked` span.
+6. **Enrich `OUTCOME_TIMEOUT` reason.** `_classify_playwright_error`
+   currently returns `(OUTCOME_TIMEOUT, None)`. Make it
+   `(OUTCOME_TIMEOUT, "navigation_timeout")` (and ideally include
+   the viewport that last failed) so the `blocked_details[]` rows
+   read cleanly.
+7. **Add a `primary_url` field to `distributors`.** The durable fix:
+   for every cat dealer there is also a public dealer-owned site
+   (yanceybros.com, thompsontractor.com, …) that mirrors the same
+   co-op creatives and is *not* WAF-protected. Scrape that first
+   and only fall back to `rent.cat.com` if the primary URL fails
+   to find the asset. Migration + small UI for the operator to
+   record both URLs per distributor.
+8. **Investigate the `hash_rejected: 241 / 298` ratio.** Even on
+   the dealer that did scan cleanly (yanceybros), 81% of extracted
+   images were rejected at the perceptual-hash gate before CLIP
+   even ran. Either the threshold is wrong or the hash isn't doing
+   what we think for resized site assets.
+9. **Operator escalation (out-of-band).** The ultimate answer to
+   `rent.cat.com` is not technical — it's asking Cat (or the
+   client's relationship manager at Cat) for either an API
+   feed or an Akamai whitelist for our scanner egress IP. Worth a
+   single email before sinking more engineering into bypass tooling.
+
