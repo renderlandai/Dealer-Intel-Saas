@@ -119,11 +119,45 @@ def _is_valid_image(data: bytes) -> bool:
         return False
 
 
+# Realistic browser headers — most CDNs don't actively block plain
+# python-httpx, but a non-trivial number of dealer sites have basic
+# anti-bot rules that 403 anything without an Accept header. Sending
+# the same UA Playwright uses (Chrome on macOS) means a successful
+# Playwright extraction is followed by successful image downloads
+# from the same origin.
+_DOWNLOAD_HEADERS: dict = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "image/avif,image/webp,image/apng,image/svg+xml,"
+        "image/*,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Dest": "image",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "same-origin",
+}
+
+
 async def download_image(url: str) -> bytes:
     """Download image from URL with caching, timeout, and error handling.
 
-    Results are cached in-memory so the same URL is only fetched once per
-    server lifetime (or until the LRU evicts it).
+    Routing rules:
+      * ``data:`` URIs are decoded inline (no network).
+      * Hosts that have been successfully unlocked by Bright Data this
+        process (see ``unlocker_service.host_needs_unlocker``) get
+        their image bytes fetched via the same unlocker. The asset
+        CDN on a WAF-protected dealer is almost always gated by the
+        same WAF as the page (e.g. rent.cat.com/content/dam/), so a
+        plain httpx.get() hangs for 30s and times out.
+      * Everything else falls through to a direct httpx.get() with
+        Chrome-equivalent headers.
+
+    Results are cached in-memory so the same URL is only fetched once
+    per worker lifetime (or until the LRU evicts it).
     """
     if url.startswith("data:"):
         try:
@@ -140,7 +174,29 @@ async def download_image(url: str) -> bytes:
     if cached is not None:
         return cached
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    # Late import to avoid a circular dep at module load time
+    # (unlocker_service imports nothing from ai_service today, so this
+    # is defensive — but unlocker → ai_service.download_image for
+    # campaign-asset crops *is* a real path, so keep the lazy import).
+    from . import unlocker_service
+
+    if unlocker_service.host_needs_unlocker(url):
+        body = await unlocker_service.download_via_unlocker(url)
+        if body is None:
+            log.warning(
+                "Unlocker download returned None for %s — falling back to direct fetch",
+                url[:100],
+            )
+        else:
+            if not _is_valid_image(body):
+                raise ValueError(
+                    f"Unlocker returned non-image content "
+                    f"({len(body)} bytes): {url[:100]}"
+                )
+            _image_cache.put(url, body)
+            return body
+
+    async with httpx.AsyncClient(timeout=30.0, headers=_DOWNLOAD_HEADERS) as client:
         try:
             response = await client.get(url, follow_redirects=True)
             response.raise_for_status()

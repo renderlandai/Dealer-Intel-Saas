@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
@@ -87,6 +88,51 @@ SMOKE_TEST_FAILURE_TTL_SECONDS = 300
 _unlocker_available: bool = True
 _unlocker_disabled_at: float = 0.0
 _smoke_test_lock = asyncio.Lock()
+
+
+# ---------------------------------------------------------------------------
+# Per-host "needs unlocker for asset downloads too" registry
+# ---------------------------------------------------------------------------
+#
+# When the unlocker successfully renders a page, the *images* on that
+# page often live on the same WAF-protected origin (e.g. rent.cat.com's
+# /content/dam/ CDN is gated by the same Akamai instance as the page
+# itself). A plain httpx.get() of those image URLs hangs for 30s and
+# times out — exactly what we saw on 2026-04-30 for wheeler-machinery
+# logos.
+#
+# This in-process set is populated whenever ``unlock_and_extract``
+# succeeds for a hostname, and consulted by ``ai_service.download_image``
+# to decide whether to fetch the image bytes via the unlocker too. The
+# set lives for the worker process lifetime; an unlocker eviction (host
+# stops needing it) is rare enough that we don't bother with TTLs —
+# next worker restart re-learns from the first scan.
+_unlocked_hosts: Set[str] = set()
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def mark_host_unlocked(url_or_host: str) -> None:
+    """Record that a hostname has at least one successful unlock under
+    its belt. Subsequent image downloads for that host will be routed
+    via the unlocker in :func:`download_via_unlocker`.
+    """
+    host = url_or_host if "://" not in url_or_host else _host_of(url_or_host)
+    if host:
+        _unlocked_hosts.add(host)
+
+
+def host_needs_unlocker(url_or_host: str) -> bool:
+    """Whether asset fetches for this host should go through the
+    unlocker. ``ai_service.download_image`` calls this on every image
+    URL; the cost is one set lookup."""
+    host = url_or_host if "://" not in url_or_host else _host_of(url_or_host)
+    return bool(host) and host in _unlocked_hosts
 
 
 def is_available() -> bool:
@@ -145,13 +191,22 @@ def _zone_name() -> str:
 # HTTP call
 # ---------------------------------------------------------------------------
 
-async def _post_unlocker(url: str) -> Tuple[Optional[str], Optional[int], Optional[str]]:
-    """Make one POST to Bright Data Web Unlocker.
+async def _post_unlocker(
+    url: str,
+    *,
+    min_body_bytes: int = 100,
+) -> Tuple[Optional[bytes], Optional[int], Optional[str]]:
+    """Make one POST to Bright Data Web Unlocker, returning raw bytes.
 
-    Returns ``(html_text, http_status, error_reason)``. On success, the
+    Returns ``(body_bytes, http_status, error_reason)``. On success, the
     first two are populated and the third is None. On failure, the first
     is None and the third carries a short human-readable reason for the
     block_details row.
+
+    ``min_body_bytes`` rejects suspiciously-tiny responses as failures.
+    100 is the right floor for HTML (any real page is many KB); for
+    image downloads the caller can lower it (a 1-pixel tracking GIF is
+    ~43 bytes and would be a real, if useless, image).
     """
     token = _api_token()
     zone = _zone_name()
@@ -197,20 +252,68 @@ async def _post_unlocker(url: str) -> Tuple[Optional[str], Optional[int], Option
         return None, resp.status_code, f"brightdata_auth_{resp.status_code}"
 
     if resp.status_code >= 400:
+        # Show first 200 bytes in the log for diagnostic context. Force
+        # latin-1 decode (1:1 byte->char) so we never crash on binary.
+        snippet = resp.content[:200].decode("latin-1", errors="replace")
         log.warning(
             "Bright Data returned HTTP %d for %s: %s",
-            resp.status_code, url[:80], resp.text[:200],
+            resp.status_code, url[:80], snippet,
         )
         return None, resp.status_code, f"brightdata_http_{resp.status_code}"
 
-    body = resp.text
-    if not body or len(body) < 100:
+    body = resp.content
+    if not body or len(body) < min_body_bytes:
         # A "successful" unlock that returns ~0 bytes is almost always a
         # JS-only page where the unlocker didn't actually wait for the
         # render. Treat as failure rather than empty content.
         return None, resp.status_code, "brightdata_empty_response"
 
     return body, resp.status_code, None
+
+
+async def _post_unlocker_text(url: str) -> Tuple[Optional[str], Optional[int], Optional[str]]:
+    """Convenience wrapper: returns the body decoded as UTF-8 text.
+
+    Used for HTML page unlocks. Errors (transport / non-2xx / too small)
+    are passed through unchanged. Decode failures fall back to latin-1
+    so a page with a misdeclared charset still parses (BeautifulSoup
+    will recover from the rest)."""
+    body, status, err = await _post_unlocker(url)
+    if body is None:
+        return None, status, err
+    try:
+        text = body.decode("utf-8")
+    except UnicodeDecodeError:
+        text = body.decode("latin-1", errors="replace")
+    return text, status, err
+
+
+async def download_via_unlocker(image_url: str) -> Optional[bytes]:
+    """Fetch an image's bytes through Bright Data.
+
+    Used by ``ai_service.download_image`` when the image's host has
+    been previously unlocked (and therefore is on the same WAF that
+    blocks our direct httpx fetch). Returns the raw image bytes, or
+    None on any failure — caller is responsible for retry / alternate
+    handling. Records the cost just like a page unlock.
+    """
+    if not is_available():
+        return None
+    body, status, err = await _post_unlocker(image_url, min_body_bytes=20)
+    try:
+        from . import cost_tracker
+        cost_tracker.record_unlocker(
+            requests=1, target=image_url, succeeded=body is not None,
+        )
+    except Exception as cost_err:
+        log.debug("Cost capture skipped (unlocker download): %s", cost_err)
+    if body is None:
+        log.warning(
+            "Bright Data download failed for %s (http=%s err=%s)",
+            image_url[:80], status, err,
+        )
+        return None
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +359,63 @@ def _absolutize(src: str, base_url: str) -> Optional[str]:
     if parsed.scheme not in ("http", "https"):
         return None
     return abs_url
+
+
+# Recognised image extensions, optionally followed by a query string or
+# end-of-URL. Case-insensitive; matched anywhere in the path.
+_IMAGE_EXT_RE = re.compile(
+    r"\.(jpe?g|png|webp|gif|avif|svg|bmp|tiff?)(?:\?|$|/)",
+    re.IGNORECASE,
+)
+
+# Substrings strongly suggestive of an image asset on enterprise CMSes.
+# AEM (Adobe Experience Manager) — what cat.com uses — names rendered
+# image variants `image.coreimg.<width>.<height>.<format>/...` so
+# ``.coreimg.`` is a near-perfect signal. ``/dam/`` is AEM's Digital
+# Asset Manager root. ``/image.`` covers other CMS conventions.
+_IMAGE_HINT_SUBSTRINGS: Tuple[str, ...] = (
+    ".coreimg.",
+    "/image.",
+    "/dam/",
+)
+
+# Substrings that almost always signal a non-image: AEM component paths
+# like /_jcr_content/root/responsivegrid_<id> end at the component
+# boundary, never at a file. Without this filter every AEM page leaks
+# 4-12 component URLs that hang the downloader for 30s each.
+_NON_IMAGE_SUBSTRINGS: Tuple[str, ...] = (
+    "/_jcr_content/",
+)
+
+
+def _looks_like_image_url(url: str) -> bool:
+    """Coarse heuristic: does this URL plausibly point at an image
+    rather than a CMS component reference?
+
+    Returns True for anything with a known image extension OR a known
+    CMS asset-path marker. Returns False for AEM component paths
+    (``/_jcr_content/.../responsivegrid_*``) and other ``-but-no-
+    extension`` URLs.
+
+    False positives (real image URLs we drop) cost us a missed match;
+    false negatives (component URLs we keep) cost us a 30-second
+    timeout in the analyzer. The asymmetry justifies the strict filter
+    — operators can widen it if they see the funnel reject real images.
+    """
+    if not url:
+        return False
+    lower = url.lower()
+    # Hard reject: AEM component paths can have an image extension at the
+    # end (e.g. .../responsivegrid_*.html), but the typical leak is
+    # extension-less. We only reject when the path contains the AEM
+    # marker AND has no image extension downstream.
+    if any(s in lower for s in _NON_IMAGE_SUBSTRINGS) and not _IMAGE_EXT_RE.search(lower):
+        return False
+    if _IMAGE_EXT_RE.search(lower):
+        return True
+    if any(s in lower for s in _IMAGE_HINT_SUBSTRINGS):
+        return True
+    return False
 
 
 def _parse_int(value: Any) -> Optional[int]:
@@ -338,6 +498,12 @@ def parse_images_from_html(
             return
         abs_src = _absolutize(src, base_url)
         if not abs_src or abs_src in seen:
+            return
+        # URL-shape filter: drops AEM /_jcr_content/.../responsivegrid_*
+        # placeholder paths and other extension-less component refs that
+        # would 30s-timeout in ai_service.download_image. See
+        # _looks_like_image_url for the heuristic.
+        if not _looks_like_image_url(abs_src):
             return
         w = _parse_int(width) or 0
         h = _parse_int(height) or 0
@@ -473,7 +639,7 @@ async def unlock_and_extract(
             block_reason="brightdata_unconfigured",
         )
 
-    html_text, http_status, error = await _post_unlocker(url)
+    html_text, http_status, error = await _post_unlocker_text(url)
 
     # Cost recording: BD only bills successful unlocks but we record
     # every attempt with its outcome so the operator can see what they
@@ -497,6 +663,13 @@ async def unlock_and_extract(
 
     # Mark available again on any successful unlock (transient outages clear).
     _mark_available()
+
+    # Tell ai_service.download_image to route image fetches for this
+    # host through the unlocker too — the same WAF that gated the page
+    # almost certainly gates the asset CDN. Without this, every <img>
+    # we just extracted would 30s-timeout in the analyzer (the
+    # 2026-04-30 wheeler-machinery symptom).
+    mark_host_unlocked(url)
 
     # Mirror the size gates Playwright uses. Pull from settings so a
     # later operator change to those numbers stays in sync.
@@ -593,7 +766,7 @@ async def smoke_test() -> Tuple[bool, str]:
             _mark_unavailable()
             return False, "BRIGHTDATA_API_TOKEN or BRIGHTDATA_UNLOCKER_ZONE missing"
 
-        html_text, status, error = await _post_unlocker(_SMOKE_TEST_URL)
+        html_text, status, error = await _post_unlocker_text(_SMOKE_TEST_URL)
         if html_text and (status or 200) < 400:
             _mark_available()
             return True, f"OK (http={status}, len={len(html_text)})"
