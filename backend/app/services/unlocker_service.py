@@ -117,6 +117,26 @@ def _host_of(url: str) -> str:
         return ""
 
 
+def _shorten_url_for_log(url: str, max_len: int = 120) -> str:
+    """Shorten a URL for log display while keeping host + filename.
+
+    Naive ``url[:80]`` truncation on AEM URLs collapses every rendition
+    of the same component to the same prefix in the log, making it
+    impossible to tell distinct images apart. Keep ``head + "..." +
+    tail`` so the filename survives. Mirrors the helper of the same
+    name in ``ai_service`` — kept duplicated rather than shared to
+    avoid an import cycle (ai_service late-imports unlocker_service).
+    """
+    if not url:
+        return ""
+    if len(url) <= max_len:
+        return url
+    head_len = max_len - 33
+    if head_len < 20:
+        head_len = 20
+    return url[:head_len] + "..." + url[-30:]
+
+
 def mark_host_unlocked(url_or_host: str) -> None:
     """Record that a hostname has at least one successful unlock under
     its belt. Subsequent image downloads for that host will be routed
@@ -725,7 +745,7 @@ async def unlock_and_extract(
 
     log.info(
         "Bright Data unlocked %s → %d image(s) inserted (parsed=%d, http=%s)",
-        url[:80], flushed, len(images), http_status,
+        _shorten_url_for_log(url), flushed, len(images), http_status,
     )
     if flushed > 0:
         return extraction_service.ExtractionResult(

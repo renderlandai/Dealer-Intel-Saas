@@ -119,6 +119,30 @@ def _is_valid_image(data: bytes) -> bool:
         return False
 
 
+def _shorten_url_for_log(url: str, max_len: int = 120) -> str:
+    """Shorten a URL for log display while preserving the discriminating
+    parts (host + filename) that operators need to read.
+
+    Naive ``url[:80]`` chopped off filenames on AEM/CMS URLs like
+    ``.../_jcr_content/.../responsivegrid_<id>/image.coreimg.jpeg/.../file.jpeg``
+    — every variant collapsed to the same prefix and the operator
+    couldn't tell whether they were 3 retries of one URL or 3 distinct
+    image renditions. Keep ``host + start of path + "..." + end of path``
+    so the discriminating filename survives.
+    """
+    if not url:
+        return ""
+    if len(url) <= max_len:
+        return url
+    # Reserve ~30 chars for the tail (typical filename) and ~80 for
+    # scheme + host + start of path. Glue with an ellipsis so it's
+    # obvious to the reader that something was elided.
+    head_len = max_len - 33
+    if head_len < 20:
+        head_len = 20
+    return url[:head_len] + "..." + url[-30:]
+
+
 # Realistic browser headers — most CDNs don't actively block plain
 # python-httpx, but a non-trivial number of dealer sites have basic
 # anti-bot rules that 403 anything without an Accept header. Sending
@@ -1728,7 +1752,7 @@ async def process_discovered_image(
             "filter_rejected", "below_threshold", "verification_rejected",
             "matched"
     """
-    log.info("Processing image: %s", image_url[:80])
+    log.info("Processing image: %s", _shorten_url_for_log(image_url))
     log.debug("Source type: %s", source_type or "not specified")
     
     # Determine if this is a screenshot — ONLY trust the explicit source_type flag.

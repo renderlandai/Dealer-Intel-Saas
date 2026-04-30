@@ -201,6 +201,51 @@ class TestParseImagesFromHtml:
 # unlock_and_extract auto-marks the host
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# URL log shortener (preserves discriminating filename)
+# ---------------------------------------------------------------------------
+
+class TestShortenUrlForLog:
+    def test_short_urls_pass_through(self):
+        from app.services.unlocker_service import _shorten_url_for_log
+        u = "https://x.com/banner.png"
+        assert _shorten_url_for_log(u) == u
+
+    def test_long_aem_urls_keep_filename_tail(self):
+        """The 2026-04-30 PM bug: `url[:80]` chopped off the
+        discriminating filename on AEM coreimg URLs, making 3 distinct
+        renditions look identical in the log. The helper must keep the
+        filename portion of the path."""
+        from app.services.unlocker_service import _shorten_url_for_log
+        url = (
+            "https://rent.cat.com/wheeler/en_US/home/"
+            "_jcr_content/root/responsivegrid_6958138/"
+            "image.coreimg.85.1024.jpeg/1730000000/banner.jpeg"
+        )
+        out = _shorten_url_for_log(url)
+        assert out.startswith("https://rent.cat.com/")
+        assert out.endswith("banner.jpeg")
+        assert "..." in out
+
+    def test_three_distinct_aem_renditions_render_distinctly(self):
+        """Operator-experience regression: the helper's whole reason
+        to exist is to make 3 distinct renditions of one component
+        visibly distinct in the log."""
+        from app.services.unlocker_service import _shorten_url_for_log
+        prefix = (
+            "https://rent.cat.com/wheeler/en_US/home/"
+            "_jcr_content/root/responsivegrid_6958138/"
+        )
+        urls = [
+            prefix + "image.coreimg.85.1024.jpeg/170000/banner.jpeg",
+            prefix + "image.coreimg.85.1024.png/170001/banner.png",
+            prefix + "image.coreimg.85.1024.svg/170002/banner.svg",
+        ]
+        shortened = [_shorten_url_for_log(u) for u in urls]
+        assert len(set(shortened)) == 3, \
+            f"all 3 shortened forms must differ, got: {shortened}"
+
+
 class TestUnlockAndExtractMarksHost:
     def setup_method(self):
         from app.services import unlocker_service

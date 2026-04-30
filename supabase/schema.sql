@@ -233,6 +233,35 @@ CREATE INDEX IF NOT EXISTS idx_host_scan_policy_last_seen
 CREATE INDEX IF NOT EXISTS idx_host_scan_policy_strategy
     ON host_scan_policy(strategy);
 
+-- Page-level hit cache for recurring scan optimization (mirror of
+-- migrations 016 + 032). On repeat scans, hot pages are scanned first;
+-- if all campaign assets are matched from cached pages alone (early
+-- stop), full page discovery is skipped entirely. See
+-- `services/page_cache_service.py`.
+--
+-- This block was missing from schema.sql when the prod database was
+-- bootstrapped, which is why runtime ``page_cache_service`` calls
+-- logged ``Could not find the table 'public.page_hit_cache'``. Adding
+-- here so future fresh installs pick it up; migration 032 re-applies
+-- it idempotently to existing databases.
+CREATE TABLE IF NOT EXISTS page_hit_cache (
+    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id    UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    distributor_id     UUID NOT NULL REFERENCES distributors(id) ON DELETE CASCADE,
+    campaign_id        UUID REFERENCES campaigns(id) ON DELETE CASCADE,
+    page_url           TEXT NOT NULL,
+    hit_count          INTEGER NOT NULL DEFAULT 1,
+    last_hit_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    asset_ids_matched  JSONB DEFAULT '[]',
+    created_at         TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_phc_org_dist
+    ON page_hit_cache(organization_id, distributor_id);
+CREATE INDEX IF NOT EXISTS idx_phc_campaign
+    ON page_hit_cache(campaign_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_phc_unique_page
+    ON page_hit_cache(organization_id, distributor_id, campaign_id, page_url);
+
 -- ============================================
 -- VIEWS FOR DASHBOARD
 -- ============================================

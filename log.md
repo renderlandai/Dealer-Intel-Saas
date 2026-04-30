@@ -5850,3 +5850,110 @@ false-positive screenshot.
    Cheap insurance against a future refactor breaking the Layer 1
    contract.
 
+
+---
+
+## 2026-04-30 (PM) — Phase 6.5.2: page discovery via unlocker, page-cache table re-applied, log truncation fix
+
+### Summary
+
+The `1/1 pages looked at` symptom on `rent.cat.com` was a discovery-side regression of the same Akamai problem Phase 6.5 fixed for extraction. Three independent issues were uncovered while diagnosing it; all three are fixed in this phase.
+
+### The smoking-gun log line
+
+From the worker that ran job `b8cb7ea3-…` at 16:39 UTC on Apr 30:
+
+```
+16:39:18.847  Starting page discovery for https://rent.cat.com/wheeler/en_US/home.html (max 15 pages)
+16:39:19.020  Probed 24 common paths: 0 valid          ← all 24 probes finished in 87 ms
+16:39:19.107  Final: 1 pages to scan for rent.cat.com   ← only the base URL survives
+16:39:19.139  [page 1/1] Extracting: ...home.html
+```
+
+24 HEAD probes completing in 87 ms is not "fetched and got a 404" — it's "Akamai dropped the TCP connection before TLS completed." The same Akamai instance that gates the homepage gates `/specials`, `/sitemap.xml`, and every other URL we tried. All three discovery strategies (`_probe_common_paths`, `_fetch_sitemap_urls`, `_crawl_homepage_links`) fell through silently with empty results. `discover_pages` then returned the seeded base URL alone, the runner gave it the per-site budget of 15 slots, and the dealer scanned exactly one page. Phase 6.5 fixed extraction on these hosts via Bright Data; discovery still went through plain httpx.
+
+### Fix #1 — page discovery via Bright Data Web Unlocker
+
+`backend/app/services/page_discovery.py` now consults `host_policy_service.get_strategy(base_url)` at the top of `discover_pages`. When the host is on a WAF-grade strategy (`unlocker_only`, `playwright_then_unlocker`, `unreachable`):
+
+- The three direct strategies are skipped entirely. They are guaranteed-zero on these hosts and burn ~100 ms of TCP/TLS aborts on every scan.
+- A new helper `_crawl_homepage_links_via_unlocker(base_url, base_domain)` POSTs the homepage to Bright Data, parses `<a href>` links from the post-render DOM with the same regex the direct path uses, filters to same-domain scannable pages, and returns the list. Promo-keyword URLs get hoisted to the front so the slot order matches the direct path's promo-first ordering.
+- As a defence-in-depth, the unlocker fallback also runs after the direct path if the result list still has only the base URL — that catches the symptom on hosts whose policy row hasn't been seeded yet (the exact pre-condition rent.cat.com was in before Phase 6.5).
+- Side effect: a successful unlocker discovery call also `mark_host_unlocked()`s the host, so the per-page extraction phase doesn't have to wait for its own first unlock to flip the asset-routing flag in `ai_service.download_image`.
+
+Cost impact: roughly $0.0015 per WAF-protected dealer per scan. At 50 such dealers that's $0.075/scan — negligible vs. the $0.044 Claude charge per match the same scan already pays.
+
+### Fix #2 — `page_hit_cache` table re-applied
+
+The same worker logs revealed a second, separate failure on every scan:
+
+```
+WARNING  Page cache lookup failed: Could not find the table 'public.page_hit_cache'
+WARNING  Failed to record page hit ... 'Missing response', 'code': '204'
+```
+
+Migration `016_page_hit_cache.sql` was added in November 2026 but never copied into `supabase/schema.sql`. Any environment that bootstrapped from `schema.sql` (rather than replaying every migration) is missing the table. `page_cache_service` fails soft so scans still complete, but the entire optimisation that lets us skip already-empty pages on re-scans is dead — every page on every recurring scan re-runs the full extraction pipeline.
+
+Fixes:
+- `supabase/schema.sql` — added the `page_hit_cache` `CREATE TABLE` block + indexes after `host_scan_policy`. Future bootstraps will include it.
+- `supabase/migrations/032_ensure_page_hit_cache.sql` (new) — re-applies migration 016 verbatim with `IF NOT EXISTS` guards. No-op on databases that already have the table; one-shot fix on those that don't. Apply with `python3 backend/run_migration.py`.
+
+### Fix #3 — log truncation made AEM URLs look like duplicates
+
+The same logs showed three "Processing image" lines for what looked like the same URL at 16:39:28, 16:39:52, 16:39:56:
+
+```
+Processing image: https://rent.cat.com/wheeler/en_US/home/_jcr_content/root/responsivegrid_6958138
+```
+
+Three log lines, looks like a retry loop. Reality: three distinct AEM image renditions (`image.coreimg.85.1024.jpeg`, `…png`, `…svg` — different filenames after the truncation point). The `image_url[:80]` truncation at `ai_service.py:1731` chopped off the discriminating filename and made every rendition collapse to the same string in the operator's terminal. The pipeline funnel `total_images=4, hash_rejected=3, matched_new=1` confirms the system actually handled all four images correctly and rejected the three at the perceptual-hash gate as expected — there was no real bug, just a misleading log.
+
+The `_looks_like_image_url` filter from Phase 6.5.1 was also re-audited and confirmed correct: AEM URLs without an image extension are rejected (`/_jcr_content/.../responsivegrid_6958138` → False); AEM URLs *with* an image extension downstream of the marker are accepted (`/_jcr_content/.../image.coreimg.jpeg/.../file.jpeg` → True). New unit tests pin both behaviors.
+
+Fixes:
+- New `_shorten_url_for_log(url)` helper in both `ai_service.py` and `unlocker_service.py` (duplicated rather than shared to avoid an import cycle). Keeps `head + "..." + tail` so the discriminating filename survives. `_run_log_for_log_test_three_distinct_aem_renditions_render_distinctly` enforces that 3 distinct renditions of the same AEM component render distinctly in the log.
+- Replaced both `image_url[:80]` log calls with `_shorten_url_for_log(image_url)`.
+
+### Tests
+
+`backend/tests/test_page_discovery.py` (new, 7 tests):
+
+- `unlocker_only` strategy skips direct probes and uses the unlocker.
+- `playwright_then_unlocker` also skips direct probes.
+- `playwright_desktop` strategy uses direct only — does NOT pay the BD cost on healthy hosts.
+- Unlocker fallback fires when direct returned only the base URL.
+- Promo keyword URLs from the unlocker get hoisted to the front of the result list.
+- `_crawl_homepage_links_via_unlocker` filters to same-domain scannable pages, drops off-domain / asset / `tel:` / `javascript:` / `#` links.
+- The unlocker-disabled and unlocker-failure paths return an empty list, not an exception.
+- A successful unlocker discovery call marks the host as unlocked for later asset routing.
+
+`backend/tests/test_unlocker_service.py` (5 added):
+
+- `_shorten_url_for_log` short-URL passthrough, AEM filename preservation, and the three-distinct-renditions invariant.
+
+Full result on the touched modules: **59 passed, 0 failed.** The pre-existing 28 JWT/auth fixture failures elsewhere in the suite are unrelated and present on `main`.
+
+### Files
+
+- `backend/app/services/page_discovery.py` — `_crawl_homepage_links_via_unlocker` helper, strategy-driven skip-direct logic, defence-in-depth unlocker fallback, updated docstring with cost reasoning.
+- `backend/app/services/ai_service.py` — `_shorten_url_for_log` helper, replaced truncating log call.
+- `backend/app/services/unlocker_service.py` — `_shorten_url_for_log` helper, replaced truncating log call.
+- `supabase/schema.sql` — `page_hit_cache` block added after `host_scan_policy`.
+- `supabase/migrations/032_ensure_page_hit_cache.sql` — idempotent re-application of migration 016.
+- `backend/tests/test_page_discovery.py` (new) — 7 regression tests for Fix #1.
+- `backend/tests/test_unlocker_service.py` — 3 new tests for `_shorten_url_for_log`.
+
+### Verification on next scan
+
+- `Probed 24 common paths: 0 valid` should NOT appear for any host on `unlocker_only` / `playwright_then_unlocker` (replaced by `Host X on strategy Y — skipping direct probes, using unlocker for discovery`).
+- `Final: N pages to scan for rent.cat.com (skip_direct=True, unlocker_used=True)` with N > 1 (target 5–15 depending on how many internal links the homepage carries).
+- `Phase 2: <N-cached> additional page(s) across 1 dealer(s)` matches the new N.
+- `[page X/N]` extraction lines run for each discovered page.
+- `Could not find the table 'public.page_hit_cache'` warnings disappear after migration 032 is applied.
+- `Processing image: https://rent.cat.com/.../...banner.jpeg` (or `.png`, etc.) — the filename portion is now visible in the log.
+
+### Open follow-ups (not in this commit)
+
+1. **`page_cache_service.record_page_hits` `.maybe_single()` quirk.** Even with the table present, the inserts use `.maybe_single().execute()` which raises with `code: '204'` on an empty result set in this version of supabase-py. The whole record loop catches and logs as `WARNING  Failed to record page hit`. Replace with `.limit(1).execute()` and check `result.data` explicitly.
+2. **Per-host `unlocker_only` discovery cost cap.** A pathological host that returns thousands of `<a href>` links would still be capped by `max_pages` slot allocation, but the BD call itself returns the entire DOM. Worth setting an explicit response-size limit in `_post_unlocker` (currently unbounded) so a malicious or misconfigured host can't run up the BD bill.
+3. **Sitemap-via-unlocker.** For really large dealer sites, the homepage `<a href>` set might miss long-tail promo URLs that only sitemap.xml carries. Worth experimenting with a second BD call to `/sitemap.xml` for hosts where the link count comes back small — but only if we see evidence of missed matches.
