@@ -310,21 +310,6 @@ async def _capture_evidence_screenshot(
         return None
 
 
-async def _screenshotone_fallback(url: str, scan_job_id: UUID) -> Optional[str]:
-    """Capture a blocked page via ScreenshotOne's hosted renderer.
-
-    Used when both Playwright viewports came back BLOCKED — ScreenshotOne
-    runs from rotating residential-style IPs that are typically not on
-    Cat/Akamai's headless-Chromium denylist. Returns the storage URL of
-    the uploaded PNG, or None on any failure.
-    """
-    if not getattr(settings, "screenshotone_access_key", ""):
-        return None
-    # Late import to avoid a circular dependency between services.
-    from . import screenshot_service
-    return await screenshot_service.capture_and_upload(url, scan_job_id)
-
-
 async def _extract_images_from_page(page: Page) -> List[Dict[str, Any]]:
     """
     Extract all meaningful images from the current page.
@@ -543,13 +528,22 @@ async def localize_screenshot_capture(
     """Run CV localization on a captured full-page screenshot and insert
     each cropped creative as its own ``discovered_images`` row.
 
-    Used when a page was captured via the ScreenshotOne fallback (Playwright
-    couldn't reach it). The matcher is then comparing real banner-sized
-    crops against the campaign assets instead of comparing a 1920x3000
-    full-page screenshot against a 320x50 banner — which previously
-    produced "STRONG MATCH (modified)" verdicts on hosts like
-    ``rent.cat.com`` because the page literally contained the campaign
-    artwork at hero size. See log.md 2026-04-29 for the diagnostic.
+    Used when a Playwright extraction returned a screenshot (evidence
+    only) but no individual ``<img>`` rows. The matcher then compares
+    real banner-sized crops against the campaign assets instead of
+    comparing a 1920x3000 full-page screenshot against a 320x50 banner —
+    which previously produced "STRONG MATCH (modified)" verdicts on
+    hosts like ``rent.cat.com`` because the page literally contained
+    the campaign artwork at hero size. See log.md 2026-04-29 for the
+    diagnostic.
+
+    Phase 6.5 note: the Bright Data Web Unlocker rung returns rendered
+    HTML (parsed for ``<img>`` tags directly), so blocked WAF hosts no
+    longer flow through this localizer in practice — they get real
+    extracted-image rows. This helper still runs for the rare case
+    where Playwright captured a screenshot but extracted zero images
+    (typical of single-page apps that render images via canvas or
+    inline SVG).
 
     Returns the number of crops inserted. Zero is a valid result (no
     campaign creatives detected on the page) and is not an error.
@@ -906,11 +900,11 @@ async def extract_dealer_website(
     """Load a dealer page, extract images, and return a structured outcome.
 
     Delegates to :mod:`render_strategies` and :mod:`host_policy_service`
-    so the choice of renderer (Playwright desktop, mobile-first,
-    ScreenshotOne, ScreenshotOne+residential) is per-host learned data,
-    not a hand-curated env var. First scan of a brand-new host pays for
-    a 5s preflight probe + the full ladder; every scan after that goes
-    straight to whatever already worked.
+    so the choice of renderer (Playwright desktop, mobile-first, Bright
+    Data Web Unlocker) is per-host learned data, not a hand-curated env
+    var. First scan of a brand-new host pays for a 5s preflight probe +
+    the full ladder; every scan after that goes straight to whatever
+    already worked.
 
     The returned :class:`ExtractionResult` carries an optional
     ``ladder_attempts`` list on its ``block_reason`` when more than one

@@ -2,48 +2,56 @@
 
 Background
 ----------
-Until tonight every dealer page was rendered the same way: Playwright
+Until Phase 6.5 every dealer page was rendered the same way: Playwright
 desktop, retry-on-failure with mobile, fall back to ScreenshotOne if
 the host returned an HTTP 403. That works for ~80% of hosts but burns
 60-120s of timeouts on Akamai/Cloudflare-protected sites that we
-already know are going to fail. The fix is two-part:
+already know are going to fail. Phase 6 added a *learning layer* that
+remembers which strategy worked per hostname; Phase 6.5 replaced the
+SS1 fallback with **Bright Data Web Unlocker**, the actual answer to
+"how do we bypass arbitrary WAF-protected sites" (see
+``unlocker_service.py`` for why).
 
-* This module defines a *ladder* of render strategies, each one
-  cheaper-but-flakier or pricier-but-stealthier than the next. The
-  runner walks the chosen strategy's ordered attempt list until one
-  succeeds (returns ``OUTCOME_IMAGES``) or every attempt is exhausted.
+The ladder structure is unchanged. What's different:
 
-* ``host_policy_service`` records which strategy each hostname
-  converges on, so subsequent scans skip the doomed attempts. The
-  first scan of a brand-new host pays the full discovery cost; every
-  scan after that is fast.
+* The top of every ladder is now ``_UNLOCKER`` (Bright Data) instead of
+  ``_SCREENSHOTONE_*``. The unlocker returns rendered HTML which we
+  parse for ``<img>`` tags directly, so it produces ``OUTCOME_IMAGES``
+  rather than the screenshot-with-localizer dance SS1 needed.
+* Every ladder is at least two rungs. The previous single-rung
+  ``screenshotone_residential`` strategy was structurally fragile —
+  one provider failure killed all evidence collection on a host. Now
+  the worst case is "Playwright failed, BD failed too" → operator sees
+  the host as unreachable rather than silently dropping rows.
+* The new ``unreachable`` rung is purely flag-only: it still tries the
+  unlocker once for evidence but ``host_policy_service`` won't promote
+  past it.
 
 Strategy names (single source of truth shared with the SQL CHECK
-constraint in migration ``030_host_scan_policy.sql``):
+constraint in migration ``031_replace_screenshotone_with_unlocker.sql``):
 
 ============================== =========================================================
 name                            attempts in order
 ============================== =========================================================
-playwright_desktop             [Playwright desktop, Playwright mobile,
-                                ScreenshotOne datacenter, ScreenshotOne residential]
-playwright_mobile_first        [Playwright mobile, Playwright desktop,
-                                ScreenshotOne datacenter, ScreenshotOne residential]
-playwright_then_screenshotone  [Playwright desktop, ScreenshotOne datacenter,
-                                ScreenshotOne residential]
-screenshotone_only             [ScreenshotOne datacenter, ScreenshotOne residential]
-screenshotone_residential      [ScreenshotOne residential]
-unreachable                    [ScreenshotOne residential]   (still try once for evidence)
+playwright_desktop             [Playwright desktop, Playwright mobile, Bright Data]
+playwright_mobile_first        [Playwright mobile, Playwright desktop, Bright Data]
+playwright_then_unlocker       [Playwright desktop, Bright Data]
+unlocker_only                  [Bright Data]
+unreachable                    [Bright Data]   (still try once for evidence)
 ============================== =========================================================
 
 Each attempt returns an :class:`ExtractionResult` so the ladder can
 decide whether to stop or keep going. The ladder stops on the first
-``OUTCOME_IMAGES`` (real images extracted) and otherwise returns the
-best-evidence result it has seen — typically a screenshot from the
-last attempt that produced one — so the user is never left with a
-completely empty row.
+``OUTCOME_IMAGES`` (real images extracted). Because the unlocker rung
+returns ``OUTCOME_IMAGES`` directly when it succeeds (no
+screenshot-only intermediate state), the early-stop ``is_screenshot_capture``
+short-circuit from the SS1 era is no longer needed for the unlocker —
+it's still on the ``RenderAttempt`` protocol for backwards compat in
+case a future provider returns evidence-only.
 
 This module deliberately holds no global state. ``host_policy_service``
-owns the per-host learning; the strategies themselves are pure.
+owns the per-host learning; ``unlocker_service`` owns the API
+availability flag; the strategies themselves are pure.
 """
 from __future__ import annotations
 
@@ -57,23 +65,21 @@ log = logging.getLogger("dealer_intel.render_strategies")
 
 # ---------------------------------------------------------------------------
 # Strategy names — single source of truth shared with the SQL CHECK constraint
-# in migration 030_host_scan_policy.sql. Adding a new strategy means: append
-# below, add an entry to ``STRATEGY_LADDERS``, and bump the SQL CHECK in a
-# follow-up migration.
+# in migration 031_replace_screenshotone_with_unlocker.sql. Adding a new
+# strategy means: append below, add an entry to ``STRATEGY_LADDERS``, and bump
+# the SQL CHECK in a follow-up migration.
 # ---------------------------------------------------------------------------
 STRATEGY_PLAYWRIGHT_DESKTOP = "playwright_desktop"
 STRATEGY_PLAYWRIGHT_MOBILE_FIRST = "playwright_mobile_first"
-STRATEGY_PLAYWRIGHT_THEN_SCREENSHOTONE = "playwright_then_screenshotone"
-STRATEGY_SCREENSHOTONE_ONLY = "screenshotone_only"
-STRATEGY_SCREENSHOTONE_RESIDENTIAL = "screenshotone_residential"
+STRATEGY_PLAYWRIGHT_THEN_UNLOCKER = "playwright_then_unlocker"
+STRATEGY_UNLOCKER_ONLY = "unlocker_only"
 STRATEGY_UNREACHABLE = "unreachable"
 
 ALL_STRATEGIES: List[str] = [
     STRATEGY_PLAYWRIGHT_DESKTOP,
     STRATEGY_PLAYWRIGHT_MOBILE_FIRST,
-    STRATEGY_PLAYWRIGHT_THEN_SCREENSHOTONE,
-    STRATEGY_SCREENSHOTONE_ONLY,
-    STRATEGY_SCREENSHOTONE_RESIDENTIAL,
+    STRATEGY_PLAYWRIGHT_THEN_UNLOCKER,
+    STRATEGY_UNLOCKER_ONLY,
     STRATEGY_UNREACHABLE,
 ]
 
@@ -82,9 +88,8 @@ ALL_STRATEGIES: List[str] = [
 PROMOTION_ORDER: List[str] = [
     STRATEGY_PLAYWRIGHT_DESKTOP,
     STRATEGY_PLAYWRIGHT_MOBILE_FIRST,
-    STRATEGY_PLAYWRIGHT_THEN_SCREENSHOTONE,
-    STRATEGY_SCREENSHOTONE_ONLY,
-    STRATEGY_SCREENSHOTONE_RESIDENTIAL,
+    STRATEGY_PLAYWRIGHT_THEN_UNLOCKER,
+    STRATEGY_UNLOCKER_ONLY,
     STRATEGY_UNREACHABLE,
 ]
 
@@ -142,10 +147,10 @@ class RenderAttempt(Protocol):
 # Concrete attempts
 # ---------------------------------------------------------------------------
 #
-# Each attempt late-imports ``extraction_service`` to break the circular
-# dependency (``extraction_service`` imports this module to choose a ladder).
-# Cost figures inform the future cost-guardrail layer; in-process Chromium
-# has no per-call $$.
+# Each attempt late-imports its underlying service to break the circular
+# dependency (``extraction_service`` and ``unlocker_service`` both import
+# this module to choose a ladder). Cost figures inform the future
+# cost-guardrail layer; in-process Chromium has no per-call $$.
 
 class _PlaywrightAttempt:
     name: str
@@ -171,103 +176,76 @@ class _PlaywrightAttempt:
         )
 
 
-class _ScreenshotOneAttempt:
-    name: str
-    cost_per_render_usd: float
-    use_residential_proxy: bool
-    # True so ``run_ladder`` stops as soon as this rung produces an
-    # evidence_url. Trying a second SS1 rung on a host that already
-    # rendered cleanly via SS1 just burns money for no new info.
-    is_screenshot_capture: bool = True
+class _UnlockerAttempt:
+    """Bright Data Web Unlocker rung.
 
-    def __init__(self, *, residential: bool, name: str, cost: float):
-        self.use_residential_proxy = residential
-        self.name = name
-        self.cost_per_render_usd = cost
+    Calls Bright Data's REST endpoint, parses the returned HTML for
+    images, and inserts each one as a ``discovered_images`` row. Because
+    the unlocker returns a rendered DOM (not a screenshot), the result
+    can be ``OUTCOME_IMAGES`` directly — no separate cv-localizer pass
+    is needed. The actual work lives in :mod:`unlocker_service`.
+    """
+    name: str = "brightdata_unlocker"
+    # PAYG list price as of 2026-04-30. ``cost_tracker.record_unlocker``
+    # is the source of truth for billing; this field is informational and
+    # used by the future cost-guardrail layer to pick cheaper rungs first.
+    cost_per_render_usd: float = 0.0015
+    # Not a "screenshot-only" capture in the SS1 sense — it returns real
+    # extracted images, so the ladder doesn't need the early-stop
+    # short-circuit that SS1 needed.
+    is_screenshot_capture: bool = False
 
     async def render(self, ctx: RenderContext):
-        from . import extraction_service       # late import
-        from . import screenshot_service       # late import
-
-        overrides: Dict[str, Any] = {}
-        if self.use_residential_proxy:
-            # ScreenshotOne residential pool: same API, residential IP egress.
-            # Adds ~$0.006/render on top of the base $0.004 charge. Empirically
-            # the only thing that defeats Akamai's IP-reputation block from
-            # a datacenter source.
-            #
-            # Param name is `proxy_type` per ScreenshotOne docs — we previously
-            # sent `proxy=residential` and the API returned 400 on every call.
-            overrides["proxy_type"] = "residential"
-            overrides["delay"] = 8     # let any challenge-page JS clear
-
-        try:
-            shot_url = await screenshot_service.capture_and_upload(
-                ctx.url, ctx.scan_job_id, **overrides,
-            )
-        except Exception as e:
-            log.warning(
-                "ScreenshotOne (%s) raised for %s: %s",
-                self.name, ctx.url, e,
-            )
-            shot_url = None
-
-        if shot_url:
-            log.info("%s captured %s", self.name, ctx.url)
-            return extraction_service.ExtractionResult(
-                count=0,
-                evidence_url=shot_url,
-                # Marked BLOCKED (not IMAGES) because we did NOT extract
-                # individual images — only a full-page screenshot. Truthful
-                # metrics depend on this distinction.
-                outcome=extraction_service.OUTCOME_BLOCKED,
-                block_reason=f"captured_via_{self.name}",
-            )
-
-        return extraction_service.ExtractionResult(
-            count=0,
-            evidence_url=None,
-            outcome=extraction_service.OUTCOME_BLOCKED,
-            block_reason=f"{self.name}_failed",
+        from . import unlocker_service       # late import
+        return await unlocker_service.unlock_and_extract(
+            url=ctx.url,
+            scan_job_id=ctx.scan_job_id,
+            distributor_id=ctx.distributor_id,
+            seen_srcs=ctx.seen_srcs,
+            campaign_assets=ctx.campaign_assets,
         )
 
 
 # Single concrete attempt instances reused across the ladders below.
-# Strategies are just different *orderings* of the same three primitives.
+# Strategies are just different *orderings* of the same primitives.
 _PLAYWRIGHT_DESKTOP = _PlaywrightAttempt(mobile=False, name="playwright_desktop")
 _PLAYWRIGHT_MOBILE = _PlaywrightAttempt(mobile=True, name="playwright_mobile")
-_SCREENSHOTONE_DC = _ScreenshotOneAttempt(
-    residential=False, name="screenshotone_datacenter", cost=0.004,
-)
-_SCREENSHOTONE_RES = _ScreenshotOneAttempt(
-    residential=True, name="screenshotone_residential", cost=0.010,
-)
+_UNLOCKER = _UnlockerAttempt()
 
 
 # Each strategy is just an ordered tuple of attempts. The runner walks
-# them until OUTCOME_IMAGES or end of list.
+# them until OUTCOME_IMAGES or end of list. Every ladder has at least
+# two rungs (with at least two distinct providers across them) so a
+# single-rung outage can never silently drop all evidence — this is the
+# structural fix for the 2026-04-30 incident where
+# ``screenshotone_residential`` had a single broken rung and produced
+# zero rows for every Akamai-protected dealer.
 STRATEGY_LADDERS: Dict[str, List[RenderAttempt]] = {
     STRATEGY_PLAYWRIGHT_DESKTOP: [
-        _PLAYWRIGHT_DESKTOP, _PLAYWRIGHT_MOBILE,
-        _SCREENSHOTONE_DC, _SCREENSHOTONE_RES,
+        _PLAYWRIGHT_DESKTOP, _PLAYWRIGHT_MOBILE, _UNLOCKER,
     ],
     STRATEGY_PLAYWRIGHT_MOBILE_FIRST: [
-        _PLAYWRIGHT_MOBILE, _PLAYWRIGHT_DESKTOP,
-        _SCREENSHOTONE_DC, _SCREENSHOTONE_RES,
+        _PLAYWRIGHT_MOBILE, _PLAYWRIGHT_DESKTOP, _UNLOCKER,
     ],
-    STRATEGY_PLAYWRIGHT_THEN_SCREENSHOTONE: [
-        _PLAYWRIGHT_DESKTOP, _SCREENSHOTONE_DC, _SCREENSHOTONE_RES,
+    STRATEGY_PLAYWRIGHT_THEN_UNLOCKER: [
+        _PLAYWRIGHT_DESKTOP, _UNLOCKER,
     ],
-    STRATEGY_SCREENSHOTONE_ONLY: [
-        _SCREENSHOTONE_DC, _SCREENSHOTONE_RES,
-    ],
-    STRATEGY_SCREENSHOTONE_RESIDENTIAL: [
-        _SCREENSHOTONE_RES,
+    STRATEGY_UNLOCKER_ONLY: [
+        # Single rung is acceptable here because:
+        #   1. The boot-time smoke test in main.py confirms BD is
+        #      authenticating before the API even starts serving;
+        #   2. ``unlocker_service.is_available()`` flips off the rung
+        #      after auth-style failures so we don't keep paying for
+        #      guaranteed errors;
+        #   3. ``host_policy_service`` will promote out of this strategy
+        #      to ``unreachable`` after PROMOTE_THRESHOLD failures.
+        _UNLOCKER,
     ],
     STRATEGY_UNREACHABLE: [
-        # Still try once so the report has visual evidence; the recording
-        # layer is responsible for not promoting past this rung.
-        _SCREENSHOTONE_RES,
+        # Still try once so the report has visual evidence; the
+        # recording layer is responsible for not promoting past this
+        # rung.
+        _UNLOCKER,
     ],
 }
 
@@ -309,8 +287,13 @@ async def run_ladder(
         is whichever attempt produced the most informative evidence:
         prefer ``OUTCOME_IMAGES`` (none here, by definition), else prefer
         any result with a screenshot (``evidence_url``); break ties by
-        the attempt that ran latest on the ladder (residential beats
-        datacenter beats Playwright).
+        the attempt that ran latest on the ladder.
+      * A rung whose ``is_screenshot_capture`` flag is True and which
+        produced an ``evidence_url`` short-circuits the ladder (a second
+        screenshot-only rung wouldn't add information). The current
+        unlocker rung is NOT a screenshot capture — it returns real
+        images — so this short-circuit doesn't apply to it. Kept for
+        forward compat with future evidence-only providers.
       * Unknown strategy names fall back to the
         ``playwright_desktop`` ladder so a corrupt policy row never
         silently disables scanning.
@@ -369,11 +352,13 @@ async def run_ladder(
                 succeeded_attempt=attempt.name,
             )
 
-        # Once a ScreenshotOne rung produces an evidence_url, stop. The next
-        # rung is also a ScreenshotOne (datacenter -> residential) and would
-        # only add cost without changing what we know about the page. If
-        # downstream OCR/match wants more data it can request a re-scan with
-        # a higher-tier strategy explicitly.
+        # Once an evidence-only rung produces a screenshot, stop. Trying
+        # a second evidence-only rung would only add cost without
+        # changing what we know about the page. The current unlocker
+        # rung is NOT marked as a screenshot capture (it returns real
+        # images) so this branch is dormant today, but the protocol
+        # supports it for any future provider that returns
+        # evidence-only.
         if (
             getattr(attempt, "is_screenshot_capture", False)
             and res.evidence_url is not None

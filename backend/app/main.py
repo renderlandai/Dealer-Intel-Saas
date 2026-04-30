@@ -38,6 +38,31 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 async def lifespan(application: FastAPI):
     await scheduler_service.start()
 
+    # Bright Data Web Unlocker smoke test (Phase 6.5). Fail-soft: a failed
+    # smoke test logs an ERROR and disables the unlocker rung in
+    # render_strategies for 5 min, but the API keeps serving so the rest
+    # of the product (auth, dashboards, billing) stays up. Without this
+    # check, a misconfigured BRIGHTDATA_API_TOKEN silently sends every
+    # WAF-protected page through a guaranteed-failure rung — exactly the
+    # pattern that produced zero rows for rent.cat.com on 2026-04-30.
+    try:
+        from .services import unlocker_service
+        ok, detail = await unlocker_service.smoke_test()
+        if ok:
+            log.info("Bright Data Web Unlocker smoke test: %s", detail)
+        else:
+            log.error(
+                "Bright Data Web Unlocker smoke test FAILED: %s — unlocker "
+                "rung disabled for %ds. Fix BRIGHTDATA_API_TOKEN / "
+                "BRIGHTDATA_UNLOCKER_ZONE and the next scan will retry.",
+                detail, unlocker_service.SMOKE_TEST_FAILURE_TTL_SECONDS,
+            )
+    except Exception as e:
+        # Never crash startup on a smoke-test bug. The is_available()
+        # flag stays True; an actual unlock attempt will surface the
+        # underlying failure.
+        log.warning("Bright Data smoke test raised unexpectedly: %s", e)
+
     yield
     await scheduler_service.shutdown()
 

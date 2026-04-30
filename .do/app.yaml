@@ -58,14 +58,13 @@ services:
         scope: RUN_TIME
         type: SECRET
         value: "PLACEHOLDER"
-      - key: SCREENSHOTONE_ACCESS_KEY
+      - key: BRIGHTDATA_API_TOKEN
         scope: RUN_TIME
         type: SECRET
         value: "PLACEHOLDER"
-      - key: SCREENSHOTONE_SECRET_KEY
+      - key: BRIGHTDATA_UNLOCKER_ZONE
         scope: RUN_TIME
-        type: SECRET
-        value: "PLACEHOLDER"
+        value: "dealer_intel_unlocker"
       - key: SERPAPI_API_KEY
         scope: RUN_TIME
         type: SECRET
@@ -238,14 +237,13 @@ workers:
         scope: RUN_TIME
         type: SECRET
         value: "PLACEHOLDER"
-      - key: SCREENSHOTONE_ACCESS_KEY
+      - key: BRIGHTDATA_API_TOKEN
         scope: RUN_TIME
         type: SECRET
         value: "PLACEHOLDER"
-      - key: SCREENSHOTONE_SECRET_KEY
+      - key: BRIGHTDATA_UNLOCKER_ZONE
         scope: RUN_TIME
-        type: SECRET
-        value: "PLACEHOLDER"
+        value: "dealer_intel_unlocker"
       - key: SERPAPI_API_KEY
         scope: RUN_TIME
         type: SECRET

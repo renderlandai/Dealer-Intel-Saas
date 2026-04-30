@@ -17,9 +17,13 @@ class Settings(BaseSettings):
     # Anthropic AI (Claude for all image analysis)
     anthropic_api_key: str
     
-    # ScreenshotOne (website & ad page capture)
-    screenshotone_access_key: str
-    screenshotone_secret_key: str = ""
+    # Bright Data Web Unlocker — used as the WAF-bypass rung in
+    # render_strategies. Replaced ScreenshotOne in Phase 6.5; see
+    # services/unlocker_service.py for the integration. Empty values
+    # are tolerated (the smoke test in main.py disables the rung at
+    # boot) so local dev without a BD account still works.
+    brightdata_api_token: str = ""
+    brightdata_unlocker_zone: str = ""
     
     # SerpApi (Google Ads Transparency Center)
     serpapi_api_key: str = ""
@@ -135,11 +139,14 @@ class Settings(BaseSettings):
     enable_tiling_fallback: bool = Field(default=True, description="Tile screenshots when extraction fails")
     tile_height: int = Field(default=1080, description="Height of each screenshot tile in pixels")
     tile_overlap: int = Field(default=200, description="Overlap between adjacent tiles in pixels")
-    # When Playwright is consistently blocked (anti-bot WAF), fall back to
-    # ScreenshotOne's hosted renderer so the user at least has visual
-    # evidence and the page is counted as "blocked, captured externally"
-    # rather than silently lost.
-    screenshotone_fallback_enabled: bool = Field(default=True, description="Use ScreenshotOne to capture pages that Playwright cannot load")
+    # When Playwright is consistently blocked (anti-bot WAF), the
+    # render_strategies ladder escalates to Bright Data Web Unlocker
+    # (configured above). This flag is the master kill-switch; flip it
+    # off only if BD billing is in dispute and you want every scan to
+    # stop at Playwright. host_policy_service.preflight_probe still
+    # picks unlocker strategies but the rung will short-circuit and
+    # return OUTCOME_BLOCKED (no API call made).
+    unlocker_fallback_enabled: bool = Field(default=True, description="Use Bright Data Web Unlocker to render pages that Playwright cannot load")
     
     # Page Discovery
     enable_page_discovery: bool = Field(default=True, description="Auto-discover subpages on dealer sites")

@@ -196,9 +196,11 @@ CREATE TABLE alerts (
 CREATE INDEX idx_alerts_org ON alerts(organization_id);
 CREATE INDEX idx_alerts_unread ON alerts(is_read) WHERE is_read = FALSE;
 
--- Adaptive scan-strategy policy per hostname (mirror of migration 030).
+-- Adaptive scan-strategy policy per hostname (mirror of migrations 030 + 031).
 -- See `services/host_policy_service.py` and
 -- `services/render_strategies.py` for the auto-promotion ladder.
+-- Strategy enum updated in migration 031 to replace ScreenshotOne with
+-- Bright Data Web Unlocker — see `services/unlocker_service.py`.
 CREATE TABLE IF NOT EXISTS host_scan_policy (
     hostname            TEXT PRIMARY KEY,
     strategy            TEXT NOT NULL DEFAULT 'playwright_desktop',
@@ -220,9 +222,8 @@ CREATE TABLE IF NOT EXISTS host_scan_policy (
         strategy IN (
             'playwright_desktop',
             'playwright_mobile_first',
-            'playwright_then_screenshotone',
-            'screenshotone_only',
-            'screenshotone_residential',
+            'playwright_then_unlocker',
+            'unlocker_only',
             'unreachable'
         )
     )

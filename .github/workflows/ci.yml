@@ -24,7 +24,8 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: test-service-role-key
       SUPABASE_JWT_SECRET: test-jwt-secret-that-is-at-least-32-chars-long
       ANTHROPIC_API_KEY: test-anthropic-key
-      SCREENSHOTONE_ACCESS_KEY: test-screenshot-key
+      BRIGHTDATA_API_TOKEN: test-brightdata-token
+      BRIGHTDATA_UNLOCKER_ZONE: test_zone
       REDIS_URL: redis://localhost:6379/0
       STRIPE_SECRET_KEY: sk_test_fake
       STRIPE_WEBHOOK_SECRET: whsec_test_fake

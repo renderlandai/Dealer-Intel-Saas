@@ -128,7 +128,11 @@ const VENDOR_LABELS: Record<string, string> = {
   anthropic: "Claude (Anthropic)",
   apify: "Apify",
   serpapi: "SerpApi",
-  screenshotone: "ScreenshotOne",
+  brightdata_unlocker: "Bright Data (Web Unlocker)",
+  // Historical — old scan_jobs.cost_breakdown rows from before Phase 6.5
+  // still carry the screenshotone vendor key. Keep the label so historical
+  // cost breakdowns render with a friendly name in the UI.
+  screenshotone: "ScreenshotOne (legacy)",
 };
 
 function formatTokens(n: number): string {

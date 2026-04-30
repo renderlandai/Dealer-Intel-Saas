@@ -24,6 +24,13 @@ imagehash==4.3.2
 opencv-python-headless==4.13.0.92
 psd-tools==1.10.10
 
+# HTML parsing — used by unlocker_service to extract <img>/picture/background
+# images out of the HTML returned by Bright Data Web Unlocker (which renders
+# JS server-side, so the response is the post-render DOM). stdlib html.parser
+# is the parser of choice; lxml deliberately not pulled in to avoid the
+# native build dependency.
+beautifulsoup4==4.12.3
+
 # CLIP visual pre-filter (Stage 2 of the AI pipeline).
 # Per the 2026-04-13 audit, omitting these makes ai_service silently skip
 # Stage 2 and route every relevance-pass image straight to Opus, which

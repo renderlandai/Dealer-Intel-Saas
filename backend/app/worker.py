@@ -248,6 +248,27 @@ def main() -> None:
     stop = asyncio.Event()
     _install_signal_handlers(loop, stop)
 
+    # Bright Data Web Unlocker smoke test (Phase 6.5). Same fail-soft
+    # contract as in main.py lifespan — we keep polling for jobs even if
+    # the smoke test fails, but the unlocker rung will be skipped at
+    # runtime so we don't burn credits on broken auth. The worker is the
+    # process that actually consumes the unlocker, so this check matters
+    # at least as much as the API-side one.
+    try:
+        from .services import unlocker_service
+        ok, detail = loop.run_until_complete(unlocker_service.smoke_test())
+        if ok:
+            log.info("Bright Data Web Unlocker smoke test: %s", detail)
+        else:
+            log.error(
+                "Bright Data Web Unlocker smoke test FAILED: %s — unlocker "
+                "rung disabled for %ds. Fix BRIGHTDATA_API_TOKEN / "
+                "BRIGHTDATA_UNLOCKER_ZONE and the next scan will retry.",
+                detail, unlocker_service.SMOKE_TEST_FAILURE_TTL_SECONDS,
+            )
+    except Exception as e:
+        log.warning("Bright Data smoke test raised unexpectedly: %s", e)
+
     try:
         loop.run_until_complete(_run_forever(stop))
     finally:

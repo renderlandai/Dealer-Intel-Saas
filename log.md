@@ -5574,3 +5574,279 @@ commit).
    feed or an Akamai whitelist for our scanner egress IP. Worth a
    single email before sinking more engineering into bypass tooling.
 
+---
+
+## 2026-04-29 — Phase 6 adaptive render-strategy, three follow-on bug fixes, and the false-positive match fix
+
+A single long session that closed the loop on the previous evening's
+"how do we get past blocked and failed" question. We built the
+learning layer that makes the scanner remember what works for each
+host, then spent the rest of the day shaking the production bugs out
+of it. Three commits, two of them shipped while the user watched
+real scan logs.
+
+### What shipped
+
+**1. Phase 6 — adaptive render-strategy per hostname (commit `6c198c0`)**
+
+The Akamai wall is not solvable with a single rendering technique;
+the right answer is a *ladder* of techniques and a *memory* of which
+rung worked for each hostname. This commit added both.
+
+* **`backend/app/services/render_strategies.py` (new, 366 LOC).**
+  `RenderStrategy` is now a string identifier
+  (`playwright_desktop` → `playwright_mobile` →
+  `screenshotone_datacenter` → `screenshotone_residential` →
+  `unreachable`) backed by `STRATEGY_LADDERS`, an ordered list of
+  `RenderAttempt` instances per strategy. `run_ladder()` walks the
+  list, returns on the first `OUTCOME_IMAGES`, and short-circuits as
+  soon as a screenshot rung produces an `evidence_url` (no point
+  burning a residential render after datacenter already captured the
+  page). `_PlaywrightAttempt` and `_ScreenshotOneAttempt` both
+  conform to a `RenderAttempt` protocol with an
+  `is_screenshot_capture: bool` flag the ladder uses to decide
+  whether an evidence-only success counts as terminal.
+* **`backend/app/services/host_policy_service.py` (new, 609 LOC).**
+  Reads/writes `host_scan_policy` rows. `ensure_policy(url)` returns
+  the right ladder strategy for a hostname — known hosts get their
+  saved strategy, unknown hosts trigger a cheap `httpx.get` probe
+  (`preflight_probe`) that sniffs for WAF-vendor headers
+  (`_WAF_FINGERPRINTS` covers Akamai, Cloudflare, Imperva, F5,
+  AWS WAF) and seeds an initial strategy. After every scan,
+  `aggregate_from_pipeline_stats` + `record_host_outcomes` walks the
+  observed outcomes, increments per-host
+  `success_30d / blocked_30d / timeout_30d` counters, and
+  auto-promotes any host that has hit `PROMOTE_THRESHOLD = 2`
+  consecutive failures on its current strategy (e.g.
+  `playwright_desktop → screenshotone_datacenter`). Manual overrides
+  via `manual_override = true` are honored — never auto-promoted.
+  `RESET_ON_SUCCESS` clears confidence the moment a host renders
+  cleanly so a one-day Akamai blip doesn't stick a domain on
+  residential proxies forever.
+* **`supabase/migrations/030_host_scan_policy.sql` + `schema.sql`
+  mirror.** New `host_scan_policy` table: `hostname` PK, `strategy`
+  (CHECK constrained to the five known values), `waf_vendor`,
+  `confidence`, `last_outcome`, `last_block_reason`,
+  `last_http_status`, the three 30-day counters, `last_seen_at`,
+  `last_promoted_at`, `manual_override`, `notes`, `created_at`,
+  `updated_at`. Indexed on `(strategy)` and `(last_seen_at)` for the
+  retention sweep that will eventually live here. Ends with
+  `NOTIFY pgrst, 'reload schema';` so PostgREST picks it up
+  immediately.
+* **`extraction_service.extract_dealer_website` rewrite.** Was
+  ~250 LOC of viewport-switching, mobile-host detection, and
+  ScreenshotOne fallback wiring. Now ~30 LOC: ask
+  `host_policy_service.ensure_policy(url)` for a strategy, build a
+  `RenderContext`, call `render_strategies.run_ladder(ctx,
+  strategy=…)`, return the final `ExtractionResult`. The ladder
+  attempts trail is stamped onto `block_reason` for audit
+  (`ladder(playwright_desktop): playwright_desktop=blocked -> screenshotone_datacenter=blocked`).
+  `MOBILE_FIRST_HOSTS` and the env var that fed it were deleted.
+* **`scan_runners.run_website_scan` post-scan hook.** After the
+  per-dealer aggregation loop, call
+  `host_policy_service.aggregate_from_pipeline_stats(pipeline_stats)`,
+  merge in `success_pages_by_host` (so hosts that worked don't get
+  promoted just because we never logged a success against them),
+  call `record_host_outcomes()`, and stamp any auto-promotions onto
+  `pipeline_stats["host_promotions"]` for the dashboard. Wrapped in
+  a broad `except` — the learning layer never fails a scan.
+* **27 new unit tests** in `test_render_strategies.py` and
+  `test_host_policy_service.py` covering the ladder, strategy
+  promotion order, the early-stop behavior, WAF fingerprinting,
+  policy aggregation, manual overrides, sticky `unreachable`
+  strategy, and the pre-flight probe under 200 / 403-Akamai / 429 /
+  connection-error conditions.
+
+The day-1 result: an empty `host_scan_policy` table that the runner
+backfills as scans complete. By the second scan of any
+previously-blocked host (`rent.cat.com` et al.), Playwright is
+skipped entirely and the request goes straight to whatever rung
+worked last time.
+
+**2. Migration-030 not applied (operator fix)**
+
+User reviewed the first post-deploy scan and reported "no way this
+thing scanned all 49 dealers — looks like it's only getting data
+from `yanceybros.com`." Logs showed
+`host_scan_policy lookup failed for rent.cat.com: PGRST205` on every
+single dealer — i.e. CI's auto-migrate had not actually applied 030
+to Supabase. Diagnosed in three minutes; the user pasted the SQL
+into Supabase Studio's SQL editor. After the manual apply, the next
+scan's logs showed the policy table being read and written correctly
+on every host.
+
+This was a process failure, not a code one — the auto-migrator
+runs on the API container, but the deployment that introduced 030
+failed its first health check (because the API code referenced a
+table that didn't exist yet, classic chicken-and-egg). The
+recommended fix going forward is to split schema migrations from
+code that uses them across two deploys, or to make the runner
+tolerate `PGRST205` and fall back to the default strategy. The
+runner already does the latter via the broad `except` around
+`ensure_policy` — but only logs at WARNING, not ERROR, so the
+problem hid in the noise. See next steps.
+
+**3. Three production bugs surfaced from the first real scan
+(commit `1490e86`)**
+
+Once 030 was live, the user asked us to "fix the bugs and the
+screenshots not being read." Reading the logs alongside the user
+turned up three distinct issues:
+
+* **ScreenshotOne residential calls were 400ing.** We were sending
+  `overrides["proxy"] = "residential"` — the actual ScreenshotOne
+  parameter is `proxy_type`. Every residential render this year
+  has been silently failing back to "blocked." One-line fix in
+  `_ScreenshotOneAttempt.render` plus a regression test
+  (`test_residential_uses_proxy_type_param_when_datacenter_fails`).
+* **The ladder was double-billing on screenshot success.** When
+  `screenshotone_datacenter` returned `OUTCOME_BLOCKED` *with* an
+  `evidence_url` (i.e. it captured the page, the page just isn't
+  full of `<img>` tags), `run_ladder` happily moved on to
+  `screenshotone_residential` and burned a second render for zero
+  new information. Added `is_screenshot_capture: bool = True` to
+  `_ScreenshotOneAttempt`, and a clause in `run_ladder` that
+  short-circuits the moment any `is_screenshot_capture=True` rung
+  produces an `evidence_url`. New test
+  `test_short_circuits_on_first_screenshotone_capture`.
+* **SS1 captures were dead weight.** The previous commit inserted
+  the captured PNG into `discovered_images` with `count=0`, which
+  meant the inline analyzer's `if count > 0:` guard skipped the
+  image entirely. The user could see the screenshot in storage but
+  it was never analyzed. Fixed in `_process_one_dealer` (and the
+  cache-phase counterpart) by setting `count = 1` and incrementing
+  `local_total_discovered` whenever `OUTCOME_BLOCKED` arrives with
+  an `evidence_url`. Crucially we did *not* bump `pages_scanned` —
+  the funnel chip should still distinguish "real DOM extraction"
+  from "screenshot fallback."
+
+All three landed in one commit with the existing 27 ladder/policy
+tests still green plus the two new ones — 147 tests total, all
+passing.
+
+**4. The false-positive "Modified" match (commit `eb48184`)**
+
+The user surfaced a scan result where a 320×50 banner asset had
+matched a `rent.cat.com` page at 82% confidence with a "Modified"
+flag — and the matched image was the dealer's full-page hero shot.
+"Technically wrong. The text is right though. How to fix."
+
+Diagnosis: granularity mismatch in the AI matcher. The SS1 fallback
+captures a 1920×3000 full-page PNG; the campaign asset is 320×50.
+CLIP and Haiku will happily say "yes this big image contains the
+banner" because it actually *does* (the dealer's hero literally uses
+the campaign artwork at hero size), but the verdict the operator
+reads — "modified version of asset X" — is misleading. What the
+operator actually wants is the cropped banner region, scored
+against the asset.
+
+Two-layer fix:
+
+* **Layer 1 — `extraction_service.localize_screenshot_capture()`
+  (new, ~80 LOC).** When the SS1 fallback fires, download the
+  captured PNG bytes, run the existing OpenCV multi-scale +
+  ORB localizer (`_localize_and_crop_assets`, already in service
+  for normal Playwright scans), and insert each detected crop as
+  its own `discovered_images` row tagged
+  `extraction_method=cv_localized_from_screenshot`. The matcher
+  now sees real banner-sized crops with proper coordinates instead
+  of a hero shot. ~50ms per template-match × ~3 assets × ~9 SS1
+  fallbacks per scan ≈ 1.5s of added wall-clock — pocket change.
+* **Layer 2 — analyzer skip rule in three places in
+  `scan_runners.py`.** The full-page evidence row stays
+  (operators need to see *why* a host was blocked) but is never
+  fed back to the matcher. The inline analyzer (live-scan and
+  cache-phase) and `auto_analyze_scan` all check
+  `metadata.capture_method == 'blocked_evidence'` and `continue`
+  past those rows. `auto_analyze_scan` also bulk-marks the
+  evidence rows `is_processed=true` at the end so they don't
+  accumulate as forever-pending across reruns.
+
+When CV localization finds zero crops, the dealer is now honestly
+reported as "blocked, no creatives detected" rather than producing
+a false-positive. This also gives the operator a cheap signal that
+the host's content has changed enough to warrant a manual look.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `backend/app/services/render_strategies.py` | NEW — RenderStrategy ladder, 4 RenderAttempt impls, run_ladder + early-stop, STRATEGY_LADDERS map; later `proxy_type` fix and `is_screenshot_capture` short-circuit |
+| `backend/app/services/host_policy_service.py` | NEW — HostPolicy dataclass, ensure_policy / get_strategy, WAF fingerprinting (`_WAF_FINGERPRINTS`), preflight_probe via httpx, aggregate_from_pipeline_stats / merge_host_successes / record_host_outcomes, auto-promotion gated on PROMOTE_THRESHOLD + RESET_ON_SUCCESS, manual_override honored |
+| `backend/app/services/extraction_service.py` | Removed MOBILE_FIRST_HOSTS + viewport-switching block; `extract_dealer_website` is now a thin shim around `host_policy_service.ensure_policy` + `render_strategies.run_ladder`; later added `localize_screenshot_capture()` (~80 LOC) for CV crop extraction from SS1 captures |
+| `backend/app/services/scan_runners.py` | Post-scan host-policy aggregation hook in `run_website_scan`; SS1 captures now flow into inline analyzer (count=1 + total_discovered++); BLOCKED branch in `_process_one_dealer` and cache-phase block now call `localize_screenshot_capture`; analyzer loops skip `capture_method=blocked_evidence`; `auto_analyze_scan` partitions evidence rows from matchable, runs analysis only on matchable, bulk-marks evidence processed |
+| `supabase/migrations/030_host_scan_policy.sql` | NEW — host_scan_policy table, CHECK constraint on strategy, two indexes, `NOTIFY pgrst, 'reload schema'` |
+| `supabase/schema.sql` | Mirrored 030 above the dashboard views block |
+| `backend/tests/test_render_strategies.py` | NEW + extended — TestStrategyMapping, TestRunLadder (incl. short-circuit + proxy_type regression tests), updated `test_screenshotone_only_strategy_skips_playwright` to expect the new short-circuit |
+| `backend/tests/test_host_policy_service.py` | NEW — TestDetectWaf, TestAggregateFromPipelineStats, TestRecordHostOutcomes (auto-promotion, confidence reset, manual override, sticky unreachable), TestPreflightProbe (200, 403-Akamai, 429, connection error) |
+| `log.md` | this entry + the missing 2026-04-28-evening backfill |
+
+### Commits
+
+* `6c198c0` — Phase 6 (1-3): adaptive render-strategy policy per hostname (1725 insertions, 70 deletions; 8 files)
+* `1490e86` — Phase 6 hotfix: read SS1 screenshots, fix proxy_type, short-circuit ladder (89 insertions, 14 deletions; 3 files; 147 tests green)
+* `eb48184` — fix: localize ScreenshotOne captures + exclude full-page evidence from matcher (410 insertions, 16 deletions; 3 files)
+
+All three pushed to `main`; DigitalOcean `deploy_on_push` rebuilt
+both `api` and `scan-worker` for each. The middle commit went out
+while the user was watching the post-030 logs and the third was
+written and shipped within 20 minutes of the user posting the
+false-positive screenshot.
+
+### Next steps for tomorrow (ordered by ROI)
+
+1. **Watch the next full scan and read `host_scan_policy` directly.**
+   With the table backfilled by today's failed run and 030 now
+   live, the second pass on `rent.cat.com` should skip Playwright
+   entirely and go straight to ScreenshotOne datacenter. If it
+   doesn't, the auto-promotion logic isn't firing — most likely
+   cause would be `success_pages_by_host` being populated from a
+   different aggregator and resetting the confidence counter
+   inappropriately. Easiest verification:
+   `select hostname, strategy, confidence, blocked_30d, last_promoted_at from host_scan_policy order by last_seen_at desc limit 20;`.
+2. **Promote `host_scan_policy` PGRST205 from WARNING to ERROR
+   (transient).** Today's miss happened because the lookup failure
+   logged at WARNING and got buried. Once we're confident the
+   table is reliably present, raise the severity for ~1 week so we
+   notice schema drift fast. Then drop it back to WARNING.
+3. **Add a "matchable / evidence-only" split to the dashboard.** The
+   funnel chip currently shows `pages_scanned`. With Layer 2 in
+   place, dealers that produce only evidence rows look like "0
+   creatives" which is technically true but unhelpful. Add a
+   sibling chip: `N captured (evidence-only, no creatives detected)`
+   so operators can tell "blocked + nothing on the page" apart from
+   "blocked + we couldn't find the asset on a captured page."
+4. **CV localizer threshold tuning.** The localizer's correlation
+   threshold was tuned for normal Playwright scans where the
+   screenshot is roughly the same scale as the asset. SS1 captures
+   are much larger; the multi-scale sweep handles this in theory
+   but ORB feature counts may be sparse on small banners. Worth a
+   one-day spike measuring crop-yield on the 9 hosts that
+   ScreenshotOne already gets through.
+5. **Residential proxy budget cap.** With `proxy_type` actually
+   working now, residential calls will go from "always 400" to
+   "actually charged at ~$0.01/render." A scan that promotes 20
+   hosts to residential in one pass is suddenly $0.20 — fine — but
+   we should add a daily cap (`SCREENSHOTONE_RESIDENTIAL_DAILY_CAP`)
+   that returns `OUTCOME_BLOCKED` once exceeded so a misbehaving
+   policy table can't run up a bill overnight.
+6. **Evidence-row retention sweep.** `auto_analyze_scan` now
+   bulk-marks evidence rows processed, but they still occupy
+   `discovered_images` with full Supabase storage URLs behind them.
+   Retention service should TTL out the storage objects (and
+   nullify `image_url`) after N days so the bucket doesn't grow
+   linearly with blocked-host count.
+7. **Phase 6 doc + runbook.** A short `docs/host-scan-policy.md`
+   covering: how to inspect the table, how to manually pin a
+   strategy (`update host_scan_policy set strategy='…',
+   manual_override=true where hostname='…';`), how to nuke a row
+   to force re-probing, and the auto-promotion rules. Two pages,
+   saves an on-call hour the first time something acts weird.
+8. **Unit-test coverage for `localize_screenshot_capture`.** The
+   helper has integration coverage via the runner but no direct
+   unit test. Mock `ai_service.download_image` and
+   `_localize_and_crop_assets` and assert the discovered_images
+   inserts use the expected `extraction_method` and `metadata`.
+   Cheap insurance against a future refactor breaking the Layer 1
+   contract.
+

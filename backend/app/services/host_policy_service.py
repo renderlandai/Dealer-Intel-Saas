@@ -333,7 +333,7 @@ def record_host_outcomes(
     """Persist outcomes and apply auto-promotion. Returns a list of
     ``(hostname, old_strategy, new_strategy)`` tuples for any host that
     was promoted this round — the caller can use this to send a Slack
-    alert ("auto-promoted rent.cat.com → screenshotone_residential").
+    alert ("auto-promoted rent.cat.com → unlocker_only").
 
     Best-effort throughout: a per-host write failure logs a warning and
     continues with the next host. The aggregate processed is guaranteed
@@ -489,15 +489,19 @@ async def preflight_probe(url: str) -> PreflightResult:
     * 2xx with Akamai/Cloudflare/etc. → ``playwright_desktop`` (it
                                          worked, but we record the WAF
                                          vendor for future routing)
-    * 401 / 403 / 451                 → ``screenshotone_only`` (clean
-                                         WAF reject; Playwright will
-                                         get the same)
-    * 429                             → ``playwright_then_screenshotone``
-                                         (rate-limited, residential proxy
-                                         won't help yet — try once)
-    * Connection error / timeout      → ``playwright_then_screenshotone``
+    * 401 / 403 / 451                 → ``unlocker_only`` (clean WAF
+                                         reject; Playwright will get the
+                                         same — go straight to Bright
+                                         Data and skip the doomed local
+                                         render)
+    * 429                             → ``playwright_then_unlocker``
+                                         (rate-limited, give Playwright
+                                         one shot; if it fails, the
+                                         unlocker's residential pool
+                                         will probably succeed)
+    * Connection error / timeout      → ``playwright_then_unlocker``
                                          (might be a flake; one
-                                         Playwright shot, then SS1)
+                                         Playwright shot, then BD)
     * 5xx                             → ``playwright_desktop`` (server
                                          error, not a block)
 
@@ -529,15 +533,15 @@ async def preflight_probe(url: str) -> PreflightResult:
             waf = detect_waf(resp.headers)
 
             if status in (401, 403, 451):
-                suggested = rs.STRATEGY_SCREENSHOTONE_ONLY
+                suggested = rs.STRATEGY_UNLOCKER_ONLY
             elif status == 429:
-                suggested = rs.STRATEGY_PLAYWRIGHT_THEN_SCREENSHOTONE
+                suggested = rs.STRATEGY_PLAYWRIGHT_THEN_UNLOCKER
             elif 200 <= status < 400:
                 suggested = rs.STRATEGY_PLAYWRIGHT_DESKTOP
             elif 500 <= status < 600:
                 suggested = rs.STRATEGY_PLAYWRIGHT_DESKTOP
             else:
-                suggested = rs.STRATEGY_PLAYWRIGHT_THEN_SCREENSHOTONE
+                suggested = rs.STRATEGY_PLAYWRIGHT_THEN_UNLOCKER
 
             log.info(
                 "Preflight %s -> status=%s waf=%s suggested=%s",
@@ -552,7 +556,7 @@ async def preflight_probe(url: str) -> PreflightResult:
         return PreflightResult(
             status=None,
             waf_vendor=None,
-            suggested_strategy=rs.STRATEGY_PLAYWRIGHT_THEN_SCREENSHOTONE,
+            suggested_strategy=rs.STRATEGY_PLAYWRIGHT_THEN_UNLOCKER,
             error=str(e)[:200],
         )
 
