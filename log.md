@@ -5957,3 +5957,181 @@ Full result on the touched modules: **59 passed, 0 failed.** The pre-existing 28
 1. **`page_cache_service.record_page_hits` `.maybe_single()` quirk.** Even with the table present, the inserts use `.maybe_single().execute()` which raises with `code: '204'` on an empty result set in this version of supabase-py. The whole record loop catches and logs as `WARNING  Failed to record page hit`. Replace with `.limit(1).execute()` and check `result.data` explicitly.
 2. **Per-host `unlocker_only` discovery cost cap.** A pathological host that returns thousands of `<a href>` links would still be capped by `max_pages` slot allocation, but the BD call itself returns the entire DOM. Worth setting an explicit response-size limit in `_post_unlocker` (currently unbounded) so a malicious or misconfigured host can't run up the BD bill.
 3. **Sitemap-via-unlocker.** For really large dealer sites, the homepage `<a href>` set might miss long-tail promo URLs that only sitemap.xml carries. Worth experimenting with a second BD call to `/sitemap.xml` for hosts where the link count comes back small — but only if we see evidence of missed matches.
+
+---
+
+## 2026-04-30 — Session summary: ScreenshotOne → Bright Data Web Unlocker, top to bottom
+
+A single day, three commits, one structural problem chased through every layer of the scan pipeline. Started with "rent.cat.com still produces zero matches even after Phase 6's ladder" and ended with discovery, extraction, asset download, URL filtering, page caching, and operator logging all rebuilt around Bright Data. Each commit shipped on the back of a real production scan that exposed the next layer's bug.
+
+### The arc
+
+**Morning — Phase 6.5 (commit `830bf1d`, 12:02 ET): replace ScreenshotOne with Bright Data Web Unlocker.**
+
+The Phase 6 ladder was structurally sound but the bottom rung was lying. ScreenshotOne does not actually accept the `proxy_type=residential` parameter we'd been sending — every call returned HTTP 400 silently, and the `screenshotone_residential` strategy was a single-rung ladder, so any host that landed on it produced zero rows forever. Two compounding flaws masquerading as "the WAF is too tough."
+
+Fix was structural, not patch-level:
+
+- **New `services/unlocker_service.py` (601 LOC).** POSTs to `api.brightdata.com/request`, parses the rendered HTML with BeautifulSoup (mirrors the JS `<img>` / `<picture>` / inline-bg extraction we already do for Playwright), inserts each image as its own `discovered_images` row. No more screenshot + cv-localizer dance for blocked hosts — they get real per-image rows with real URLs.
+- **`render_strategies.py` ladder rebuilt.** All `_ScreenshotOneAttempt` rungs swapped for `_UnlockerAttempt`. New invariant: every multi-rung ladder must have ≥2 rungs across ≥2 providers. Single-rung ladders are documented exceptions only (`unlocker_only`, `unreachable`).
+- **`host_policy_service` preflight updated.** 403 / 451 → `unlocker_only`; 429 / timeouts → `playwright_then_unlocker`.
+- **`cost_tracker.record_unlocker(succeeded=…)` at $0.0015/req PAYG.** Failed attempts log $0 line items so the audit trail still shows what was attempted. The `screenshotone` vendor label was kept on the frontend so historical `scan_jobs` rows still render.
+- **Boot-time smoke test in both `api` and `scan-worker`.** If BD auth is broken at deploy time, the rung is disabled at runtime with a 5-min auto-retry — a misconfigured deploy never silently burns credits on guaranteed errors. This was the explicit lesson from the SS1 incident: a dead provider is worse than no provider, because the ladder thinks it tried.
+- **Migration 031.** Drops the old `strategy` CHECK, maps `playwright_then_screenshotone` → `playwright_then_unlocker` and `screenshotone_{only,residential}` → `unlocker_only`, resets confidence on migrated rows so the unlocker gets a fair first scan, re-adds CHECK with the new five-strategy enum. Idempotent.
+- **Tests rewritten.** `test_render_strategies` now asserts no strategy name contains `"screenshotone"` and that every ladder has ≥2 rungs (the regression that would have caught the original bug). `test_host_policy_service` strategy names updated. `conftest` + `ci.yml` swap `SCREENSHOTONE_ACCESS_KEY` for `BRIGHTDATA_API_TOKEN` + `BRIGHTDATA_UNLOCKER_ZONE`.
+
+**Late morning — Phase 6.5.1 (commit `f2bd167`, 12:26 ET): route asset downloads via unlocker, drop AEM component URLs.**
+
+First post-6.5 production scan against `rent.cat.com` revealed two more layers had the same Akamai problem:
+
+1. **Asset downloads still went through plain `httpx`.** Bright Data unlocked the page and parsed 4 image URLs — then `ai_service.download_image()` called `httpx.get()` on those URLs against the same Akamai instance that gates the page. Every call hung 30s and timed out. Net: 4 successful unlocks, 0 successful downloads, 0 matches. The same wall, one layer down.
+2. **Two of the 4 "image URLs" were AEM component paths.** `/_jcr_content/root/responsivegrid_<id>` — Adobe Experience Manager `<img src="">` placeholders that the page's own JS swaps to real images at runtime. Even with bypass, those URLs would never resolve to bytes.
+
+Fixes:
+
+- **`unlocker_service._post_unlocker` refactored to return bytes** (not text) so the same call works for HTML and binary. `_post_unlocker_text` wrapper added for the HTML path. New `download_via_unlocker(url)` fetches asset bytes through BD. Cost recorded per fetch (~$0.0015), only on successful unlock.
+- **Per-process `_unlocked_hosts` set** populated on any successful page unlock. `ai_service.download_image` checks this set before any direct fetch and routes through BD when the host is flagged. O(1) lookup, zero DB hits, self-populating across the worker's lifetime.
+- **`parse_images_from_html` now applies `_looks_like_image_url` filter** — accepts known image extensions (jpg/png/webp/etc) and known CDN markers (`.coreimg.`, `/dam/`), rejects extension-less `/_jcr_content/` component paths. Drops the `responsivegrid_*` class of leak before it ever hits the analyzer.
+- **`ai_service.download_image` now sends Chrome-equivalent headers** (User-Agent, Accept, Sec-Fetch-*) on every direct fetch too. Helps with non-WAF dealer sites that have basic UA-based anti-bot rules.
+- **17 new tests in `test_unlocker_service.py`** covering URL-shape filter (extensions, query strings, AEM coreimg paths, `/dam/` paths, component-path rejection), per-host registry (case-insensitive lookup, per-host marking, no leak across hosts), `parse_images_from_html` end-to-end on AEM markup, and `unlock_and_extract` auto-marking on success.
+
+**Afternoon — Phase 6.5.2 (commit `b666e1f`, 13:04 ET): page discovery via unlocker, page-cache table re-applied, log truncation fix.**
+
+Next production scan: extraction was now working on unlocked pages, but `rent.cat.com` was still only scanning `1/1 pages`. The discovery layer had the *same* Akamai problem as extraction, plus a second unrelated bug surfaced in the same logs, plus a third "this is actually fine but the log made it look broken" issue. Full detail in the section above; one-line summary of each:
+
+- **Fix #1: discovery via unlocker.** `_crawl_homepage_links_via_unlocker` POSTs the homepage to BD, parses `<a href>` from the rendered DOM, hoists promo-keyword URLs to the front. WAF-strategy hosts skip direct probes entirely (saves ~100ms of TCP/TLS aborts per scan). Defence-in-depth fallback fires on any host where direct discovery returned only the base URL. ~$0.0015 per WAF-protected dealer per scan.
+- **Fix #2: `page_hit_cache` table re-applied.** Migration 016 was added in November 2026 but never copied into `supabase/schema.sql`. Any environment bootstrapped from `schema.sql` was missing the table; `page_cache_service` failed soft so scans completed but the entire skip-empty-pages optimisation was dead. Migration `032_ensure_page_hit_cache.sql` re-applies it idempotently; `schema.sql` updated for future bootstraps.
+- **Fix #3: log truncation made AEM renditions look like duplicates.** `image_url[:80]` chopped off the discriminating filename on AEM URLs, making three distinct renditions render as the same line. New `_shorten_url_for_log` helper keeps `head + "..." + tail` so the filename survives. No real bug in the pipeline — confirmed via the `total_images=4, hash_rejected=3, matched_new=1` funnel — just a misleading log line that consumed an hour of debug time.
+
+### What this session changes structurally
+
+1. **The "scan blocked WAF dealer" path is now end-to-end through Bright Data.** Discovery, page rendering, image extraction, asset download, and host marking all share the same `_unlocked_hosts` registry and the same `download_via_unlocker` plumbing. There is no remaining `httpx`-direct call on the hot path for a flagged host.
+2. **No silent provider failures on the bottom rung.** Boot-time smoke test + ≥2-rungs-per-ladder structural rule + `is_screenshot_capture` short-circuit means a misconfigured or dead BD account fails loud and obvious, not silent and zero-match.
+3. **Cost is tracked per BD operation, not per scan.** Page unlock, asset download, and discovery crawl each record their own `record_unlocker` line item. We can now answer "what did this dealer cost?" and "what did Bright Data cost us this week?" from the same `cost_log` table.
+4. **The audit log finally tells the truth on AEM URLs.** Before today, three-rendition AEM components looked like a retry loop in the operator's terminal. After today, the filename portion survives truncation, so the operator sees what the pipeline actually saw.
+
+### Numbers
+
+- **3 commits** (`830bf1d`, `f2bd167`, `b666e1f`) all pushed to `main`.
+- **`backend/app/services/unlocker_service.py`** went from new file to 790+ LOC across the day (extraction → asset routing → discovery).
+- **`backend/app/services/screenshot_service.py`** deleted (-331 LOC).
+- **30 + 17 + 12 = 59 new tests** across `test_unlocker_service.py`, `test_render_strategies.py`, and `test_page_discovery.py`. All green on touched modules.
+- **2 new migrations** shipped: `031_replace_screenshotone_with_unlocker.sql`, `032_ensure_page_hit_cache.sql`.
+- **Cost change for a WAF-protected dealer:** roughly +$0.003/scan (discovery + page unlock + ~3 asset downloads at $0.0015 each). At 50 such dealers that's $0.15/scan run vs. the $0.044/match Claude charge the same scan was already paying. Negligible.
+
+### What we did NOT do (deferred follow-ups)
+
+- **`page_cache_service.record_page_hits` `.maybe_single()` quirk.** Even with the table present, inserts raise `code: '204'` on empty result sets in this supabase-py version. Catch-and-warn for now; replace with `.limit(1).execute()` later.
+- **Per-host BD response-size cap.** A pathological host returning thousands of `<a href>` links is bounded by `max_pages` slot allocation but the BD response itself is unbounded. Worth an explicit cap in `_post_unlocker` before a malicious host runs up the bill.
+- **Sitemap-via-unlocker for very large dealers.** Homepage `<a href>` might miss long-tail promo URLs only sitemap.xml carries. Defer until we see evidence of missed matches.
+- **The on-call runbook for `host_scan_policy`.** Still not written. Next operator surprise will pay for it.
+
+---
+
+## 2026-05-01 — Phase 6.5.3 — kill the `{{path}}.html` template leak + URL safety gate
+
+### Why now
+
+Live triage on scan_job `d7a396de-3ed1-4350-93ae-be0eb6172241` (46 dealers, $7.28, 3 matches). Two production findings drove this commit, plus one investigation that is NOT a code bug.
+
+**Finding 1 — Bright Data is being asked to fetch literal Mustache template strings.** `pipeline_stats.blocked_details` shows 17 dealer pages blocked with `brightdata_http_400` on URLs of the shape `https://rent.cat.com/<dealer>/en_US/{{path}}.html`. Affected dealers: battlefield, blanchard, cresco, finning-canada, hawthorne-rentals, holtca, kellytractor, macallister-rentals, milton, nmcrental, peterson-cat, quinn, riggs-rental, stowers, tractorandequipment, warren, ziegler-rental. That's 17 BD requests per scan (~$0.026) and 17 dealer pages effectively unscanned (~30% of the dealer footprint), every single recurring scan, returning a 400 Bright Data cannot do anything about. Root cause: AEM's home page templates emit `<a href="{{path}}.html">` when the server-side render fails to substitute the variable. `_crawl_homepage_links_via_unlocker` was extracting these literal hrefs with a regex, `urljoin`-ing them to the dealer base URL, and forwarding them to extraction.
+
+**Finding 2 — `_post_unlocker` will happily forward URLs containing whitespace, non-ASCII, and unrendered placeholders.** Same shape as #1 but at a different layer: even if discovery were perfect, an asset URL that came in from `parse_images_from_html` with a literal space, an unencoded ó (Spanish-language dealer URLs like `cogesa`, `finning-chile`), or a Mustache placeholder would still be POSTed verbatim to BD and 400 there. We caught the AEM case in #1 because discovery was the source; we'd catch the others later, individually, in production. Better to install one gate at the BD boundary that handles all three.
+
+**Investigation — "skipped creative" `b81f16a0-3c58-4996-9e4d-d2ad56496432` is NOT a code bug.** Operator reported the asset never matched on `https://rent.cat.com/altorfer-rents/en_US/home.html`. Pulled every image extracted from every `altorfer-rents/*` page in the latest scan (40 images across 12 pages) and computed a 4-hash perceptual distance (`phash`+`dhash`+`whash`+`average_hash`, threshold `≤28`) against the asset's actual bytes. Best score on `altorfer-rents/home.html` was `42.5` (current `homepagehero/image.img.png`) — well above the prefilter cutoff. Side-by-side render showed why: the asset is a Retina screenshot of the page's "WHY ALTORFER RENTS IS HERE FOR YOU" three-column **HTML+CSS** block (black background, big yellow heading, 3 small icons + body copy). It is not a single image on the page — the dealer site renders that section from text + 3 separate icon files. Filed as a category limitation rather than a bug. Documented inline in this entry so the next operator who sees a "missing match" on a screenshot of an HTML section gets the context immediately.
+
+### Fix #1 — `_href_is_safe` gate at the discovery layer
+
+New helper in `services/page_discovery.py`:
+
+```python
+_TEMPLATE_PLACEHOLDER_MARKERS = ("{{", "}}", "${", "<%", "%>", "[%", "%]")
+
+def _href_is_safe(href: str) -> bool:
+    if not href or len(href) > 2048:
+        return False
+    if any(m in href for m in _TEMPLATE_PLACEHOLDER_MARKERS):
+        return False
+    return all(not c.isspace() and ord(c) >= 0x20 for c in href)
+```
+
+Applied in BOTH `_crawl_homepage_links` (direct httpx path) and `_crawl_homepage_links_via_unlocker` (BD path) before the `urljoin` call. Drops counted in a debug log line so operators can spot AEM render leaks without running queries. Same set is also enforced inside `_is_scannable_page` so anything that arrives via sitemap parsing or any other channel is gated too.
+
+Why a substring match instead of a tighter regex: the seven markers are unique enough that no real URL contains them (`{` and `}` are reserved per RFC 3986), and the substring scan is O(n×k) with k=7, which is faster than compiling and matching one alternation regex per href.
+
+### Fix #2 — `_normalize_target_url` gate at the Bright Data boundary
+
+New helper in `services/unlocker_service.py`:
+
+```python
+def _normalize_target_url(url: str) -> Tuple[Optional[str], Optional[str]]:
+    # Returns (safe_url, error_reason). On reject, safe_url is None and
+    # error_reason is one of:
+    #   brightdata_url_empty
+    #   brightdata_url_too_long
+    #   brightdata_url_template_placeholder
+    #   brightdata_url_unparseable
+    #   brightdata_url_non_ascii_host
+    ...
+    safe_path  = quote(parts.path,  safe="/%-._~!$&'()*+,;=:@")
+    safe_query = quote(parts.query, safe="=&%-._~!$'()*+,;:@/?")
+    return urlunparse((parts.scheme, parts.netloc, safe_path, parts.params, safe_query, "")), None
+```
+
+Called at the top of `_post_unlocker`. On reject, returns the structured error code without an HTTP call — the BD request is never sent, the cost is never recorded, and the error code lands in `blocked_details` so the operator can see in `pipeline_stats` exactly which dealer URL produced which failure mode.
+
+Three properties the encoding logic preserves:
+
+1. **No double encoding.** `%` is in the `safe` set for both path and query, so `https://x.com/promo%20page` round-trips to itself, not to `https://x.com/promo%2520page`.
+2. **Spaces and non-ASCII are encoded.** `https://x.com/promo page` → `https://x.com/promo%20page`. `…/promoción.html` → `…/promoci%C3%B3n.html` (UTF-8 percent bytes — what BD's URL parser expects).
+3. **Fragments are dropped.** Fragments are client-only and never sent over HTTP anyway; stripping them defensively saves one round-trip class of canonicalization mismatch with BD.
+
+The placeholder marker set is **duplicated** between `page_discovery._TEMPLATE_PLACEHOLDER_MARKERS` and `unlocker_service._TEMPLATE_PLACEHOLDER_MARKERS` rather than shared. Reasoning: page_discovery late-imports unlocker_service (optional dependency), so a top-level import the other direction would create a cycle. Two five-line tuple definitions cost less than the cycle.
+
+### Why two gates instead of one
+
+Defence in depth. The `_href_is_safe` gate catches placeholder leaks at the source (discovery), where we can also drop them with zero cost, and where the operator can see in `pipeline_stats.pages_discovered` that they never entered the scan budget in the first place. The `_normalize_target_url` gate catches anything that slipped past discovery — sitemap-sourced URLs, asset URLs from `parse_images_from_html`, retry paths — without depending on every upstream caller having done the right filtering. If either gate alone fired, we'd still have a weakness; both gates together close the loop.
+
+### Tests
+
+New `TestHrefIsSafe` class in `tests/test_page_discovery.py` (7 cases) covers Mustache, ES6 template literals, ASP/JSP scriptlets, Template Toolkit, inline whitespace, control characters, and overlong URLs. New `TestUnlockerCrawlerDropsTemplateHrefs` (1 case) is the integration test: feed AEM-style HTML with both clean and placeholder-leaking hrefs to `_crawl_homepage_links_via_unlocker` and assert only the clean ones survive.
+
+New `TestNormalizeTargetUrl` (8 cases) and `TestPostUnlockerSkipsBadUrls` (2 cases) in `tests/test_unlocker_service.py`. The `TestPostUnlockerSkipsBadUrls::test_template_placeholder_short_circuits_before_http` case patches `httpx.AsyncClient` to raise on construction — so if the gate ever leaks, the test explodes loudly rather than silently making real requests. The `test_clean_url_is_passed_through_to_payload` case captures the actual payload BD would receive and asserts the path was percent-encoded.
+
+Run on touched modules in isolation: **31 passed (`test_unlocker_service.py`), 12 passed (`test_page_discovery.py` excluding the pre-existing Python-3.9 event-loop infra issue in `TestUnlockerHomepageCrawl`).** All new Phase 6.5.3 tests: **19 passed.** Local Python is 3.9 and shows pre-existing event-loop sharing failures across some `_run(asyncio.run(...))` chains; CI runs Python 3.11 (`.github/workflows/ci.yml:10`) where this issue does not occur.
+
+### Files
+
+- `backend/app/services/page_discovery.py` — `_href_is_safe` helper, integrated into both crawlers and `_is_scannable_page`, debug log line for dropped placeholders.
+- `backend/app/services/unlocker_service.py` — `_normalize_target_url` helper, integrated into `_post_unlocker`. Added `quote` and `urlunparse` to imports.
+- `backend/tests/test_page_discovery.py` — `TestHrefIsSafe` (7 cases) + `TestUnlockerCrawlerDropsTemplateHrefs` (1 case).
+- `backend/tests/test_unlocker_service.py` — `TestNormalizeTargetUrl` (8 cases) + `TestPostUnlockerSkipsBadUrls` (2 cases).
+
+### Verification on next scan
+
+- `pipeline_stats.blocked_details` should NOT contain any `{{path}}.html` URLs. Any new `brightdata_url_*` codes (template_placeholder / non_ascii_host / unparseable / too_long / empty) appear there instead, with the originating page url so the operator can fix the source.
+- `pipeline_stats.pages_blocked` for rent.cat.com dealers drops by ~17 (was 17 in the 2026-04-30 scan; expected 0 going forward). Page coverage on the 17 affected dealers goes from 1 page to whatever the homepage `<a href>` set actually has (typical: 5–12).
+- `cost.line_items` shows ~17 fewer `brightdata_unlocker` operations per scan (≈ −$0.026/scan), so the total scan cost on a 46-dealer rent.cat.com run drops modestly.
+
+### Investigation summary — `b81f16a0` is a screenshot of an HTML section, not an image
+
+| altorfer-rents image | source page | avg pHash distance vs asset | gate verdict |
+|---|---|---:|---|
+| `homepagehero/image.img.png/1754073614666` | home | 42.5 | reject |
+| `ttac_1604119479` (older hero) | home | 42.5 | reject |
+| `markeingcontent/grey.jpeg` | home | 23.0 | pass (flat colour collision) |
+| `services/rental-store-25a` | services | 23.2 | pass |
+| `about/rental-store-14a` | about | 26.2 | pass |
+| `locations: telehandler C10452791` | various | 27.8 | pass |
+| (8 more, all rejected) | various | 32–37 | reject |
+
+Four images survived the prefilter; none survived the downstream CLIP / Claude verifier — the scanner correctly decided none of them are the asset. Visual confirmation: the asset is a 2462×950 Retina screenshot of the page's three-column "WHY ALTORFER RENTS IS HERE FOR YOU" promo block, which the dealer site composes from HTML + CSS + 3 separate small icons (`iconservicesupport.png`, `iconequipment.png`, `iconadvice.png`), not a single hosted image. Action for operator: re-upload either the underlying icons individually, or extract just the hero/banner area as a discrete asset. No code change.
+
+### Open follow-ups (still not in this commit)
+
+1. (carried) `page_cache_service.record_page_hits` `.maybe_single()` raising `204`.
+2. (carried) Explicit response-size cap in `_post_unlocker` so a malicious host can't run up the BD bill.
+3. (carried) Sitemap-via-unlocker for very large dealer sites.
+4. (carried) On-call runbook for `host_scan_policy`.
+5. **Distributor mapping bug.** `matches.distributor_id` for the latest scan was hard-coded to a single seed value (`2a2d3712`, "Finning Chile") for every `rent.cat.com` match, including matches found on `/carolina/`, `/ohiocat/`, etc. The dispatcher seeds one distributor per host instead of resolving the actual sub-path → dealer at match-write time. Cosmetic for now (the source_url carries the truth) but will mis-attribute dealer-level analytics until fixed.
+6. **Local-dev `.env` parsing.** `BRIGHTDATA_API_TOKEN= cf567277-…` (note leading space after `=`) loaded with the leading whitespace via plain `grep | cut`. pydantic-settings strips it correctly so production is unaffected; the `_api_token()` helper already calls `.strip()`. Worth making the .env.example loud about no-space convention.

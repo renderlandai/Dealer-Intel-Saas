@@ -42,7 +42,7 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse, urlunparse
 from uuid import UUID
 
 import httpx
@@ -188,6 +188,80 @@ def _mark_available() -> None:
 
 
 # ---------------------------------------------------------------------------
+# URL safety
+# ---------------------------------------------------------------------------
+
+# Substrings that mark an unrendered template placeholder. Same set as
+# page_discovery._TEMPLATE_PLACEHOLDER_MARKERS — kept duplicated so this
+# module remains importable even if page_discovery is being patched.
+# A URL containing any of these is guaranteed-400 at Bright Data and we
+# skip the round trip entirely.
+_TEMPLATE_PLACEHOLDER_MARKERS: Tuple[str, ...] = (
+    "{{", "}}", "${", "<%", "%>", "[%", "%]",
+)
+
+
+def _normalize_target_url(url: str) -> Tuple[Optional[str], Optional[str]]:
+    """Sanitize a URL before posting it to Bright Data.
+
+    Returns ``(safe_url, error_reason)``. On success, ``safe_url`` is a
+    properly percent-encoded URL and ``error_reason`` is None. On
+    failure, ``safe_url`` is None and ``error_reason`` carries a short
+    code suitable for a ``blocked_details`` row.
+
+    Two failure shapes:
+
+    * The URL contains an unrendered template placeholder
+      (``{{path}}.html``, ``${url}``, ...). These are page-side bugs
+      that resolved to real-looking URLs; sending them burns a Bright
+      Data request that always returns HTTP 400.
+    * The URL is structurally unparseable (no scheme, no host).
+
+    On success, the path and query are re-quoted with ``urllib.quote``
+    using a permissive ``safe`` character set so:
+
+    * Spaces and other ASCII whitespace become ``%20`` etc.
+    * Non-ASCII characters become percent-encoded UTF-8.
+    * Already-encoded URLs are NOT double-encoded (``%`` is in safe).
+
+    This prevents the second class of HTTP 400s we saw in production:
+    Spanish-language dealer URLs (``cogesa``, ``finning-chile``) and
+    paste-mangled hrefs that contained literal spaces.
+    """
+    if not url:
+        return None, "brightdata_url_empty"
+    if len(url) > 2048:
+        return None, "brightdata_url_too_long"
+    for marker in _TEMPLATE_PLACEHOLDER_MARKERS:
+        if marker in url:
+            return None, "brightdata_url_template_placeholder"
+    try:
+        parts = urlparse(url)
+    except ValueError:
+        return None, "brightdata_url_unparseable"
+    if not parts.scheme or not parts.netloc:
+        return None, "brightdata_url_unparseable"
+    # The netloc must already be ASCII (IDN hosts that aren't punycoded
+    # would need a separate idna step; not seen in production yet).
+    try:
+        parts.netloc.encode("ascii")
+    except UnicodeEncodeError:
+        return None, "brightdata_url_non_ascii_host"
+
+    safe_path = quote(parts.path, safe="/%-._~!$&'()*+,;=:@")
+    safe_query = quote(parts.query, safe="=&%-._~!$'()*+,;:@/?")
+    safe = urlunparse((
+        parts.scheme,
+        parts.netloc,
+        safe_path,
+        parts.params,
+        safe_query,
+        "",  # drop fragment — never sent in HTTP requests anyway
+    ))
+    return safe, None
+
+
+# ---------------------------------------------------------------------------
 # Configuration helpers
 # ---------------------------------------------------------------------------
 
@@ -233,9 +307,20 @@ async def _post_unlocker(
     if not token or not zone:
         return None, None, "brightdata_unconfigured"
 
+    safe_url, url_err = _normalize_target_url(url)
+    if safe_url is None:
+        # Don't pay for a guaranteed-400 round trip. The blocked_details
+        # row carries the structured reason so the operator can see in
+        # pipeline_stats which dealer page produced the bad URL.
+        log.warning(
+            "Skipping Bright Data call — %s for url=%s",
+            url_err, _shorten_url_for_log(url),
+        )
+        return None, None, url_err
+
     payload: Dict[str, Any] = {
         "zone": zone,
-        "url": url,
+        "url": safe_url,
         # `format=raw` returns the response body verbatim (rendered HTML
         # for HTML pages, binary for media). We never request `json` —
         # that wraps the body in metadata we don't need.

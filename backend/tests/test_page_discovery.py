@@ -299,3 +299,91 @@ class TestUnlockerHomepageCrawl:
             ))
 
         assert unlocker_service.host_needs_unlocker("rent.cat.com") is True
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.5.3 — template-placeholder href filter
+# ---------------------------------------------------------------------------
+
+class TestHrefIsSafe:
+    """``_href_is_safe`` is the gate that drops unrendered template
+    placeholders before they become bogus URLs in the discovery list.
+    The 2026-04-30 production scan recorded HTTP 400 from Bright Data
+    on 17 dealer URLs, every one of which was a literal
+    ``…/{{path}}.html`` href the AEM page failed to substitute."""
+
+    def test_rejects_mustache_placeholders(self):
+        from app.services.page_discovery import _href_is_safe
+        assert _href_is_safe("/{{path}}.html") is False
+        assert _href_is_safe("{{url}}") is False
+        assert _href_is_safe("/page/{{slug}}/sub") is False
+
+    def test_rejects_es6_template_literals(self):
+        from app.services.page_discovery import _href_is_safe
+        assert _href_is_safe("/promo/${name}") is False
+
+    def test_rejects_asp_jsp_scriptlets(self):
+        from app.services.page_discovery import _href_is_safe
+        assert _href_is_safe("/<%= var %>") is False
+        assert _href_is_safe("/[% page %]/foo") is False
+
+    def test_rejects_inline_whitespace(self):
+        from app.services.page_discovery import _href_is_safe
+        assert _href_is_safe("/promo page.html") is False
+        assert _href_is_safe("/promo\tpage.html") is False
+        assert _href_is_safe("/promo\npage.html") is False
+
+    def test_rejects_control_characters(self):
+        from app.services.page_discovery import _href_is_safe
+        assert _href_is_safe("/promo\x00page.html") is False
+        assert _href_is_safe("/promo\x07page.html") is False
+
+    def test_rejects_overlong_urls(self):
+        from app.services.page_discovery import _href_is_safe
+        # 2049 chars = beyond the limit. AEM has been known to leak
+        # entire JSON blobs into href on broken templates.
+        assert _href_is_safe("/" + ("a" * 2049)) is False
+
+    def test_accepts_normal_urls(self):
+        from app.services.page_discovery import _href_is_safe
+        assert _href_is_safe("/specials") is True
+        assert _href_is_safe("/promo-2026") is True
+        assert _href_is_safe("https://x.com/inventory?type=loader") is True
+        assert _href_is_safe("/products/aerial-equipment/boom-lifts") is True
+
+
+class TestUnlockerCrawlerDropsTemplateHrefs:
+    """Integration: the unlocker discovery path must drop template-leak
+    hrefs BEFORE they reach the unlocker request in run_ladder.
+
+    This is the exact bug shape from the 2026-04-30 production scan."""
+
+    def test_template_hrefs_filtered_from_results(self):
+        from app.services import page_discovery, unlocker_service
+
+        # Real-world AEM-style HTML with both a clean link and the
+        # leaked Mustache placeholder side-by-side.
+        html = """
+          <a href="/altorfer-rents/en_US/promotions.html">Promotions</a>
+          <a href="/altorfer-rents/en_US/{{path}}.html">Broken template</a>
+          <a href="/altorfer-rents/en_US/about.html">About</a>
+          <a href="https://rent.cat.com/altorfer-rents/en_US/${section}/index">Broken template 2</a>
+        """
+
+        async def _ok(_url):
+            return html, 200, None
+
+        with patch.object(
+            unlocker_service, "_post_unlocker_text", side_effect=_ok,
+        ), patch.object(unlocker_service, "is_available", return_value=True):
+            urls = _run(page_discovery._crawl_homepage_links_via_unlocker(
+                "https://rent.cat.com/altorfer-rents/en_US/home.html",
+                "rent.cat.com",
+            ))
+
+        joined = " ".join(urls)
+        assert "promotions" in joined
+        assert "about" in joined
+        assert "{{" not in joined
+        assert "${" not in joined
+        assert "%7B%7B" not in joined  # no encoded leak either

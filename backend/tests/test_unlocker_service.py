@@ -311,3 +311,156 @@ class TestUnlockAndExtractMarksHost:
 
         assert res.outcome == "blocked"
         assert unlocker_service.host_needs_unlocker("rent.cat.com") is False
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.5.3 — URL safety / normalization before posting to Bright Data
+# ---------------------------------------------------------------------------
+
+class TestNormalizeTargetUrl:
+    """``_normalize_target_url`` is the gate between us and Bright Data.
+
+    It exists because production scans on 2026-04-30 burned ~17 BD
+    requests per scan on URLs like ``…/{{path}}.html`` (unrendered AEM
+    Mustache templates leaked into discovery), and were also at risk of
+    burning more on Spanish-language dealer URLs whose UTF-8 paths
+    weren't percent-encoded. Both shapes return HTTP 400 with no useful
+    body, so we reject them locally rather than pay BD to tell us so."""
+
+    def test_template_placeholder_rejected(self):
+        from app.services.unlocker_service import _normalize_target_url
+        for bad in (
+            "https://rent.cat.com/dealer/en_US/{{path}}.html",
+            "https://x.com/${url}",
+            "https://x.com/<%= path %>",
+            "https://x.com/[% var %]",
+        ):
+            safe, err = _normalize_target_url(bad)
+            assert safe is None, f"expected reject for {bad!r}"
+            assert err == "brightdata_url_template_placeholder"
+
+    def test_empty_or_too_long_rejected(self):
+        from app.services.unlocker_service import _normalize_target_url
+        assert _normalize_target_url("") == (None, "brightdata_url_empty")
+        long_url = "https://x.com/" + ("a" * 3000)
+        safe, err = _normalize_target_url(long_url)
+        assert safe is None
+        assert err == "brightdata_url_too_long"
+
+    def test_unparseable_rejected(self):
+        from app.services.unlocker_service import _normalize_target_url
+        # No scheme.
+        assert _normalize_target_url("rent.cat.com/home.html")[0] is None
+        # No host.
+        assert _normalize_target_url("https:///home.html")[0] is None
+
+    def test_passes_through_already_clean_url_unchanged(self):
+        """A URL that has no spaces, no non-ASCII, and no template
+        markers must come back identical (modulo dropped fragment)."""
+        from app.services.unlocker_service import _normalize_target_url
+        clean = "https://rent.cat.com/wheeler/en_US/home.html"
+        safe, err = _normalize_target_url(clean)
+        assert err is None
+        assert safe == clean
+
+    def test_drops_fragment(self):
+        """Fragments are client-only and never sent in the HTTP request,
+        so it's safer to strip them than rely on Bright Data's
+        canonicalization."""
+        from app.services.unlocker_service import _normalize_target_url
+        safe, err = _normalize_target_url("https://x.com/page#section")
+        assert err is None
+        assert safe == "https://x.com/page"
+
+    def test_encodes_inline_spaces_in_path(self):
+        from app.services.unlocker_service import _normalize_target_url
+        safe, err = _normalize_target_url("https://x.com/promo page/spring deals")
+        assert err is None
+        assert " " not in safe
+        assert "%20" in safe
+
+    def test_encodes_non_ascii_path_chars(self):
+        """Real example: Spanish-language dealer URL with an accented
+        character in the path. UTF-8 percent-encoded bytes are what
+        Bright Data expects."""
+        from app.services.unlocker_service import _normalize_target_url
+        safe, err = _normalize_target_url("https://rent.cat.com/finning-chile/promoción.html")
+        assert err is None
+        assert "ó" not in safe
+        # 'ó' UTF-8: 0xC3 0xB3 → "%C3%B3"
+        assert "%C3%B3" in safe
+
+    def test_does_not_double_encode_already_encoded(self):
+        """If the input already has ``%20`` we MUST keep it as ``%20``,
+        not turn it into ``%2520`` (which would Bright Data canon to a
+        different URL than the dealer page actually uses)."""
+        from app.services.unlocker_service import _normalize_target_url
+        safe, err = _normalize_target_url("https://x.com/promo%20page")
+        assert err is None
+        assert safe == "https://x.com/promo%20page"
+
+    def test_preserves_query_string(self):
+        from app.services.unlocker_service import _normalize_target_url
+        safe, err = _normalize_target_url("https://x.com/path?a=1&b=2&c=hello+world")
+        assert err is None
+        # Query characters that are already URL-safe must survive untouched.
+        assert "a=1" in safe and "b=2" in safe
+
+
+class TestPostUnlockerSkipsBadUrls:
+    """``_post_unlocker`` must NOT make an HTTP call when the URL is
+    structurally bad — that's the whole point of the local gate."""
+
+    def test_template_placeholder_short_circuits_before_http(self):
+        from app.services import unlocker_service
+
+        # If httpx.AsyncClient is constructed at all, that's a fail. We
+        # patch it to raise so any leak through the gate explodes loudly.
+        class _Boom:
+            def __init__(self, *a, **kw):
+                raise AssertionError("HTTP client must not be constructed for bad URL")
+
+        with patch.object(unlocker_service.httpx, "AsyncClient", _Boom), \
+             patch.object(unlocker_service, "_api_token", return_value="tok"), \
+             patch.object(unlocker_service, "_zone_name", return_value="zone"):
+            body, status, err = _run(unlocker_service._post_unlocker(
+                "https://rent.cat.com/dealer/en_US/{{path}}.html",
+            ))
+
+        assert body is None
+        assert status is None
+        assert err == "brightdata_url_template_placeholder"
+
+    def test_clean_url_is_passed_through_to_payload(self):
+        """End-to-end: a normal URL reaches BD with the path encoded but
+        otherwise unchanged."""
+        from app.services import unlocker_service
+
+        captured = {}
+
+        class _FakeResp:
+            status_code = 200
+            content = b"x" * 200
+
+        class _FakeClient:
+            def __init__(self, *a, **kw):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            async def post(self, url, json=None, headers=None):
+                captured["url"] = url
+                captured["payload"] = json
+                return _FakeResp()
+
+        with patch.object(unlocker_service.httpx, "AsyncClient", _FakeClient), \
+             patch.object(unlocker_service, "_api_token", return_value="tok"), \
+             patch.object(unlocker_service, "_zone_name", return_value="zone"):
+            body, status, err = _run(unlocker_service._post_unlocker(
+                "https://x.com/promo page",
+            ))
+
+        assert err is None
+        assert status == 200
+        assert captured["payload"]["url"] == "https://x.com/promo%20page"

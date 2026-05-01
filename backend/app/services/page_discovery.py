@@ -32,7 +32,7 @@ import logging
 import re
 import time
 import xml.etree.ElementTree as ET
-from typing import List, Set, Optional
+from typing import List, Optional, Set, Tuple
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -149,8 +149,64 @@ def _url_looks_promotional(url: str) -> bool:
     return any(seg in PROMO_KEYWORDS for seg in segments if seg)
 
 
+# Hrefs containing any of these substrings are unrendered template
+# placeholders that AEM / Mustache / JSP / ASP / Template Toolkit emits
+# when the server-side render didn't substitute the variable. Sending
+# them anywhere downstream produces guaranteed 400s (or worse, "success"
+# fetches of literal placeholder text). Caught BEFORE urljoin so the
+# resolved URL never enters the discovery list.
+#
+# Real-world sample from the 2026-04-30 production scan that motivated
+# this filter: <a href="{{path}}.html"> on rent.cat.com dealer pages
+# rendered 17 dealers' discovery into <dealer>/{{path}}.html, each of
+# which then burned a Bright Data request returning HTTP 400.
+_TEMPLATE_PLACEHOLDER_MARKERS: Tuple[str, ...] = (
+    "{{", "}}",   # Mustache / Handlebars / Vue
+    "${",          # ES6 template literals / JSP EL / Thymeleaf
+    "<%", "%>",   # ASP / JSP / ERB scriptlets
+    "[%", "%]",   # Template Toolkit
+)
+
+
+def _href_is_safe(href: str) -> bool:
+    """Reject hrefs that would resolve to garbage URLs.
+
+    Three failure shapes seen in production:
+
+    1. Unrendered template placeholders ``{{path}}.html`` etc. — the
+       page server-side rendered without substituting the variable.
+       Resolves to a real-looking URL that 400s at Bright Data.
+    2. Whitespace anywhere in the href — usually a copy/paste error in
+       the page's HTML; Bright Data and most servers reject these
+       with no meaningful body.
+    3. Control characters — same idea, almost always a mis-escaped
+       template variable on the page side.
+
+    Returning False here drops the href silently. The caller logs at
+    DEBUG only since these are very common on AEM-templated pages.
+    """
+    if not href or len(href) > 2048:
+        return False
+    for marker in _TEMPLATE_PLACEHOLDER_MARKERS:
+        if marker in href:
+            return False
+    # Any ASCII whitespace or control character is a tell. Trailing
+    # whitespace already gets stripped by the regex bounds, but inline
+    # whitespace inside the URL is the actual smell.
+    for ch in href:
+        if ch.isspace() or ord(ch) < 0x20:
+            return False
+    return True
+
+
 def _is_scannable_page(url: str) -> bool:
-    """Filter out non-page resources (images, PDFs, etc)."""
+    """Filter out non-page resources (images, PDFs, etc).
+
+    Also rejects URLs whose path or query carries an unrendered template
+    placeholder — defence in depth for callers that bypassed
+    :func:`_href_is_safe` (e.g. URLs from a sitemap)."""
+    if not _href_is_safe(url):
+        return False
     path = urlparse(url).path.lower()
     skip_extensions = {
         ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico",
@@ -288,16 +344,25 @@ async def _crawl_homepage_links(base_url: str, base_domain: str) -> List[str]:
         raw_links = link_pattern.findall(html)
 
         urls: Set[str] = set()
+        skipped_template = 0
         for href in raw_links:
             if href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:"):
                 continue
             if href.startswith("javascript:"):
+                continue
+            if not _href_is_safe(href):
+                skipped_template += 1
                 continue
 
             full_url = urljoin(base_url, href)
             if _is_same_domain(full_url, base_domain) and _is_scannable_page(full_url):
                 urls.add(_normalize_url(full_url))
 
+        if skipped_template:
+            log.debug(
+                "Crawled homepage: dropped %d unrendered template href(s)",
+                skipped_template,
+            )
         log.info("Crawled homepage: %d internal links", len(urls))
         return list(urls)
 
@@ -383,15 +448,29 @@ async def _crawl_homepage_links_via_unlocker(
     raw_links = link_pattern.findall(html_text)
 
     urls: Set[str] = set()
+    skipped_template = 0
     for href in raw_links:
         if href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:"):
             continue
         if href.startswith("javascript:"):
             continue
+        if not _href_is_safe(href):
+            # Mustache / JSP / ASP placeholder. Resolves to a real-looking
+            # URL that 400s at Bright Data and never contains content.
+            # See log.md 2026-04-30 / Phase 6.5.3 for the production
+            # incident that motivated this filter.
+            skipped_template += 1
+            continue
 
         full_url = urljoin(base_url, href)
         if _is_same_domain(full_url, base_domain) and _is_scannable_page(full_url):
             urls.add(_normalize_url(full_url))
+
+    if skipped_template:
+        log.debug(
+            "Unlocker discovery on %s: dropped %d unrendered template href(s)",
+            base_url[:80], skipped_template,
+        )
 
     # Once the unlocker produced HTML for this host, every later asset
     # download on the same host should also go through it. We stamp
