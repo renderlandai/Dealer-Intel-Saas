@@ -569,7 +569,7 @@ async def _analyze_single_image(
     Returns the matched asset_id (str) when a match is recorded, else None.
     """
     try:
-        result, stage = await ai_service.process_discovered_image(
+        result, stage, diagnostics = await ai_service.process_discovered_image(
             image["id"],
             image["image_url"],
             campaign_assets,
@@ -582,6 +582,52 @@ async def _analyze_single_image(
 
         if stage != "matched":
             pipeline_stats[stage] = pipeline_stats.get(stage, 0) + 1
+
+        # Track total Claude error volume across the funnel even when
+        # the stage isn't `claude_error` itself (e.g. one asset
+        # comparison errored but another scored normally and won the
+        # match). This is what tells the operator that BD-driven
+        # traffic is bleeding into Anthropic rate limits.
+        if diagnostics.get("had_claude_error"):
+            pipeline_stats["claude_errors"] = pipeline_stats.get("claude_errors", 0) + 1
+            for kind in diagnostics.get("claude_error_kinds", []) or []:
+                key = f"claude_error_{kind}"
+                pipeline_stats[key] = pipeline_stats.get(key, 0) + 1
+
+        # Persist the per-image diagnostic blob on the
+        # discovered_images row so an operator (or the Phase 7 review
+        # tool) can post-mortem any image without re-running the
+        # pipeline. We do this for every non-matched stage — even the
+        # cheap reject stages (hash/CLIP) — because knowing "this
+        # image was killed by hash with best-rung-distance=N" is the
+        # same kind of post-hoc signal we care about.
+        if stage != "matched":
+            try:
+                pipeline_diag = {
+                    "stage": stage,
+                    "best_score": diagnostics.get("best_score", 0),
+                    "best_asset_id": diagnostics.get("best_asset_id"),
+                    "threshold": diagnostics.get("threshold"),
+                    "comparisons_run": diagnostics.get("comparisons_run", 0),
+                    "had_claude_error": bool(diagnostics.get("had_claude_error")),
+                    "claude_error_kinds": diagnostics.get("claude_error_kinds", []),
+                }
+                if diagnostics.get("download_error"):
+                    pipeline_diag["download_error"] = diagnostics["download_error"]
+                # Read-merge-write: discovered_images.metadata is
+                # JSONB and may already carry extraction-side info
+                # (capture_method, full_page, …) we must not clobber.
+                existing = supabase.table("discovered_images")\
+                    .select("metadata").eq("id", image["id"]).limit(1).execute()
+                base_meta = (existing.data[0].get("metadata") if existing.data else {}) or {}
+                base_meta["pipeline"] = pipeline_diag
+                supabase.table("discovered_images").update({
+                    "metadata": base_meta,
+                }).eq("id", image["id"]).execute()
+            except Exception as diag_err:
+                # Diagnostics are best-effort — never fail a scan over
+                # a metadata write hiccup.
+                log.debug("Failed to persist pipeline diagnostics for %s: %s", image["id"], diag_err)
 
         matched_asset_id: Optional[str] = None
 
@@ -800,6 +846,8 @@ async def _process_one_dealer(
             "filter_rejected": 0,
             "below_threshold": 0,
             "verification_rejected": 0,
+            "claude_error": 0,
+            "claude_errors": 0,
             "matched_new": 0,
             "matched_confirmed": 0,
             "drift_detected": 0,
@@ -1277,6 +1325,15 @@ async def run_website_scan(
             "filter_rejected": 0,
             "below_threshold": 0,
             "verification_rejected": 0,
+            # New stage: Claude-side failures (rate-limit, timeout,
+            # JSON parse) — every ensemble call for the image errored,
+            # so the resulting 0 score is not a real "no match" verdict.
+            # Tracked separately from below_threshold so a spike in
+            # Anthropic quota pressure is visible at a glance.
+            "claude_error": 0,
+            # Aggregated counters across all images, including those
+            # that ultimately matched on a different asset comparison.
+            "claude_errors": 0,
             "matched_new": 0,
             "matched_confirmed": 0,
             "drift_detected": 0,
@@ -1755,6 +1812,8 @@ async def run_image_analysis(
         "filter_rejected": 0,
         "below_threshold": 0,
         "verification_rejected": 0,
+        "claude_error": 0,
+        "claude_errors": 0,
         "matched_new": 0,
         "matched_confirmed": 0,
         "drift_detected": 0,

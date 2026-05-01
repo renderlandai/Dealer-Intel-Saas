@@ -6135,3 +6135,91 @@ Four images survived the prefilter; none survived the downstream CLIP / Claude v
 4. (carried) On-call runbook for `host_scan_policy`.
 5. **Distributor mapping bug.** `matches.distributor_id` for the latest scan was hard-coded to a single seed value (`2a2d3712`, "Finning Chile") for every `rent.cat.com` match, including matches found on `/carolina/`, `/ohiocat/`, etc. The dispatcher seeds one distributor per host instead of resolving the actual sub-path → dealer at match-write time. Cosmetic for now (the source_url carries the truth) but will mis-attribute dealer-level analytics until fixed.
 6. **Local-dev `.env` parsing.** `BRIGHTDATA_API_TOKEN= cf567277-…` (note leading space after `=`) loaded with the leading whitespace via plain `grep | cut`. pydantic-settings strips it correctly so production is unaffected; the `_api_token()` helper already calls `.strip()`. Worth making the .env.example loud about no-space convention.
+
+---
+
+## 2026-05-01 — Phase 6.5.4 — BD-vs-direct accuracy fixes (silent Claude errors, per-image diagnostics, direct-first asset fetch)
+
+### Why
+
+The user reported a regression: "Before [Bright Data], if a website was not blocked, the results were almost 100% accurate every time." The "New 50" campaign scan (May 1, 14:56–15:32 UTC) returned 0 matches even though Asset 1 (`Screenshot 2026-05-01 at 10.55.31 AM.png`) was visually identical to `/dam/crs/test/hero.png` on three dealer pages — pHash distance 9.2 (well below the 28 reject threshold), pre-filter passed, the row was marked `is_processed: true`, but `pipeline_stats.below_threshold: 46` and `matched_new: 0`.
+
+Investigation traced the regression to three structural mechanisms, all introduced or exacerbated by Bright Data joining the hot path:
+
+1. **`compare_images()` and `detect_asset_in_screenshot()` swallowed every exception and returned `similarity_score: 0`** with no telemetry the funnel could see. Rate-limits (429), timeouts, and JSON-parse failures all looked identical to "Claude evaluated this image and said it's not a match." A BD-active scan submits ~10× more Claude calls per scan than a pre-BD scan (because BD floodgates open ~46 candidate images per WAF-protected page across 15 pages), so the rate-limit pressure that used to be invisible now drives a meaningful fraction of "below_threshold" outcomes.
+
+2. **`process_discovered_image()` returned `(result, stage)` and threw away the best score / best asset** for every image that didn't match. The funnel told operators *that* an image was rejected but never *which asset it was closest to* or *what score it actually got*. With 0 matches and a 60-image funnel, there was no way to root-cause without re-running the pipeline by hand.
+
+3. **`download_image()` on a Bright-Data-unlocked host went to BD for every asset fetch**, even when the dealer's CDN edge was actually open. BD returns a re-encoded edge rendition (different dimensions, different colour profile, JPEG-compressed PNGs) that the hash pre-filter forgives but Claude scores meaningfully lower than the original master. Confirmed by hand: BD returned `/dam/crs/test/hero.png` as 1000×411 RGB JPEG (~469 KB), while the asset is 1174×412 RGBA PNG (~758 KB). Claude visual scores for this pair landed in the 50–58 range instead of the 80+ they'd hit on the original master.
+
+### What changed
+
+**`backend/app/services/ai_service.py`:**
+
+- New `_classify_claude_error(exc)` helper buckets exception messages into `rate_limit` / `timeout` / `overloaded` / `json_parse` / `network` / `other`. Used everywhere `compare_images` and `detect_asset_in_screenshot` catch an exception. Distinguishing the buckets is the whole point of the funnel work — without classification, an operator can't tell if a low match rate means "Claude saw real visual mismatches" or "BD-driven traffic is melting the Anthropic quota."
+- `compare_images()` now annotates every failure with `error_kind` (rate_limit / timeout / json_parse / image_optimize / network / other). On the success path, `error_kind` is explicitly set to None so callers can rely on the key existing.
+- `detect_asset_in_screenshot()` mirrors the same annotation contract for the screenshot path.
+- `ensemble_match()` propagates `error_kind` from the visual / detection rungs into its own return dict. Hash-only failures get hash_score=0 instead of an error_kind because hashing is local-only — any failure there is a real visual mismatch, not infrastructure noise.
+- `process_discovered_image()` signature changed from `(result, stage)` to `(result, stage, diagnostics)`. The diagnostics dict carries `best_score`, `best_asset_id`, `threshold`, `comparisons_run`, `had_claude_error`, `claude_error_kinds`, and `all_comparisons_errored`. Every early-exit branch (download_failed, hash_rejected, clip_rejected, filter_rejected, verification_rejected) now returns the partial diagnostics it collected so the caller has something to persist regardless of how short the path was.
+- New stage `claude_error` returned when EVERY ensemble call for an image errored — the resulting 0 score isn't a real Claude verdict and shouldn't be lumped in with `below_threshold`.
+- New `_try_direct_image_fetch(url)` helper: best-effort 6s direct httpx fetch, returns None on any failure, never raises, only logs at DEBUG. Caller uses this as a probe and has its own fallback path.
+- `download_image()` on a BD-unlocked host now tries `_try_direct_image_fetch(url)` FIRST. If direct returns valid image bytes, those bytes are used and Bright Data is never called. If direct fails (timeout, 4xx, garbage), falls back to `download_via_unlocker(url)` exactly like before. Net cost: at most one 6s probe per uncached unlocked-host image (then cached); recovers the original master bytes whenever the asset CDN happens to be open.
+
+**`backend/app/services/scan_runners.py`:**
+
+- `_analyze_single_image()` unpacks the new 3-tuple, increments two new pipeline counters (`claude_errors` for any image where any comparison errored, plus per-kind buckets like `claude_error_rate_limit` / `claude_error_timeout`), and persists the diagnostics blob onto `discovered_images.metadata.pipeline` for every non-matched image. This is read-merge-write to preserve any extraction-side metadata (capture_method, full_page, …) that's already on the row. Diagnostic writes are best-effort: a metadata write hiccup never fails a scan.
+- `pipeline_stats` initialisation in all three places (per-dealer local, run-wide for website scans, run-wide for the legacy bottom analyzer) now seeds `claude_error: 0` and `claude_errors: 0`. Per-kind buckets like `claude_error_rate_limit` are populated lazily as they appear, so the funnel only carries keys for kinds that actually fired in this scan.
+- The per-dealer→run-wide merge loop already uses `pipeline_stats.get(k, 0) + v`, so the new keys propagate automatically without further plumbing.
+
+### What this gives the operator on the next scan
+
+When a "0 matches" result happens, the operator can now see:
+
+- **`pipeline_stats.claude_error`** — count of images where every ensemble call failed (genuine Claude infra problem, not a real visual verdict).
+- **`pipeline_stats.claude_errors`** — count of images that experienced *any* Claude failure across their asset comparisons (broader than `claude_error` — includes images that ultimately matched on a different asset).
+- **`pipeline_stats.claude_error_<kind>`** — distribution of failure kinds, so a spike in `claude_error_rate_limit` is the visible signal that BD-driven traffic is bleeding into Anthropic quota.
+- **`discovered_images.metadata.pipeline`** per row — `{stage, best_score, best_asset_id, threshold, comparisons_run, had_claude_error, claude_error_kinds}`. Lets the operator (or the Phase 7 review tool) post-mortem any image: "this row was rejected at below_threshold with best_score=58 against asset abc123 (threshold was 60)" is now visible without re-running the pipeline.
+
+### What this gives match accuracy on the next scan
+
+For BD-unlocked hosts whose asset CDN is actually open (the common case for AEM `/content/dam/...` paths on rent.cat.com — the WAF gates the page but not the static assets), `download_image` will now return the original master bytes instead of BD's re-encoded edge rendition. Claude's visual score on the user's reference asset (`/dam/crs/test/hero.png`) should move from the 50–58 below-threshold band into the 80+ strong-match band. The hash pre-filter was already passing this case at 9.2 distance, so the only thing standing between this asset and a confirmed match was the BD encoding artifacts — addressed by the direct-first probe.
+
+### Why direct-first instead of "compare both and take the better one"
+
+Considered, rejected. Comparing both would double the cost on every unlocked-host image (one BD call + one direct call) regardless of outcome. Direct-first costs one direct call (which is fast and free) plus one BD call only when direct fails — so the BD bill is unchanged on locked CDNs and *reduced* on the open-CDN cases that previously were paying BD to re-encode an image that direct could have fetched for free. Net: better accuracy AND lower BD spend.
+
+### Tests
+
+New `backend/tests/test_ai_service_diagnostics.py` (20 cases across 5 classes):
+
+- `TestClassifyClaudeError` (6 cases) — exhaustive coverage of every error-kind bucket including unknown messages falling to `other`.
+- `TestCompareImagesErrorAnnotation` (4 cases) — Anthropic 429 → `rate_limit`, malformed Claude response → `json_parse`, non-image source bytes → `image_optimize`, and the success path setting `error_kind` to None.
+- `TestEnsembleMatchErrorPropagation` (1 case) — verifies a rate-limited `compare_images` result surfaces in the ensemble dict so `process_discovered_image` can bucket it as `claude_error`.
+- `TestProcessDiscoveredImageDiagnostics` (4 cases) — below-threshold returns diagnostics with the real best score, all-Claude-errors returns the new `claude_error` stage, partial Claude failures still match on a healthy asset, and the earliest reject path (`download_failed`) still returns a 3-tuple so the caller's unpacking never crashes.
+- `TestUnlockedHostDirectFirstProbe` (5 cases) — direct success skips BD entirely, direct failure falls back to BD with the BD bytes used, an unmarked host hits neither the probe nor BD, and the probe itself returns None (never raises) on timeout and on non-image responses.
+
+Run on touched modules: **20 new tests pass** (15 in one batch, 5 BD-probe tests in isolation; the same pre-existing Python 3.9 `asyncio.run()` cross-test loop quirk we documented in Phase 6.5.3 prevents running all 20 in one process locally — CI runs Python 3.11 where it doesn't reproduce). Full backend suite: **198 pre-existing tests still pass** (no regressions from the 2-tuple → 3-tuple signature change).
+
+### Files
+
+- `backend/app/services/ai_service.py` — `_classify_claude_error`, `_try_direct_image_fetch`, `_UNLOCKED_DIRECT_PROBE_TIMEOUT` constant. `compare_images` and `detect_asset_in_screenshot` now annotate `error_kind`. `ensemble_match` propagates it. `process_discovered_image` returns 3-tuple with diagnostics, adds `claude_error` stage. `download_image` does direct-first probe on BD-unlocked hosts.
+- `backend/app/services/scan_runners.py` — `_analyze_single_image` unpacks 3-tuple, increments `claude_errors` + per-kind buckets, persists diagnostics to `discovered_images.metadata.pipeline`. All three `pipeline_stats` init sites add `claude_error` / `claude_errors` keys.
+- `backend/tests/test_ai_service_diagnostics.py` — new file, 20 cases across 5 classes.
+
+### Verification on next scan
+
+- `pipeline_stats.claude_errors` should populate with a real number (>0 expected on busy scans). Any spike correlates 1:1 with Anthropic infra pressure rather than visual mismatches.
+- `pipeline_stats.claude_error_<kind>` distribution surfaces *which* failure mode is dominant. Operationally: lots of `rate_limit` → bump max_retries / lower batch_size; lots of `timeout` → look at network or model-overload; lots of `json_parse` → prompt drift, look at recent prompt edits.
+- `discovered_images.metadata.pipeline.best_score` for the user's reference asset (`/dam/crs/test/hero.png`) should jump from below 60 to above 60 on the rent.cat.com dealer pages, and the corresponding rows should flip from `is_processed: true, matched: 0` to `is_processed: true, matched: 1`.
+- BD asset-fetch volume for rent.cat.com should drop measurably (the AEM `/content/dam/` paths return cleanly via direct httpx in our manual testing), reflected as fewer `brightdata_unlocker` line items in `cost.line_items` per scan even though page coverage stays the same.
+
+### Open follow-ups (still not in this commit)
+
+1. (carried) `page_cache_service.record_page_hits` `.maybe_single()` raising `204`.
+2. (carried) Explicit response-size cap in `_post_unlocker` so a malicious host can't run up the BD bill.
+3. (carried) Sitemap-via-unlocker for very large dealer sites.
+4. (carried) On-call runbook for `host_scan_policy`.
+5. (carried) Distributor mapping bug — `rent.cat.com` matches all attribute to one seed distributor.
+6. (carried) Local-dev `.env` parsing — leading space tolerance via `tr -d ' '`.
+7. **Frontend surfacing of `claude_errors` and `metadata.pipeline.best_score`.** The data is now in the database; the operator dashboard doesn't show it yet. Lowest-effort: add a `claude_errors` column to the scan-detail table next to `matches_count` and a tooltip showing the kind distribution. Higher-effort: per-image "why didn't this match?" view that reads `metadata.pipeline` and explains the funnel stage in plain English.
+8. **Replace data-URL asset storage with Supabase Storage.** Asset 1 in the May 1 scan is a 2.4 MB base64 data URL — `download_image` decodes inline (no network) but every subsequent step (optimize, hash, CLIP, Claude) then operates on bytes that are 33% larger than they need to be. Storing all assets in Supabase Storage and migrating existing data-URL assets to https URLs would shrink the in-flight payloads and remove the data-URL code path entirely.
