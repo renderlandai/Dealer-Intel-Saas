@@ -70,6 +70,22 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# How often to fire a heartbeat from inside the per-image analysis
+# loop. The outer loop already heartbeats once per page (line ~869),
+# but a single page on a heavy AEM-style dealer site can carry 100+
+# creatives and the Claude verification ladder runs several seconds
+# per image; without an inner heartbeat the row's `last_heartbeat_at`
+# can sit stale for 10+ minutes during a perfectly healthy scan.
+#
+# That mattered when the cleanup window was 4 hours (it didn't fire),
+# but with the post-2026-05-05 30-min cleanup window the inner
+# heartbeat is what keeps a slow-but-alive page from being mistakenly
+# auto-failed. Every 10 images is the right cadence: chatty enough to
+# survive a Supabase hiccup on any single write, sparse enough that
+# the heartbeat update itself isn't a meaningful share of scan cost.
+_HEARTBEAT_EVERY_N = 10
+
+
 def _heartbeat(scan_job_id) -> None:
     """Stamp `scan_jobs.last_heartbeat_at` so the cleanup job knows we're alive.
 
@@ -81,8 +97,10 @@ def _heartbeat(scan_job_id) -> None:
 
     Best-effort: failures are logged at debug level and swallowed so a
     transient Supabase hiccup never fails an otherwise-healthy scan.
-    Called once per page from the website runner and at major phase
-    boundaries; per-image calls would be too chatty for the value.
+    Called at major phase boundaries (per-page, post-discover, etc.)
+    AND every `_HEARTBEAT_EVERY_N` images from the per-image analysis
+    loop, so a slow-but-progressing page keeps `last_heartbeat_at`
+    fresh enough to satisfy the post-2026-05-05 30-min cleanup window.
     """
     try:
         supabase.table("scan_jobs").update({
@@ -1014,6 +1032,13 @@ async def _process_one_dealer(
                             match_buffer=local_buffer,
                             processed_buffer=local_processed,
                         )
+                        # Periodic intra-page heartbeat — pages with 100+
+                        # creatives can spend 10+ minutes inside this
+                        # loop, which would let `last_heartbeat_at` go
+                        # stale past the 30-min cleanup window even
+                        # though the runner is making active progress.
+                        if local_total_images % _HEARTBEAT_EVERY_N == 0:
+                            _heartbeat(scan_job_id)
                         if asset_id:
                             local_page_match_tracker.setdefault(page_url, set()).add(asset_id)
                             async with matched_lock:

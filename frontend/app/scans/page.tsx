@@ -13,6 +13,7 @@ import {
   Radar,
   Eye,
   Trash2,
+  Ban,
   ChevronDown,
   ChevronUp,
   BarChart3,
@@ -23,7 +24,7 @@ import { Header } from "@/components/layout/header";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { useScanJobs, useCampaigns, useDeleteScan, useDeleteAllScans, useRetryScan, useBatchScan, useBillingUsage } from "@/lib/hooks";
+import { useScanJobs, useCampaigns, useDeleteScan, useDeleteAllScans, useRetryScan, useCancelScan, useBatchScan, useBillingUsage } from "@/lib/hooks";
 import { useQueryClient } from "@tanstack/react-query";
 import { formatDateTime } from "@/lib/utils";
 
@@ -501,6 +502,7 @@ export default function ScansPage() {
   const deleteScanMutation = useDeleteScan();
   const deleteAllScansMutation = useDeleteAllScans();
   const retryScanMutation = useRetryScan();
+  const cancelScanMutation = useCancelScan();
   const batchScanMutation = useBatchScan();
   const { data: billing } = useBillingUsage();
   
@@ -518,6 +520,29 @@ export default function ScansPage() {
       } catch (error: any) {
         console.error("Failed to delete scan:", error);
         alert(error?.response?.data?.detail || "Failed to delete scan.");
+      }
+    }
+  };
+
+  // Cancelling = flip to `failed` immediately so the operator stops
+  // seeing the row as RUNNING. The 2026-05-05 incident showed the
+  // 30-min heartbeat-stale cleanup window is correct in aggregate but
+  // too slow when an operator already knows the worker is dead. The
+  // confirm() text is intentionally clear that this does NOT halt a
+  // live worker — see the cancel endpoint docstring for that nuance.
+  const handleCancelScan = async (id: string) => {
+    if (
+      confirm(
+        "Cancel this scan? The row will be marked failed so you can retry.\n\n" +
+          "Note: if the worker is still alive it may finish its current page " +
+          "before stopping, but the dashboard will show 'failed' immediately.",
+      )
+    ) {
+      try {
+        await cancelScanMutation.mutateAsync(id);
+      } catch (error: any) {
+        console.error("Failed to cancel scan:", error);
+        alert(error?.response?.data?.detail || "Failed to cancel scan.");
       }
     }
   };
@@ -786,7 +811,29 @@ export default function ScansPage() {
                           </Button>
                         </Link>
                       )}
-                      
+
+                      {/* Cancel is only meaningful for active scans.
+                          Showing it next to Delete (which lives below)
+                          keeps the destructive-action group together
+                          while making clear that Cancel preserves the
+                          row (just flips state → failed) and Delete
+                          purges everything. */}
+                      {(job.status === "pending" ||
+                        job.status === "running" ||
+                        job.status === "analyzing") && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => handleCancelScan(job.id)}
+                          disabled={cancelScanMutation.isPending}
+                          className="text-amber-400 hover:text-amber-300 border-amber-500/30 hover:bg-amber-500/10"
+                          title="Mark this scan as failed so it stops showing as RUNNING. Use this if the worker is stuck or dead."
+                        >
+                          <Ban className={`h-3 w-3 mr-1 ${cancelScanMutation.isPending ? "animate-pulse" : ""}`} />
+                          {cancelScanMutation.isPending ? "Cancelling..." : "Cancel"}
+                        </Button>
+                      )}
+
                       <Button 
                         size="sm" 
                         variant="ghost"
@@ -819,6 +866,17 @@ export default function ScansPage() {
                             // the verbatim error_message above already tells
                             // the user exactly what to do.
                             if (msg.startsWith("browser runtime not installed")) {
+                              return null;
+                            }
+                            // Operator-cancelled / heartbeat-stale / pending-
+                            // stale messages (Phase 6.5.7) are themselves
+                            // already operator-friendly; don't append a
+                            // generic "check your URLs" hint that would be
+                            // misleading in those cases.
+                            if (
+                              msg.startsWith("cancelled by operator") ||
+                              msg.includes("auto-failed by cleanup job")
+                            ) {
                               return null;
                             }
                             const hint = msg.includes("timeout")

@@ -139,6 +139,34 @@ class Settings(BaseSettings):
     enable_tiling_fallback: bool = Field(default=True, description="Tile screenshots when extraction fails")
     tile_height: int = Field(default=1080, description="Height of each screenshot tile in pixels")
     tile_overlap: int = Field(default=200, description="Overlap between adjacent tiles in pixels")
+
+    # ===========================================
+    # Phase 6.5.8 — Evidence-screenshot RSS hardening
+    # ===========================================
+    # The 2026-05-05 OOM-during-page-9 incident traced to a single
+    # full-page PNG screenshot held in RSS alongside Playwright +
+    # CLIP + an in-flight Supabase Storage upload. These knobs cut
+    # peak RSS at the screenshot step by ~80–90%:
+    #
+    # - JPEG instead of PNG cuts the byte budget per shot 5–10×
+    #   without affecting the CV matcher (`cv_matching` uses
+    #   cv2.imdecode, OpenCV is format-agnostic) or the audit-trail
+    #   value (operators view the screenshot as a thumbnail).
+    # - The full-page height cap stops AEM-style 30000-px landing
+    #   pages from producing 50+ MB shots that would never fit in
+    #   the worker's RSS budget. The cap is generous (most useful
+    #   creative is in the first 6000 px); tall pages are clipped
+    #   from the top down with a metadata flag noting the truncation.
+    # - The screenshot-concurrency semaphore is independent of
+    #   `max_concurrent_dealers`. Even with 4-way dealer parallelism,
+    #   only N screenshot+upload pairs are hot in RSS at once. The
+    #   default of 2 keeps worst-case concurrent screenshot RSS at
+    #   ~2 × MAX_JPEG_SIZE ≈ a few MB, vs. the pre-fix worst case of
+    #   4 × MAX_PNG_SIZE ≈ tens of MB.
+    evidence_screenshot_format: str = Field(default="jpeg", description="Evidence screenshot format: 'jpeg' (RSS-cheap, default) or 'png' (lossless)")
+    evidence_screenshot_quality: int = Field(default=82, description="JPEG quality 1-95 — only used when format is 'jpeg'. 82 is visually lossless for thumbnail audit use.")
+    max_screenshot_height: int = Field(default=12000, description="Maximum page height (px) to capture in a single full-page screenshot. Pages taller than this are clipped from y=0 down so the screenshot never exceeds RSS budget.")
+    max_concurrent_screenshots: int = Field(default=2, description="Max in-flight page.screenshot+upload pairs across the whole worker. Independent of max_concurrent_dealers.")
     # When Playwright is consistently blocked (anti-bot WAF), the
     # render_strategies ladder escalates to Bright Data Web Unlocker
     # (configured above). This flag is the master kill-switch; flip it

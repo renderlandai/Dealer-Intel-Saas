@@ -7,6 +7,7 @@ in this file means it can stay coupled to FastAPI / auth / slowapi /
 plan_enforcement without contaminating the worker import path —
 see Phase 4.5 in `log.md` and `backend/docs/scan_dispatch_flow.md`.
 """
+from datetime import datetime, timezone
 from fastapi import APIRouter, HTTPException, Depends, Request
 from typing import List, Optional
 from uuid import UUID
@@ -22,6 +23,18 @@ from ..plan_enforcement import (
 import logging
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+
+
+# Sentinel `error_message` for operator-cancelled scans. Lives at module
+# scope so the test suite (and any future runner-side cancel-aware code)
+# can match against the same string.
+SCAN_CANCEL_MESSAGE = "Cancelled by operator"
+
+# Statuses where a cancel is meaningful. `pending` is here because the
+# worker may not have claimed the row yet — the operator should still
+# be able to abort before any work happens. `analyzing` is the post-
+# discovery phase; same logic.
+_CANCELLABLE_STATUSES = {"pending", "running", "analyzing"}
 
 limiter = Limiter(key_func=get_remote_address)
 
@@ -237,6 +250,84 @@ async def retry_scan_job(
 
     log.info("Retried scan %s → new scan %s (source=%s)", job_id, new_id, source)
     return new_job.data[0]
+
+
+@router.post("/{job_id}/cancel", response_model=ScanJob, summary="Cancel an in-flight scan")
+async def cancel_scan_job(
+    job_id: UUID,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Mark a `pending`/`running`/`analyzing` scan as `failed`.
+
+    The motivating scenario (2026-05-05) is a worker process that has
+    OOM-died mid-scan: the row is genuinely orphaned in `running`, no
+    process is going to advance it, and the heartbeat-based cleanup job
+    will only catch it 30 minutes after the last heartbeat. The
+    operator wants to stop seeing this row as RUNNING in the dashboard
+    *now* and retry it.
+
+    This endpoint flips the row's `status` to `failed` with a clear
+    `error_message` (`SCAN_CANCEL_MESSAGE`) so the existing failure UX
+    in the scans page (red banner, hint, Retry button) lights up
+    immediately. Already-terminal rows (`completed`, `failed`) return
+    400 because cancelling them is meaningless.
+
+    Important nuance — this does NOT actively halt a worker that is
+    still alive. If the worker process is healthy and the operator
+    cancels mid-scan anyway, the runner will eventually finish its
+    current page and try to write its own `completed`/`failed` status,
+    racing this update. That race is acceptable for the primary
+    "worker is dead" use case (no race possible), and for the rare
+    "I changed my mind on a live scan" use case the worst outcome is
+    one status oscillation. A future runner-side cancel-aware
+    heartbeat (raise `ScanCancelled` if a heartbeat update returns
+    zero matched rows because the status was flipped under us) is the
+    right next step but out of scope here.
+
+    Auth: scan must belong to the caller's org. Otherwise 404 (matches
+    the leak-resistant pattern used by `delete_scan_job`).
+    """
+    job = supabase.table("scan_jobs")\
+        .select("*")\
+        .eq("id", str(job_id))\
+        .eq("organization_id", str(user.org_id))\
+        .maybe_single()\
+        .execute()
+    if not job.data:
+        raise HTTPException(status_code=404, detail="Scan job not found")
+
+    current_status = job.data.get("status")
+    if current_status not in _CANCELLABLE_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot cancel a scan that is already '{current_status}'. "
+                   "Use Delete to remove a completed or failed scan.",
+        )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    updated = supabase.table("scan_jobs").update({
+        "status": "failed",
+        "error_message": SCAN_CANCEL_MESSAGE,
+        "completed_at": now_iso,
+    }).eq("id", str(job_id)).execute()
+
+    log.info(
+        "Scan %s cancelled by user %s (was '%s')",
+        job_id, user.user_id, current_status,
+    )
+    if not updated.data:
+        # Defensive: the .update() should always echo back the row,
+        # but if the supabase client decided otherwise return what we
+        # already fetched with the locally-applied changes so the
+        # response shape stays predictable.
+        merged = dict(job.data)
+        merged.update({
+            "status": "failed",
+            "error_message": SCAN_CANCEL_MESSAGE,
+            "completed_at": now_iso,
+        })
+        return merged
+    return updated.data[0]
 
 
 @router.delete("/{job_id}", summary="Delete scan job")

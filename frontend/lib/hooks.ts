@@ -32,6 +32,7 @@ import {
   deleteScan,
   deleteAllScans,
   retryScan,
+  cancelScan,
   startBatchScan,
   getComplianceTrend,
   submitMatchFeedback,
@@ -376,6 +377,17 @@ export function useRetryScan() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: retryScan,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: queryKeys.scans.all });
+      queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });
+    },
+  });
+}
+
+export function useCancelScan() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: cancelScan,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.scans.all });
       queryClient.invalidateQueries({ queryKey: queryKeys.dashboard.stats });

@@ -354,76 +354,121 @@ async def _run_retention() -> None:
     await run_retention_sweep()
 
 
+# Heartbeat-stale cutoff for scans whose runner advertised a heartbeat
+# at least once. The runner stamps `last_heartbeat_at` at every major
+# phase boundary AND every N images analysed (see `_HEARTBEAT_EVERY_N`
+# in `scan_runners.py`), so a healthy scan should never have a >30-min
+# heartbeat gap even on heavy AEM-style pages with 100+ creatives.
+#
+# 30 min was chosen as: ~2× the slowest realistic between-heartbeat
+# stretch we have observed (a single dealer page that BD-routes through
+# unlocker_only with the full Claude verification ladder for ~15 min on
+# heavy creative). Anything beyond that is the runner process being
+# dead/killed, which is what the 2026-05-05 OOM-during-screenshot
+# incident actually was — and which the previous 4-hour window kept the
+# row in `running` for 4 hours of operator confusion.
+#
+# The `created_at`-based fallback (for runners that never wrote a
+# heartbeat at all) stays at 4 hours: that branch only catches
+# pre-migration-029 rows or runners that died during prep before any
+# heartbeat could be stamped, and 30 min is too aggressive there
+# because some prep phases (asset hash precompute, large campaign
+# loads) can legitimately take a few minutes.
+_HEARTBEAT_STALE_AFTER = timedelta(minutes=30)
+_NO_HEARTBEAT_STALE_AFTER = timedelta(hours=4)
+_PENDING_STALE_AFTER = timedelta(minutes=15)
+
+
 async def _cleanup_stale_scans() -> None:
     """Auto-fail scans stuck in 'pending' or 'running' too long.
 
-    Pending cutoff (15 min) — when in-process dispatch is enabled the row
-    moves to 'running' almost immediately, so anything sitting here is a
-    truly dropped task. When a separate worker is doing the dispatch the
-    same window still applies because the worker poll interval is seconds,
-    not minutes.
+    Three independent cutoffs, applied in one pass:
 
-    Running cutoff (4 hours) — large 50+ dealer scans on the new worker
-    routinely run for ~30–90 min. The runner now writes
-    `scan_jobs.last_heartbeat_at` once per page (see Phase 5-minimal in
-    log.md / migration 029), so we can use a per-row liveness signal:
-        * If `last_heartbeat_at` is set → consider the scan stuck only when
-          the heartbeat itself is >4h old (the runner has actually stopped
-          touching the row).
-        * If `last_heartbeat_at` is NULL → the runner predates the
-          heartbeat or never made it past prep work; fall back to the
-          original `created_at`-based check at the same 4h horizon.
+    * `pending` rows older than `_PENDING_STALE_AFTER` (15 min) — when
+      in-process dispatch is enabled the row moves to 'running' almost
+      immediately, so anything sitting here is a truly dropped task.
+      With a separate worker doing the dispatch the same window still
+      applies because the worker poll interval is seconds, not minutes.
+    * `running`/`analyzing` rows whose `last_heartbeat_at` has not
+      advanced in `_HEARTBEAT_STALE_AFTER` (30 min) — the runner is
+      dead. Cf. `_HEARTBEAT_EVERY_N` in scan_runners.py for the cadence
+      that makes this safe.
+    * `running`/`analyzing` rows that NEVER wrote a heartbeat AND were
+      created more than `_NO_HEARTBEAT_STALE_AFTER` (4 hours) ago —
+      runners that crashed during prep before the first heartbeat. The
+      generous 4-hour window here is intentional; it's a fallback for
+      runners predating migration 029, not a hot path.
 
     The hard backstop is the asyncio.wait_for in tasks.py
     (SCAN_TIMEOUT_SECONDS) — the cleanup job is a safety net, not the
     primary timeout.
+
+    Different stale buckets get distinct `error_message` strings so the
+    operator dashboard can tell at a glance whether a failure was the
+    "runner picked up the job and stopped heartbeating" path (almost
+    always OOM / pod restart) vs "worker never picked the job up at
+    all" (worker is down / crash-looping).
     """
     try:
         now = datetime.now(timezone.utc)
-        pending_cutoff = (now - timedelta(minutes=15)).isoformat()
+        pending_cutoff = (now - _PENDING_STALE_AFTER).isoformat()
+        heartbeat_cutoff = (now - _HEARTBEAT_STALE_AFTER).isoformat()
+        no_heartbeat_cutoff = (now - _NO_HEARTBEAT_STALE_AFTER).isoformat()
+
         stale_pending = supabase.table("scan_jobs") \
             .select("id") \
             .eq("status", "pending") \
             .lt("created_at", pending_cutoff) \
             .execute()
 
-        running_cutoff = (now - timedelta(hours=4)).isoformat()
-
-        # Heartbeat-based: row has a heartbeat that has not advanced in 4h.
         stale_by_heartbeat = supabase.table("scan_jobs") \
             .select("id") \
             .in_("status", ["running", "analyzing"]) \
             .not_.is_("last_heartbeat_at", "null") \
-            .lt("last_heartbeat_at", running_cutoff) \
+            .lt("last_heartbeat_at", heartbeat_cutoff) \
             .execute()
 
-        # Fallback: row never wrote a heartbeat AND was created >4h ago.
         # `is_("last_heartbeat_at", "null")` reads "IS NULL" via PostgREST.
         stale_no_heartbeat = supabase.table("scan_jobs") \
             .select("id") \
             .in_("status", ["running", "analyzing"]) \
             .is_("last_heartbeat_at", "null") \
-            .lt("created_at", running_cutoff) \
+            .lt("created_at", no_heartbeat_cutoff) \
             .execute()
 
+        buckets = [
+            (stale_pending.data,
+                "Scan stuck in pending — worker did not claim the job within "
+                f"{int(_PENDING_STALE_AFTER.total_seconds() // 60)} minutes "
+                "(auto-failed by cleanup job)"),
+            (stale_by_heartbeat.data,
+                "Scan worker stopped heartbeating for "
+                f"{int(_HEARTBEAT_STALE_AFTER.total_seconds() // 60)} minutes — "
+                "runner most likely crashed or was OOM-killed (auto-failed by "
+                "cleanup job)"),
+            (stale_no_heartbeat.data,
+                "Scan was created over "
+                f"{int(_NO_HEARTBEAT_STALE_AFTER.total_seconds() // 3600)}h "
+                "ago and never wrote a heartbeat (auto-failed by cleanup job)"),
+        ]
+
         seen_ids: set = set()
-        all_stale = []
-        for bucket in (stale_pending.data, stale_by_heartbeat.data, stale_no_heartbeat.data):
-            for job in (bucket or []):
-                if job["id"] in seen_ids:
+        cleaned = 0
+        for bucket_rows, error_message in buckets:
+            for job in (bucket_rows or []):
+                job_id = job["id"]
+                if job_id in seen_ids:
                     continue
-                seen_ids.add(job["id"])
-                all_stale.append(job)
+                seen_ids.add(job_id)
+                supabase.table("scan_jobs").update({
+                    "status": "failed",
+                    "error_message": error_message,
+                }).eq("id", job_id).execute()
+                log.warning("Auto-failed stale scan: %s (%s)", job_id, error_message)
+                cleaned += 1
 
-        for job in all_stale:
-            supabase.table("scan_jobs").update({
-                "status": "failed",
-                "error_message": "Scan timed out — auto-failed by cleanup job",
-            }).eq("id", job["id"]).execute()
-            log.warning("Auto-failed stale scan: %s", job["id"])
-
-        if all_stale:
-            log.info("Cleaned up %d stale scan(s)", len(all_stale))
+        if cleaned:
+            log.info("Cleaned up %d stale scan(s)", cleaned)
     except Exception:
         log.exception("Error cleaning up stale scans")
 

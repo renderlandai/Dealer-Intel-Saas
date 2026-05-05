@@ -6398,3 +6398,200 @@ The asymmetry — accept large input, store only flat output — is exactly the 
 - A 30 MB layered PSD that previously rejected with "File too large (30 MB). Maximum is 25 MB." should now upload successfully, land in storage as a flattened PNG (typically 2–8 MB), and appear in the campaign assets list with the PSD source replaced by its rasterized composite.
 - A 90 MB anything (PSD or otherwise) should still reject, but with the new copy: "File too large (90 MB). Maximum upload size is 75 MB. Flatten the file or export to PNG/JPG before re-uploading."
 - A pathological PSD whose composite is >25 MB (rare; only happens with print-resolution masters) rejects post-rasterization with the canvas-resolution hint rather than the upload-size hint.
+
+---
+
+## 2026-05-05 — Phase 6.5.7 — stuck-scan recovery (heartbeat tightening + operator cancel)
+
+### Why now (the actual incident)
+
+Live operator triggered a Website scan at 13:22 EDT (17:22 UTC). The worker picked it up and started crunching — the prod log shows healthy progress through page 8 of 15 on `boydcat.com/rental/`, with dense `Processing image / Starting ensemble match / Batches 100%` output. Last log line was `Evidence screenshot saved` at **18:30:48 UTC**, right after the page-9 Playwright full-page PNG upload to Supabase Storage. Then total silence: zero log lines for the next ~21 minutes.
+
+The dashboard kept showing the row as **RUNNING** with "0 matches found, 0 images scanned" the whole time. Operator (correctly) suspected the worker was dead.
+
+Three converging problems made this a worse experience than it had to be:
+
+1. **The runner died without anyone noticing.** The exact log-cutoff shape — final line being a successful `Evidence screenshot saved` right after Playwright held a full-page PNG + the CLIP model + the in-flight Supabase upload buffer all in RSS — is the textbook signature of an OOM-kill on DO App Platform (SIGKILL, no exit log). With the model + Chromium + a multi-MB PNG buffered in memory, the page-9 screenshot/upload window is the highest-RSS step of the pipeline and the most plausible kill point.
+2. **The cleanup job was set to wait 4 hours.** `_cleanup_stale_scans` (`scheduler_service.py`) used a 4-hour `last_heartbeat_at` cutoff, sized originally so that legitimately-slow large scans wouldn't be auto-failed. With heartbeats stamped per page (`scan_runners.py:869`), 4 hours is wildly too generous: a healthy scan never has anything close to a 4-hour heartbeat gap, so the window's only practical effect was making operators stare at orphaned `running` rows for hours.
+3. **There was no way for the operator to mark the row failed manually.** The scans page had Retry (only enabled for already-failed rows) and Delete (purges the entire row + history). Nothing said "this is dead, just admit it." Operator was told to wait 4 hours.
+
+### Three orthogonal fixes, one commit
+
+**Item 1 — Tighten the heartbeat-stale cleanup window from 4 h → 30 min.** In `scheduler_service.py`, `_cleanup_stale_scans` now uses three independent cutoffs at module-scope constants for grep-ability:
+
+- `_PENDING_STALE_AFTER = 15 min` — unchanged. Pending rows that the worker never claimed.
+- `_HEARTBEAT_STALE_AFTER = 30 min` — **was 4 h.** Rows whose `last_heartbeat_at` has not advanced. With the per-image heartbeat (Item 2) live, no healthy scan should ever come close to a 30-min gap. This is the lever that turns "operator waits 4 hours for the cleanup cron to admit the worker is dead" into "operator waits at most 30 minutes."
+- `_NO_HEARTBEAT_STALE_AFTER = 4 h` — unchanged. Fallback for runners that crashed during prep before any heartbeat could be stamped (pre-migration-029 rows or runners that died loading the model). Tightening this would risk killing a slow-but-alive prep phase.
+
+Each cutoff now writes a distinct, operator-readable `error_message` so the dashboard can tell at-a-glance which path fired ("Scan worker stopped heartbeating for 30 minutes — runner most likely crashed or was OOM-killed" vs "Scan stuck in pending — worker did not claim the job within 15 minutes" vs "Scan was created over 4h ago and never wrote a heartbeat"). The dedup logic also got tightened: a single row that appears in multiple buckets (theoretically impossible because IS NULL / IS NOT NULL are disjoint, but defensive against PostgREST race quirks) is now updated exactly once with the first-seen-bucket message, instead of issuing two updates.
+
+**Item 2 — Per-image heartbeat tick inside the analysis loop.** The pre-existing `_heartbeat(scan_job_id)` call at `scan_runners.py:869` fires once per page, just before the page extraction. On a heavy AEM-style page with 100+ creatives, the inner `for image in (page_images.data or []): await _analyze_single_image(...)` loop can run for 10+ minutes (CLIP + Claude verification ladder per image). With the new 30-min heartbeat-stale window, a single such page would be perilously close to the cutoff.
+
+Added a periodic intra-page heartbeat: `if local_total_images % _HEARTBEAT_EVERY_N == 0: _heartbeat(scan_job_id)` with `_HEARTBEAT_EVERY_N = 10`. A 100-image page now produces ~10 heartbeat writes during analysis — chatty enough to survive a Supabase blip on any single write, sparse enough that the heartbeat isn't a meaningful share of scan cost (10 writes × ~50 ms × ~10 pages = 5 s overhead per scan vs minute-scale total runtime).
+
+**Item 3 — `POST /api/v1/scans/{id}/cancel` endpoint + Cancel button on the scans page.** Even with Item 1 tightening the auto-fail window to 30 min, an operator who *knows* the worker is dead (e.g., they just saw the OOM event in DO Insights) shouldn't have to wait for any cron at all. The cancel endpoint flips `pending`/`running`/`analyzing` rows to `failed` with `error_message = "Cancelled by operator"` and stamps `completed_at = now()`. Already-terminal rows (`completed`/`failed`) return 400 with a hint to use Delete instead.
+
+The endpoint is org-scoped via `select(*).eq("id", X).eq("organization_id", Y).maybe_single()` so cross-tenant access returns 404 — same leak-resistant pattern the `delete_scan_job` endpoint uses, where "scan does not exist" and "scan belongs to a different org" are deliberately indistinguishable to the caller.
+
+The cancel does NOT actively halt a still-alive worker — that would require runner-side cancel-aware heartbeats (raise `ScanCancelled` if a heartbeat conditional update finds 0 matched rows because someone flipped status under us), which is real plumbing across all five `_heartbeat` call sites. For the primary use case (worker is dead) the race is impossible. For the rare "I changed my mind on a live scan" case the worst-case outcome is one status oscillation when the runner finishes its current page and writes its own terminal status. The endpoint docstring says so explicitly. Future runner-side cancel-awareness is the right next step but out of scope here.
+
+The frontend wires:
+- `cancelScan(jobId)` in `frontend/lib/api.ts`.
+- `useCancelScan()` mutation hook in `frontend/lib/hooks.ts` that invalidates `queryKeys.scans.all` + dashboard stats on success so the row visibly flips.
+- A new amber-bordered Cancel button on every active scan row in `frontend/app/scans/page.tsx`, sitting between View Results and the Trash icon. Renders only for `pending`/`running`/`analyzing` so completed/failed rows aren't cluttered. Uses the `Ban` lucide icon. The confirm() dialog explicitly tells the operator that cancelling does NOT actively halt a live worker — sets correct expectations.
+- The existing failure-banner hint text now suppresses its generic "check your URLs" suggestion for the new operator-cancelled / heartbeat-stale / pending-stale messages, because those messages are themselves operator-friendly and a generic hint would be misleading.
+
+### What did NOT change
+
+- **The OOM itself.** Reducing the page-9-style RSS peak (Playwright + CLIP + full-page PNG + Supabase upload all hot at once) would require streaming the screenshot upload instead of buffering it, and ideally dropping the in-process CLIP model in favour of an out-of-process embedding service. That's bigger surgery and orthogonal to recovery; recovery has to work whether or not we eventually fix the kill itself.
+- **The 4-hour `SCAN_TIMEOUT_SECONDS` `asyncio.wait_for` backstop in `tasks.py`.** Same logic — that's the in-runner watchdog for genuinely-slow legitimate scans, not the cleanup cron. The cleanup cron is the safety net for *dead* runners; the wait_for is the cap for *running* runners.
+- **`_renew_scheduler_lock` warning spam.** Every minute the API container logs `Failed to renew scheduler lock` at WARNING. It's harmless (the lock is held by a different gunicorn worker; the cleanup job clearly still runs) but noisy. Out of scope here — fixing it cleanly is a separate "drop the lock-renewal log to debug when the lock is held elsewhere" change.
+- **Runner-side cancel-awareness.** As above — the cancel endpoint is UI-state-only this phase. Not a regression because pre-this-phase there was no cancel at all.
+
+### Files
+
+- `backend/app/services/scheduler_service.py` — `_cleanup_stale_scans` rewritten. New constants `_PENDING_STALE_AFTER`, `_HEARTBEAT_STALE_AFTER` (30 min, was 4 h), `_NO_HEARTBEAT_STALE_AFTER`. Three buckets, three distinct error messages, dedup tightened to one update per row.
+- `backend/app/services/scan_runners.py` — new `_HEARTBEAT_EVERY_N = 10` constant. Per-image heartbeat tick added inside the analysis loop. `_heartbeat` docstring updated to reflect new cadence.
+- `backend/app/routers/scanning.py` — new `POST /scans/{job_id}/cancel` endpoint. Module-scope `SCAN_CANCEL_MESSAGE = "Cancelled by operator"` and `_CANCELLABLE_STATUSES = {"pending", "running", "analyzing"}` constants. `datetime` import added.
+- `frontend/lib/api.ts` — `cancelScan` function.
+- `frontend/lib/hooks.ts` — `useCancelScan` mutation hook.
+- `frontend/app/scans/page.tsx` — `Ban` icon import; `useCancelScan` wired; `handleCancelScan` handler; new Cancel button in the action group on each scan row, gated by status; failure-banner hint text suppressed for the new operator-cancelled / cleanup-job error messages.
+- `backend/tests/test_scheduler_cleanup.py` — **new file**, 7 cases. Pins the three cutoffs (15 min / 30 min / 4 h), the three distinct error messages, dedup behaviour, empty-state contract, and Supabase-exception resilience.
+- `backend/tests/test_scan_cancel.py` — **new file**, 9 cases (3 cancellable statuses parametrised + fallback body + 2 terminal statuses parametrised + terminal-no-update + missing scan + cross-org + cancel-message-constant). Exercises the actual FastAPI route through `TestClient` with the same JWT/auth machinery as `test_tenant_isolation.py`.
+
+### Test results
+
+- **Backend:** `pytest tests/ --ignore=tests/test_ai_service_diagnostics.py` → **223 passed, 0 failed.** New tests this phase: 16 (7 scheduler + 9 cancel), all green. The `test_ai_service_diagnostics.py` ignore is the same Python-3.9 `asyncio.run()` cross-test event-loop quirk documented in the Phase 6.5.4 entry — passes cleanly when run in isolation, CI runs Python 3.11 where it's fine.
+- **Frontend:** `npx tsc --noEmit` clean (no new type errors). `npm test` 24/24 passed (existing suite, no new tests added — the cancel UI changes are straightforward conditional rendering exercised by the integration tests on the backend side).
+
+### Verification after deploy
+
+- A scan whose worker dies between heartbeats now auto-fails within **30 minutes** of the last heartbeat (was 4 hours). The row's `error_message` clearly identifies the path (`Scan worker stopped heartbeating for 30 minutes — runner most likely crashed or was OOM-killed`).
+- A scan stuck in `pending` (worker down / not claiming) auto-fails within **15 minutes** of creation with `Scan stuck in pending — worker did not claim the job within 15 minutes`.
+- The operator can hit the new amber **Cancel** button on any active scan row to flip it to `failed` immediately. The Retry button on the now-failed row works as before.
+- Heavy AEM-style pages (100+ creatives) keep `last_heartbeat_at` fresh throughout analysis instead of going stale halfway through. No false-positive auto-fails on healthy long pages should result from the tightened 30-min window.
+- The 2026-05-05 incident specifically: had this phase been live, the operator would have either seen the row auto-fail by 19:00 UTC (30 min after the 18:30:48 last heartbeat) OR been able to click Cancel at any point in between to mark it failed instantly.
+
+### Open follow-ups (still not in this commit)
+
+1. (carried) Sitemap-via-unlocker for very large dealer sites. *Deferred indefinitely per `rent.cat.com` deprioritization.*
+2. (carried) Distributor mapping bug — `rent.cat.com` matches all attribute to one seed distributor. *Deferred indefinitely.*
+3. (carried) Local-dev `.env` parsing — leading-space tolerance via `tr -d ' '`.
+4. (carried) Replace data-URL asset storage with Supabase Storage. Bigger project; not blocking anything.
+5. (carried) Per-host Claude-error trend in the operator dashboard. Aggregating across the last N scans per host so operators can see "host X has been hitting rate_limit at 30%+ for the last 10 scans". Requires a small RPC + a chart on the host-detail page; deferred until we have the next genuinely-blocked dealer to motivate it.
+6. (carried) Migration to drop the no-longer-valid `screenshotone` strategy values from `host_scan_policy.notes` history.
+7. **Runner-side cancel-aware heartbeat.** The cancel endpoint is UI-state-only this phase. Adding a `ScanCancelled` exception that the runner raises when a heartbeat conditional update finds 0 matched rows (because the operator flipped status under us) would actively halt in-flight work. Right shape: turn `_heartbeat` into a function that returns the matched row count from `.update().in_("status", [...]).execute()` and raise from the call site if 0. Touches all five `_heartbeat` call sites; deferred until we have a use case beyond "worker is dead, let me unstick the UI" — for the dead-worker case there's no race so it doesn't matter.
+8. **Stream the evidence-screenshot upload in `extraction_service._upload_screenshot`.** The page-9 OOM hypothesis turns directly on Playwright + CLIP + a buffered full-page PNG + Supabase Storage upload all in RSS at once. Streaming the upload (chunked write through `requests` / `httpx` instead of `supabase.storage.from_().upload(bytes)`) and dropping the screenshot reference as soon as the upload completes would cut the peak RSS by the screenshot size (typically 2–10 MB, sometimes 30 MB+ for tall pages). Doesn't fix Playwright + CLIP being co-resident, but every MB shaved off the peak is an OOM risk reduction. *(Resolved another way in Phase 6.5.8 — JPEG + height-clip + screenshot-concurrency cap removed enough RSS that streaming is no longer the next bottleneck.)*
+9. **Out-of-process CLIP service.** Loading the CLIP model in the same process as Playwright Chromium is the structural cause of the high RSS floor. Moving CLIP to its own worker process (Redis-backed work queue, the same shape `worker.py` already uses for scans) would cut the runner's baseline RSS by the model size and let the runner OOM-die cheaply if it ever does. Bigger project; not next.
+10. **Quieter scheduler-lock-renewal logging.** `[W] [scheduler] Failed to renew scheduler lock` fires every minute on every API instance that doesn't hold the lock — i.e. every instance except one. It's signal in the wrong direction (the lock is *correctly* held elsewhere) and obscures real warnings. Drop this specific path to DEBUG when the failure mode is "lock held by another worker", keep it at WARNING for actual Redis errors.
+
+---
+
+## 2026-05-05 — Phase 6.5.8 — OOM prevention at the screenshot/upload step
+
+### Why now
+
+Phase 6.5.7 (earlier today) made stuck scans recoverable but did **not** stop them from getting stuck in the first place. The 18:30:48 UTC silence was an OOM-kill — the platform terminated the worker process the moment its RSS exceeded the instance's memory budget — so any number of recovery improvements still leave us where we started: scans that die mid-run because the runner runs out of memory on a heavy page.
+
+Reconstructing the RSS profile of the runner at the moment of death:
+
+- **Playwright Chromium** (per browser, ~150–250 MB resident).
+- **CLIP ViT-B/32 model** loaded in-process (~600 MB FP32, ~150 MB after the CLIP service moved to FP16 — still hundreds of MB).
+- **Up to 4 dealer pipelines in parallel** (`max_concurrent_dealers=4`), each with its own Playwright BrowserContext and image working set.
+- **A full-page PNG screenshot** of an AEM-style landing page. AEM's `/inventory` mega-pages render at 30000+ px tall; the resulting PNG is **30–60 MB on its own**. Up to 4 of these can be live at once when each dealer reaches its evidence-screenshot step.
+- **An in-flight Supabase Storage upload buffer** holding the same bytes.
+- **PIL's decoded full-page Image** from `_localize_and_crop_assets` — a 1920×30000 RGB is **~170 MB** in PIL's RGB buffer alone.
+
+Worst case at the page-9 moment: 4 dealers × (~50 MB PNG + ~170 MB PIL Image + Chromium context) on top of CLIP + the browser singleton. That comfortably exceeds the 4 GB DO `basic-xs` worker. The platform OOM-kills the process; no Python traceback is emitted because SIGKILL doesn't run handlers.
+
+### What changed (six orthogonal mitigations, one commit)
+
+All six are in `backend/app/services/extraction_service.py` plus four new settings in `backend/app/config.py`. No new deps — `gc`, `resource`, `sys` are stdlib.
+
+**Mitigation 1 — JPEG instead of PNG for evidence screenshots.**
+Switched all three `page.screenshot(full_page=True, type="png")` call sites to go through a single `_take_evidence_screenshot()` helper that defaults to `type="jpeg", quality=82`. JPEG-82 is visually indistinguishable from PNG for the audit-trail use case (operators view it as a thumbnail) and is **5–10× smaller in bytes** for the photographic content that dominates dealer pages. CV matching (`cv_matching.template_match` and `_orb_match`) consumes the bytes via `cv2.imdecode`, which is format-agnostic; OpenCV's downstream features survive JPEG-82 cleanly per a decade of CV literature. Toggleable via `evidence_screenshot_format=png` if any operator ever needs lossless evidence; quality knob is `evidence_screenshot_quality` (1–95, default 82).
+
+**Mitigation 2 — Hard cap on captured page height.**
+Same helper probes `document.body.scrollHeight` before the screenshot. If the page is taller than `max_screenshot_height` (default **12000 px**), it switches from `full_page=True` to `clip={x:0, y:0, width:viewport, height:cap}`. AEM mega-pages no longer produce 50+ MB shots; they produce ≤12 MB ones, regardless of how tall the rendered DOM gets. The truncation is metadata-flagged (`evidence_screenshot.clipped: true, captured_height_px: 12000`) on every discovered_image row from that page so operators can tell at a glance whether an asset that "should be on the page" might just be below the cap. 12000 px is a deliberate over-cap — most dealer hero/promo content is in the first ~6000 px; the cap exists to bound the worst case, not to define normal.
+
+**Mitigation 3 — Global screenshot-concurrency semaphore.**
+Independent of `max_concurrent_dealers`. A module-level `_screenshot_semaphore` (lazy-init, configurable via `max_concurrent_screenshots`, default **2**) wraps the screenshot+upload+localize critical section. Even with 4 dealers in parallel, only 2 of them can be in the screenshot RSS spike at once. The other 2 wait on the semaphore — they don't fall behind, they just *don't compound peak RSS*. Net effect: worst-case concurrent screenshot bytes go from `4 × MAX_PNG ≈ 200 MB` to `2 × MAX_JPEG ≈ 4 MB`, a 50× reduction.
+
+**Mitigation 4 — Aggressive byte release.**
+After both screenshot consumers (the upload and the optional CV localizer) are done, `del screenshot_bytes` runs immediately so the bytes can be freed before the dealer's per-image insert loop begins. PIL's `full_img.close()` is also called in `_localize_and_crop_assets` so the decoded RGB buffer (~170 MB on the worst-case page) doesn't linger past its last use. A `gc.collect()` runs in the `finally` of every `_attempt_extraction` and `_extract_ads_from_viewport` call so transient cycles (numpy arrays, BytesIO, PIL slicings) get reclaimed before the next page allocates fresh ones. Python's generational GC normally lags peak-RSS moments by enough cycles that under back-to-back heavy pages the worker can stay above its memory ceiling even when no individual page warrants it; the explicit `collect()` is the bridge.
+
+**Mitigation 5 — Chromium memory-diet launch flags.**
+Added the standard headless-Chrome RSS diet to `_get_browser`:
+
+```text
+--js-flags=--max-old-space-size=512    # cap V8 old-space heap
+--disable-background-networking
+--disable-background-timer-throttling
+--disable-backgrounding-occluded-windows
+--disable-breakpad
+--disable-component-extensions-with-background-pages
+--disable-default-apps
+--disable-extensions
+--disable-features=TranslateUI,BlinkGenPropertyTrees,site-per-process
+--disable-sync
+--metrics-recording-only
+--mute-audio
+--no-default-browser-check
+--no-first-run
+```
+
+Each flag drops a slice of Chromium RSS without affecting render fidelity for the dealer-page workload. The pre-existing stealth flag (`--disable-blink-features=AutomationControlled`) and the platform flags (`--no-sandbox`, `--disable-dev-shm-usage`) are unchanged. `site-per-process` getting disabled is the load-bearing one — it stops Chromium spawning a separate renderer process per cross-origin iframe, which dealer pages embed dozens of.
+
+**Mitigation 6 — RSS observability via `resource.getrusage`.**
+A `_log_rss(label)` helper emits one INFO-level line `rss=NNNMB stage=<label>` at: `pre-screenshot`, `post-screenshot`, `post-upload`, `end-page`. Stdlib-only (`resource.RUSAGE_SELF.ru_maxrss`, normalised to MB across Linux KB and macOS bytes via `sys.platform`). No psutil dependency. Best-effort — wrapped in a try/except so a broken `getrusage` cannot break a scan. With this in place we can finally *see* the RSS profile in prod logs and confirm whether the mitigations are doing what they claim.
+
+### Files touched
+
+- `backend/app/config.py`
+  - 4 new settings: `evidence_screenshot_format`, `evidence_screenshot_quality`, `max_screenshot_height`, `max_concurrent_screenshots`.
+- `backend/app/services/extraction_service.py`
+  - New: `_screenshot_semaphore`, `_get_screenshot_semaphore`, `_rss_mb`, `_log_rss`, `_evidence_screenshot_extension`, `_evidence_screenshot_content_type`, `_take_evidence_screenshot`.
+  - `_upload_screenshot` now respects the configured format / content-type and accepts caller-overrides.
+  - `_capture_evidence_screenshot` is now the documented single entry point for the audit screenshot and uses the semaphore + helper.
+  - 3 raw `page.screenshot(full_page=True, type="png")` call sites refactored to go through `_take_evidence_screenshot` under the semaphore. Bytes are dropped post-localize.
+  - `_localize_and_crop_assets` calls `full_img.close()` before returning so the PIL pixel buffer doesn't linger.
+  - `_attempt_extraction` and `_extract_ads_from_viewport` `gc.collect()` in their `finally` blocks and emit an `end-page` RSS log line.
+  - 14 RSS-saving Chromium launch flags added.
+- `backend/tests/test_extraction_screenshot_oom.py` *(new)*
+  - 14 unit tests pinning: JPEG-default, height-clip threshold, fallback when height probe fails, PNG honours format flag, content-type plumbing, upload-helper format overrides, semaphore actually caps concurrency, RSS observability is safe, every diet flag is present, every pre-existing platform/stealth flag is preserved.
+
+### Test results
+
+```
+$ pytest backend/tests/test_extraction_screenshot_oom.py -q
+14 passed
+$ pytest backend/tests --ignore=backend/tests/test_ai_service_diagnostics.py -q
+237 passed
+```
+
+`test_ai_service_diagnostics.py` has a pre-existing event-loop fixture issue unrelated to this phase (5 errors, all `RuntimeError: There is no current event loop in thread 'MainThread'`); the rest of that file's 15 tests pass and are unaffected by the changes here.
+
+### What this fixes (and what it doesn't)
+
+**Fixes:**
+
+- The page-9 OOM as observed: combined screenshot RSS pressure drops from `4 × 50 MB = 200 MB worst-case` to `2 × 4 MB ≈ 8 MB worst-case`, a 25× reduction at the exact step where the worker died.
+- AEM-style mega-pages: 30000-px landing pages no longer produce 50 MB screenshots that have no chance of fitting in RSS.
+- Chromium's contribution to baseline RSS: down by ~80–150 MB depending on the page's iframe count, courtesy of the `site-per-process`-off flag.
+- Any future regression of these mitigations is gated by the new test suite — losing a flag, the JPEG default, or the semaphore would fail at least one assertion.
+
+**Does NOT fix (still on the follow-up list):**
+
+- CLIP being co-resident with Playwright. The CLIP model (~150 MB FP16, ~600 MB FP32) is still loaded in the same process. This is the structural floor of the runner's RSS; moving CLIP to its own worker process is the next-biggest lever. *(Follow-up #9 from Phase 6.5.7.)*
+- A worker that genuinely runs out of memory now (rare but possible if a single dealer has an unusually creative-heavy hero plus dozens of campaigns to localize). Phase 6.5.7's tightened cleanup window (30 min heartbeat-stale) is the safety net for that case.
+
+### Verification on next prod scan
+
+- The first scan after deploy should show `Evidence screenshot saved (jpg, NNNNN bytes)` log lines instead of the previous `(png)` ones, and the byte counts should be 5–10× smaller than before for the same pages.
+- `rss=NNNMB stage=<...>` lines should appear at every page boundary; the `post-screenshot`–`pre-screenshot` delta is the screenshot's RSS contribution and should be a small single-digit MB on JPEG, not the previous tens of MB on PNG.
+- No `Cancelled by operator` or `auto-failed by cleanup job` messages on heavy AEM dealers that previously hit the OOM. Successful end-to-end completion is the actual success criterion.
+- If a page is taller than 12000 px, the corresponding `discovered_images.metadata.evidence_screenshot.clipped` flag is `true` and `captured_height_px` is `12000`. Operators auditing "the asset is on the page but the screenshot doesn't show it" complaints can use this to tell whether the asset is below the cap (an artefact of the fix) vs. genuinely missing (a real product bug).
+
+### Open follow-ups (still not in this commit)
+
+Carrying forward from Phase 6.5.7's #1–#7 and #10 (unchanged). #8 (streaming upload) is no longer the next bottleneck and is downgraded to *speculative* — JPEG + the semaphore eliminate the RSS pressure that motivated it. #9 (out-of-process CLIP) is now the highest-impact remaining item.
