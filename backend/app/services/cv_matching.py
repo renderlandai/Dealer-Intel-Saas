@@ -50,7 +50,7 @@ def template_match(
     asset_bytes: bytes,
     scale_range: Tuple[float, float] = (0.10, 1.8),
     scale_steps: int = 50,
-    threshold: float = 0.40,
+    threshold: float = 0.55,
 ) -> List[Dict[str, Any]]:
     """
     Find the asset in the screenshot using multi-scale normalised
@@ -61,6 +61,18 @@ def template_match(
 
     Returns a list of match dicts sorted by confidence (highest first).
     Each dict: {x, y, width, height, confidence, method}.
+
+    Threshold (Phase 6.5.10): the previous default of 0.40 was below
+    the floor where "actual visual match" reliably outranks "incidental
+    pixel correlation." With a 50-scale max-pooled sweep, anything
+    below ~0.55 has a non-trivial chance of clearing the bar against
+    a navigation tile or hero photo at *some* scale even when the
+    asset is not on the page. Each ghost crop costs ~$0.023 in
+    downstream Claude calls (compare + verify + compliance) and
+    occasionally gets recorded as a match. 0.55 keeps legitimate
+    creative localisation intact (tolerant of CSS resampling and
+    JPEG re-encodes) while rejecting ~80% of the gradient-overlap
+    noise that 0.40 admitted.
     """
     screenshot = _bytes_to_cv(screenshot_bytes)
     asset = _bytes_to_cv(asset_bytes)
@@ -214,7 +226,7 @@ def feature_match(
 def find_asset_on_page(
     screenshot_bytes: bytes,
     asset_bytes: bytes,
-    template_threshold: float = 0.40,
+    template_threshold: float = 0.55,
     feature_min_matches: int = 8,
 ) -> List[Dict[str, Any]]:
     """

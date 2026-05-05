@@ -236,6 +236,15 @@ class ExtractionResult:
     outcome: str = OUTCOME_EMPTY
     block_reason: Optional[str] = None
     http_status: Optional[int] = None
+    # Phase 6.5.10 — which ladder rung produced this result, if any.
+    # Populated by `extract_dealer_website` from `LadderResult.succeeded_attempt`
+    # so callers (specifically `_process_one_dealer` in scan_runners) can
+    # tell a Playwright-rung success apart from a Bright-Data-rung success
+    # without round-tripping through the block_reason string.
+    # ``None`` means either the ladder didn't succeed at all (every rung
+    # produced a non-IMAGES outcome) or the result came from a code path
+    # that doesn't use the ladder (e.g. the cv-localizer fallback).
+    succeeded_attempt: Optional[str] = None
 
 
 # Shared browser instance to avoid repeated cold starts
@@ -1195,6 +1204,12 @@ async def extract_dealer_website(
             f"{a.attempt}={a.outcome}" for a in ladder.attempts
         )
         final.block_reason = f"ladder({strategy}): {trail}"
+
+    # Phase 6.5.10 — propagate which rung succeeded so the caller can
+    # drive the host-policy auto-demote. The ladder result already
+    # tracks this (see render_strategies.LadderResult), it just wasn't
+    # being plumbed onto the ExtractionResult that callers see.
+    final.succeeded_attempt = ladder.succeeded_attempt
 
     log.info(
         "Dealer page %s — strategy=%s succeeded=%s outcome=%s count=%d",

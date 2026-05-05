@@ -30,6 +30,19 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture
+def _unlocker_discovery_enabled():
+    """6.5.9 flipped ``unlocker_discovery_enabled`` to False by default.
+    Tests in this file pre-date that and document the legacy contract
+    that still applies when an operator opts into BD discovery, so we
+    flip the flag back on for the duration of the test."""
+    from unittest.mock import MagicMock
+    fake_settings = MagicMock()
+    fake_settings.unlocker_discovery_enabled = True
+    with patch("app.config.get_settings", return_value=fake_settings):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Strategy-driven routing of discovery
 # ---------------------------------------------------------------------------
@@ -38,7 +51,7 @@ class TestDiscoverPagesStrategyRouting:
     """``discover_pages`` should consult ``host_policy_service`` and skip
     direct probes on WAF-grade strategies."""
 
-    def test_unlocker_only_strategy_skips_direct_probes(self):
+    def test_unlocker_only_strategy_skips_direct_probes(self, _unlocker_discovery_enabled):
         """A host on ``unlocker_only`` should never call _probe_common_paths
         / _fetch_sitemap_urls / _crawl_homepage_links — those are
         guaranteed-zero on the same WAF that earned the strategy."""
@@ -75,7 +88,7 @@ class TestDiscoverPagesStrategyRouting:
         assert len(urls) == 4
         assert "https://rent.cat.com/wheeler/specials" in urls
 
-    def test_playwright_then_unlocker_strategy_also_skips_direct(self):
+    def test_playwright_then_unlocker_strategy_also_skips_direct(self, _unlocker_discovery_enabled):
         from app.services import page_discovery
 
         called = {"direct": 0, "unlocker": 0}
@@ -146,7 +159,7 @@ class TestUnlockerFallbackOnEmptyDirect:
     produced 0 results we should fall back to the unlocker — that's the
     exact symptom rent.cat.com showed before its policy row existed."""
 
-    def test_fallback_triggers_when_direct_returns_only_base(self):
+    def test_fallback_triggers_when_direct_returns_only_base(self, _unlocker_discovery_enabled):
         from app.services import page_discovery
 
         called = {"unlocker": 0}
@@ -179,7 +192,7 @@ class TestUnlockerFallbackOnEmptyDirect:
         # Base + 2 unlocker pages
         assert len(urls) == 3
 
-    def test_promo_links_from_unlocker_are_promoted_first(self):
+    def test_promo_links_from_unlocker_are_promoted_first(self, _unlocker_discovery_enabled):
         """Same ordering rules as the direct path: promo-keyword URLs
         get filled into the result list before non-promo URLs."""
         from app.services import page_discovery

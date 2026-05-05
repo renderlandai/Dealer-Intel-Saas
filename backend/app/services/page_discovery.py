@@ -584,7 +584,27 @@ async def discover_pages(
     # (known WAF host) or because direct returned only the base URL
     # (likely-but-unconfirmed WAF). One extra Bright Data request per
     # affected dealer per scan — see module docstring for cost notes.
-    needs_unlocker_fallback = skip_direct or len(result) <= 1
+    #
+    # Phase 6.5.9: gated behind `unlocker_discovery_enabled` (default
+    # False). The previous trigger fired on any healthy host whose
+    # homepage HTML happened to ship without parseable href links
+    # (lots of JS-heavy dealer sites hydrate links client-side), which
+    # silently expanded BD usage well beyond the WAF-blocked cohort it
+    # was designed for. With the flag off, page discovery falls back
+    # to "what we got from sitemap + direct crawl"; the rendering
+    # ladder's per-page BD rung still picks up genuinely WAF-blocked
+    # pages so we don't lose evidence on the dealers that truly need
+    # BD.
+    try:
+        from ..config import get_settings
+        _ds_settings = get_settings()
+        _discovery_enabled = bool(getattr(_ds_settings, "unlocker_discovery_enabled", False))
+    except Exception:
+        _discovery_enabled = False
+
+    needs_unlocker_fallback = (
+        _discovery_enabled and (skip_direct or len(result) <= 1)
+    )
     if needs_unlocker_fallback and len(result) < max_pages:
         unlocker_links = await _crawl_homepage_links_via_unlocker(
             base_url, base_domain,

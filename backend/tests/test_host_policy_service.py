@@ -187,7 +187,7 @@ class TestRecordHostOutcomes:
                 "rent.cat.com": self._agg(blocked=3, last_block_reason="HTTP 403"),
             })
         assert promotions == [
-            ("rent.cat.com", "playwright_desktop", "playwright_mobile_first"),
+            ("rent.cat.com", "playwright_desktop", "playwright_mobile_first", "promoted"),
         ]
         upserted = table_mock.upsert.call_args[0][0]
         assert upserted["strategy"] == "playwright_mobile_first"

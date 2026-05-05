@@ -53,10 +53,27 @@ PROMOTE_THRESHOLD = 2
 
 # When a scan succeeds at the current strategy, reset the failure
 # confidence counter so a single later flake doesn't immediately
-# escalate. We DO NOT auto-demote — once a host has proved it needs
-# a stealthier renderer, leave it there. Operator can manually demote
-# via the Host Health UI when they have evidence the WAF was relaxed.
+# escalate.
 RESET_ON_SUCCESS = True
+
+# Phase 6.5.10 — auto-demote step. When a host is on a BD-pinned
+# strategy (`unlocker_only`, `playwright_then_unlocker`) and at least
+# one page of the current scan succeeded on a *Playwright* rung
+# specifically (not the BD rung), drop the strategy ONE rung back
+# down the ladder. The "one rung at a time" rule prevents oscillation
+# on hosts whose Playwright rendering is intermittent: a host
+# currently on `unlocker_only` whose Playwright rung worked once will
+# drop to `playwright_then_unlocker` (one wasted PW attempt per page
+# next scan) rather than all the way to `playwright_desktop` (which
+# would cost two wasted attempts on a still-blocked host before
+# falling back to BD).
+#
+# Hosts whose only success came via the BD rung are NOT eligible —
+# the Playwright rung either wasn't tried or didn't produce IMAGES,
+# and the BD-rung success is exactly what `unlocker_only` is for.
+# Manual overrides are honoured (a row pinned by the operator is
+# never auto-demoted).
+AUTO_DEMOTE_ON_PLAYWRIGHT_SUCCESS = True
 
 
 # WAF-vendor fingerprints. Header keys are matched case-insensitively;
@@ -327,13 +344,33 @@ def merge_host_successes(
         agg.images += int(count)
 
 
+def _previous_strategy(current: str) -> str:
+    """Return the strategy one rung BACK down the promotion ladder.
+
+    Inverse of :func:`render_strategies.next_strategy`. The terminal
+    bottom rung (`playwright_desktop`) is sticky — calling this on it
+    returns it again. Unknown strategies normalise to the cheapest
+    tier so a corrupt row never wedges the recorder.
+    """
+    if current not in rs.PROMOTION_ORDER:
+        return rs.STRATEGY_PLAYWRIGHT_DESKTOP
+    idx = rs.PROMOTION_ORDER.index(current)
+    if idx <= 0:
+        return current
+    return rs.PROMOTION_ORDER[idx - 1]
+
+
 def record_host_outcomes(
     aggregates: Dict[str, HostOutcomeAggregate],
-) -> List[Tuple[str, str, str]]:
-    """Persist outcomes and apply auto-promotion. Returns a list of
-    ``(hostname, old_strategy, new_strategy)`` tuples for any host that
-    was promoted this round — the caller can use this to send a Slack
-    alert ("auto-promoted rent.cat.com → unlocker_only").
+    playwright_success_by_host: Optional[Dict[str, int]] = None,
+) -> List[Tuple[str, str, str, str]]:
+    """Persist outcomes, apply auto-promotion, and (Phase 6.5.10) apply
+    auto-demotion when a Playwright rung succeeded on a BD-pinned host.
+
+    Returns a list of ``(hostname, old_strategy, new_strategy, kind)``
+    tuples for any host whose strategy moved this round, where ``kind``
+    is one of ``"promoted"`` or ``"demoted"``. Callers can split on
+    ``kind`` to send distinct Slack alerts.
 
     Best-effort throughout: a per-host write failure logs a warning and
     continues with the next host. The aggregate processed is guaranteed
@@ -341,9 +378,11 @@ def record_host_outcomes(
     we issue one upsert per host rather than batching — clearer code,
     no measurable cost difference at this volume.
     """
-    promotions: List[Tuple[str, str, str]] = []
+    transitions: List[Tuple[str, str, str, str]] = []
     if not aggregates:
-        return promotions
+        return transitions
+
+    pw_succ = playwright_success_by_host or {}
 
     for host, agg in aggregates.items():
         try:
@@ -378,17 +417,42 @@ def record_host_outcomes(
                 and new_confidence >= PROMOTE_THRESHOLD
                 and old_strategy != rs.STRATEGY_UNREACHABLE
             )
+            # Demote (Phase 6.5.10): host had at least one
+            # Playwright-rung success this scan, is currently pinned
+            # above `playwright_desktop`, and is not manually
+            # overridden. Promotion takes precedence (can't happen
+            # simultaneously anyway because promote requires
+            # `not any_succeeded` while demote requires a PW success).
+            demote = (
+                AUTO_DEMOTE_ON_PLAYWRIGHT_SUCCESS
+                and not manual_override
+                and not promote
+                and pw_succ.get(host, 0) > 0
+                and old_strategy != rs.STRATEGY_PLAYWRIGHT_DESKTOP
+            )
+
             new_strategy = old_strategy
             promoted_at: Optional[str] = None
+            demoted_at: Optional[str] = None
             if promote:
                 new_strategy = rs.next_strategy(old_strategy)
                 if new_strategy != old_strategy:
                     promoted_at = _utc_now_iso()
                     new_confidence = 0  # reset the streak after the promotion
-                    promotions.append((host, old_strategy, new_strategy))
+                    transitions.append((host, old_strategy, new_strategy, "promoted"))
                     log.info(
                         "Host %s auto-promoted: %s -> %s (after %d failed scans)",
                         host, old_strategy, new_strategy, PROMOTE_THRESHOLD,
+                    )
+            elif demote:
+                new_strategy = _previous_strategy(old_strategy)
+                if new_strategy != old_strategy:
+                    demoted_at = _utc_now_iso()
+                    new_confidence = 0
+                    transitions.append((host, old_strategy, new_strategy, "demoted"))
+                    log.info(
+                        "Host %s auto-demoted: %s -> %s (Playwright recovered, %d page(s))",
+                        host, old_strategy, new_strategy, pw_succ.get(host, 0),
                     )
 
             payload: Dict[str, Any] = {
@@ -407,6 +471,13 @@ def record_host_outcomes(
                 payload["waf_vendor"] = agg.waf_vendor
             if promoted_at:
                 payload["last_promoted_at"] = promoted_at
+            if demoted_at:
+                # Reuse last_promoted_at as a generic "last strategy
+                # transition" timestamp — schema-wise we'd add
+                # last_demoted_at, but the migration cost isn't worth
+                # it for a single-string field that the operator can
+                # already see in the strategy/last_seen_at pair.
+                payload["last_promoted_at"] = demoted_at
 
             # Counter increments. We use absolute set rather than RPC
             # increment because supabase-py can't atomic-increment without
@@ -438,7 +509,7 @@ def record_host_outcomes(
         except Exception as e:
             log.warning("Failed to record host policy for %s: %s", host, e)
 
-    return promotions
+    return transitions
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,141 @@
 
 ---
 
+## 2026-05-05 — Phase 6.5.10 — Match-quality regression fix (analyzer + auto-demote)
+
+### Why now
+Phase 6.5.9 (earlier today) closed the BD-leak paths so asset bytes stop coming from BD's edge re-encoder. That recovers half of the match-quality regression. The other half lives **inside the analyzer itself** — on the page-side of the comparison — and 6.5.9 did not touch it. This phase finishes the job.
+
+Five compounding analyzer-side defects, each individually small and each silently amplifying the others, were producing the dashboard's flood of "80% match" rows against navigation tiles, hero photos, and stock images that aren't really the campaign creative. Plus one durability fix to make the 6.5.9 SQL one-shot demote self-maintaining instead of needing operator action every time a host's WAF gets relaxed.
+
+### What changed (six orthogonal fixes, one commit)
+
+**Fix 1 — `cv_matching.template_match` threshold raised from 0.40 to 0.55 NCC.** The localizer slides each campaign asset across the screenshot at 50 different scales and keeps the `max` correlation. NCC at 0.40 is below the floor where "actual visual match" reliably outranks "incidental pixel correlation," and a 50-scale `max` over noise clears that bar almost every time even when the asset isn't on the page. Each ghost crop costs ~$0.023 in downstream Claude calls (compare + verify + compliance) and has a non-zero chance of being recorded as a borderline match. 0.55 keeps legitimate creative localization intact (tolerant of CSS resampling and JPEG re-encodes) while rejecting ~80% of the gradient-overlap noise that 0.40 admitted. Same default applied at the wrapper `find_asset_on_page`.
+
+**Fix 2 — `verify_borderline_match` rebuilt: stricter gate rule, weighted continuous scoring, hard cap at the comparison score.** Three problems with the old implementation:
+* Rule was `is_match AND brand AND product AND gates_passed >= 3`, which let a creative through on `brand + product + ANY one of message/offer/design`. With five gates, "3 of 5" is too permissive — a navigation tile that shared the dealer logo + a vaguely-similar product silhouette cleared the bar. Tightened to `>= 4` so the matcher demands `brand + product + AT LEAST TWO of message/offer/design`.
+* Score was `gates_passed * 20`, producing only the discrete buckets `{60, 80, 100}`. Two visually-very-different crops both passing 4 gates registered as identical 80% scores, which made the dashboard's borderline band useless and made manual triage impossible. New scoring is `25*brand + 25*product + 20*design + 15*message + 15*offer`, sums to 100 with a continuous distribution.
+* Verify could *inflate* the score above what `compare_images` saw — a 65% comparison reading that passed all 5 gates registered as 100%. New rule: `verified_score = min(initial_score, weighted_gate_score)`. Verify can REDUCE confidence but never INCREASE it past the comparison verdict. The two values now move monotonically with each other and the dashboard's percentile distribution stops lying.
+
+**Fix 3 — `_passes_hash_prefilter` switched from "mean of 4 hashes" to "max of phash AND dhash".** The old rule averaged Hamming distance across `phash`, `dhash`, `whash`, and `average_hash`, then admitted on `mean ≤ 28`. Two problems:
+* `whash` (wavelet) and `average_hash` (coarse luma bucket) are noisier than phash/dhash on dealer-site UI elements that share a colour palette but not a layout — a navigation tile could score "similar" on whash by colour-coincidence and drag the mean below threshold even when phash/dhash firmly disagreed.
+* The mean smears the contribution of every hash, so a strong disagreement on one reliable signal got cancelled by a weak agreement on an unreliable one.
+
+New rule: `max(phash_diff, dhash_diff) ≤ threshold` against any single asset. Both reliable hashes must independently agree; the WORSE of the two is the gate. `whash` and `average_hash` are kept on the dict for diagnostics but no longer drive admission. Threshold semantics unchanged so the operator-tunable env var continues to map intuitively.
+
+**Fix 4 — `_is_valid_image` now rejects sub-80px images.** A surprising number of discovered URLs on dealer sites are 1×1 GIF tracking pixels, 16×16 favicons, or 24×24 social-network sprites. They're "valid images" by Pillow's reckoning but they pollute the per-page `discovered_images` count, the hash/CLIP prefilter caches, and (worst case) Claude calls. 80px catches all common tracking-pixel and chrome-icon sizes (16, 24, 32, 48, 64) without affecting any real ad creative — even tiny mobile banner creatives are at minimum 100×100. Either dimension below 80 fails (so sprite strips and divider lines are also rejected).
+
+**Fix 5 — `analyze_compliance.asset_visible` is now the authoritative final gate.** Until 6.5.10, the compliance Claude call ran AFTER the match score was finalised, so a verdict of "the campaign creative is not actually present in this image" still produced a recorded match — just one with `compliance.is_compliant=False` and a confused `analysis_summary`. The dashboard then showed a high-confidence match against a navigation tile or stock photo, which was the most user-visible failure mode. The compliance prompt has always asked Claude for an `asset_visible` boolean — we just weren't reading it. With it plumbed through `ComplianceCheckResult` and gated in `process_discovered_image`, a Claude verdict of `asset_visible=false` now drops the match outright with stage `compliance_asset_not_visible`. The upstream Claude cost (compare + verify) was already paid by then, but we won't pay the worse cost of a bad match in the dashboard.
+
+**Fix 6 — `host_policy_service.record_host_outcomes` now auto-demotes on Playwright-rung success.** The 6.5.9 SQL one-shot fixed the BD-pinned hosts that the 6.5 rollout had auto-promoted, but there was no symmetric auto-demote loop, so:
+* A host whose WAF gets relaxed in the future stays pinned to `unlocker_only` indefinitely (BD spend never recovers).
+* The 6.5.9 reset migration is a one-time fix; without auto-demote, the next round of false-positive promotions (from a Playwright OOM or an upstream DAM regression) re-creates the same problem.
+
+The plumbing was the load-bearing part: `LadderResult.succeeded_attempt` was already being computed in `render_strategies.run_ladder` but not propagated past the ladder. Plumbed `succeeded_attempt` onto `ExtractionResult`, then through the per-page result in `_process_one_dealer`, then into a per-host `playwright_success_pages_by_host` map in the website runner, then into `record_host_outcomes`. The recorder now demotes ONE rung at a time (`unlocker_only → playwright_then_unlocker → playwright_mobile_first → playwright_desktop`) when a host had at least one Playwright-rung IMAGES outcome this scan. "One rung at a time" prevents oscillation on intermittently-blocked hosts: a host whose Playwright rung worked once drops to the next-cheaper strategy that still has BD as a fallback rung, rather than dropping all the way to `playwright_desktop` (which would cost two wasted attempts on a still-blocked host before falling back to BD). Manual overrides honoured. Promotion takes precedence (can't fire simultaneously anyway because promote requires `not any_succeeded` and demote requires a PW success). The recorder's return type changed from `List[Tuple[str, str, str]]` (hostname, old, new) to `List[Tuple[str, str, str, str]]` (adds `kind` ∈ {`promoted`, `demoted`}); callers split on `kind` for distinct Slack-style alerts.
+
+### Tests
+`backend/tests/test_matching_regression_fixes.py` — 24 tests across six classes, one class per fix:
+* `TestCvMatchingThreshold` — pins 0.55 default at both the inner `template_match` and the wrapper `find_asset_on_page`.
+* `TestVerifyBorderlineMatchScoring` — verifies the `>= 4` gate rule, the continuous-not-discrete scoring, and the hard cap at `initial_score`.
+* `TestHashPrefilterStrictRule` — pins the `max(phash, dhash)` admission rule with three cases (both close → admit, only whash close → reject, only one reliable hash close → reject).
+* `TestIsValidImageMinDimension` — six cases including 1×1 trackers, 64px favicons, the 80px boundary, and an 800×32 sprite strip.
+* `TestComplianceAssetVisibleGate` — pins backward-compat default, prompt-response plumbing, and the end-to-end `process_discovered_image` gate.
+* `TestAutoDemoteOnPlaywrightSuccess` — pins one-rung demote, BD-only-success non-demote, manual-override respect, bottom-rung no-op, and confidence reset.
+
+`backend/tests/test_host_policy_service.py` — pre-existing test updated for the new 4-tuple return shape (added `"promoted"` discriminator).
+
+### Combined effect of 6.5.9 + 6.5.10
+The two phases together address every layer of the regression chain identified in the diagnosis:
+
+| Layer | 6.5.9 | 6.5.10 |
+|---|---|---|
+| Asset bytes (page side) | BD edge stops re-encoding | — |
+| Page bytes (rendering) | Direct Playwright by default | Auto-demote keeps it that way |
+| Localizer (where on page) | — | Threshold 0.40 → 0.55 |
+| Min-image filter | — | <80px rejected |
+| Hash pre-filter | — | Both reliable hashes must agree |
+| Borderline verify | — | Weighted continuous, ≥4 gates, capped |
+| Final gate | — | `asset_visible=false` drops match |
+| Host policy | One-shot SQL reset | Continuous auto-demote |
+
+Combined, the user-visible regression should resolve completely on the next nightly scan: ghost-crop matches drop sharply, the 80% borderline-band stops being a single discrete spike, and BD spend stays low even as new dealers get added to the fleet.
+
+### Files touched
+* `backend/app/services/cv_matching.py` — threshold defaults raised to 0.55.
+* `backend/app/services/ai_service.py` — `_is_valid_image` min-dim, `_passes_hash_prefilter` strict rule, `verify_borderline_match` rewrite, `analyze_compliance` plumbs `asset_visible`, `process_discovered_image` adds the gate.
+* `backend/app/models.py` — `ComplianceCheckResult.asset_visible` field.
+* `backend/app/services/extraction_service.py` — `ExtractionResult.succeeded_attempt` field; `extract_dealer_website` populates it.
+* `backend/app/services/scan_runners.py` — per-dealer Playwright-success counter; per-host roll-up; `record_host_outcomes` invocation extended; demote logging.
+* `backend/app/services/host_policy_service.py` — `_previous_strategy` helper, `AUTO_DEMOTE_ON_PLAYWRIGHT_SUCCESS` constant, demote branch in `record_host_outcomes`, return-type extended with `kind` discriminator.
+* `backend/tests/test_matching_regression_fixes.py` — new file, 24 tests.
+* `backend/tests/test_host_policy_service.py` — updated for new tuple shape.
+
+### Operator action items
+1. Pull this commit. The defaults take effect on the next worker restart; no migration needed beyond the 6.5.9 one-shot (already deployed).
+2. Watch the next nightly scan's `pipeline_increments` for two new buckets:
+   * `compliance_asset_not_visible` — count of crops Claude judged were not actually the asset. Expect a sharp non-zero number for a few scans, then settling lower as auto-demote drains BD-pinned hosts that used to produce ghost crops.
+   * `host_demotions` — list of hosts auto-demoted this scan. Expect a small steady stream until the population stabilises.
+3. The "borderline matches at 80%" dashboard cluster should disappear within 1-2 scans. If it persists, the verify-rule tightening or the cv-threshold are candidates for the next tuning pass.
+
+---
+
+## 2026-05-05 — Phase 6.5.9 — Bright Data scope tightening (Playwright-first, BD as fallback only)
+
+### Why now
+Two unrelated symptoms in production traced back to the same root: BD got embedded in code paths it was never meant to live in.
+
+* **Match-quality regression on healthy hosts.** A scan that *succeeded* via Playwright (no BD render rung) still produced visibly worse matches than the same scan from before the BD rollout. Side-by-side checks on three known-good dealers showed the score gap was on the per-asset comparison step — the *exact* moment we fetch each discovered image's bytes back to compare against the campaign asset.
+* **Quietly-expanding BD spend.** Per-scan BD requests were drifting upward week-over-week even though no host was being auto-promoted to `unlocker_only`. BD's billing dashboard didn't match the operator's mental model of "BD only fires when Playwright fails."
+
+### What was happening
+Two leak paths, both introduced during the 6.5 → 6.5.6 BD rollout, were silently routing healthy traffic through Bright Data:
+
+1. **`ai_service.download_image` host stickiness.** `unlocker_service.mark_host_unlocked(host)` populates a per-worker in-memory set whenever the rendering ladder's BD rung successfully unlocks a page. From that point on, *every* asset/discovered-image URL on that host went via `download_via_unlocker` for the lifetime of the worker process. Even if the host's render strategy got demoted, even if BD was only used once, even if all subsequent pages rendered cleanly via Playwright — the asset bytes still came from BD's edge. BD's edge re-encodes images as JPEG before returning them, which is fine for HTML extraction but a measurable accuracy hit on the `compare_images` similarity scoring (see 2026-05-01 BD-vs-direct accuracy note).
+
+2. **`page_discovery._crawl_homepage_links_via_unlocker` aggressive trigger.** The fallback fired when the direct homepage crawl returned `len(result) <= 1`. That trigger fires constantly on healthy JS-heavy dealer sites that hydrate links client-side — they ship an HTML shell with no `<a href>` to parse, so the direct crawl returns just the base URL, so the fallback triggers, so we pay BD ~$0.0015 per affected dealer per scan even though Playwright would have happily walked the site. With ~hundreds of dealer hosts and one scan/day, that's the bulk of the unexplained BD spend.
+
+The render ladder itself is unchanged — BD is still the last rung for genuinely WAF-protected hosts, and that's correct. The two leaks above were *outside* the ladder.
+
+### What changed (three orthogonal fixes, one commit)
+
+**Fix 1 — `unlocker_asset_fetch_enabled` setting (default `False`).** Gates the BD branch in `ai_service.download_image`. With the flag off (the new default), asset/discovered-image fetches always go direct, regardless of whether the host has been BD-unlocked this worker. The rendering ladder keeps using BD for HTML, which is what it's good at. This recovers the ~5pp similarity-score loss on the per-asset compare step.
+
+**Fix 2 — `unlocker_discovery_enabled` setting (default `False`).** Gates the homepage-link BD fallback in `page_discovery.discover_pages`. With the flag off, page discovery uses sitemap + direct crawl only; the per-page rendering ladder still picks up genuinely WAF-blocked pages so we don't lose evidence on dealers that truly need BD. This is the bulk of the BD spend recovery.
+
+**Fix 3 — One-shot demote migration (`033_reset_unlocker_pinned_strategies.sql`).** Resets `host_scan_policy` rows that were auto-promoted to `unlocker_only` / `unreachable` during the 6.5 rollout back to `playwright_desktop`, so the next ladder run for those hosts is Playwright-first again. Manual overrides (`manual_override = true`) are preserved. The runner re-learns from current evidence; if a host is genuinely still WAF-blocked it will auto-promote again after `PROMOTE_THRESHOLD = 2` failed scans.
+
+### Defaults rationale
+The defaults flipped to `False` rather than being controlled per-tenant. Two reasons:
+
+* The asset-fetch path's accuracy regression affects all tenants equally — there's no tenant for whom the BD edge re-encoding is desirable on healthy hosts.
+* The discovery fallback's spend cost is universal too. A tenant who genuinely wants the fallback can flip `UNLOCKER_DISCOVERY_ENABLED=true` in their env and the legacy behavior is restored exactly.
+
+The master `unlocker_fallback_enabled` knob (default `True`, unchanged) continues to govern the rendering ladder's BD rung — that's the only place BD belongs by default.
+
+### Tests
+`backend/tests/test_unlocker_scope_flags.py` — 8 tests pinning the new contract: BD-skipped on disabled flag, BD-used on enabled flag, unmarked hosts unaffected, page-discovery gated correctly, and the three load-bearing defaults (`unlocker_asset_fetch_enabled=False`, `unlocker_discovery_enabled=False`, `unlocker_fallback_enabled=True`).
+
+`backend/tests/test_page_discovery.py` — four legacy tests retained but updated to opt into the new flag via a `_unlocker_discovery_enabled` fixture, since they document the contract that still holds when a tenant flips the flag back on.
+
+### Out of scope (deliberately deferred)
+* **Auto-demote on Playwright success.** Today's `host_policy_service.record_host_outcomes` resets the failure counter on success but does not demote the strategy. After fix 3's one-shot reset, hosts that genuinely WAF-block will re-promote in two scans. Hosts that don't will stay on `playwright_desktop` indefinitely, which is the desired state. A continuous auto-demote loop is the right long-term answer but requires plumbing `succeeded_attempt` from the rendering ladder up through `aggregate_from_pipeline_stats` so we know whether the success came from a Playwright rung or a BD rung — naive per-host demotion oscillates badly on truly-blocked hosts. Tracked separately.
+* **Match-quality fixes inside the analyzer itself** (template-match threshold, gates-passed scoring, hash pre-filter, `analyze_compliance` gating). These are real follow-ups identified in the same review but are independent of BD scope. Phasing them separately keeps each commit individually revertable.
+
+### Operator action items
+1. Pull this commit. The defaults take effect on the next worker restart.
+2. Run `supabase/migrations/033_reset_unlocker_pinned_strategies.sql` against prod once. The migration logs the row count it touched.
+3. Watch the next nightly scan. Expected: BD request count drops sharply (90%+ on a typical fleet), per-asset similarity scores recover ~5pp, and any host that's genuinely still WAF-blocked will auto-promote back to `unlocker_only` within two scans without operator intervention.
+
+### Files touched
+* `backend/app/config.py` — two new settings, defaults `False`.
+* `backend/app/services/ai_service.py` — gate the unlocker branch in `download_image` on `unlocker_asset_fetch_enabled`.
+* `backend/app/services/page_discovery.py` — gate `_crawl_homepage_links_via_unlocker` on `unlocker_discovery_enabled`.
+* `supabase/migrations/033_reset_unlocker_pinned_strategies.sql` — one-shot demote of BD-pinned rows.
+* `backend/tests/test_unlocker_scope_flags.py` — new file, 8 tests.
+* `backend/tests/test_page_discovery.py` — fixture-opt-in for 4 legacy tests.
+
+---
+
 ## 2026-01-19  — Project Genesis
 
 ### Summary

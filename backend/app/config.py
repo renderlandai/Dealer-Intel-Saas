@@ -175,6 +175,55 @@ class Settings(BaseSettings):
     # picks unlocker strategies but the rung will short-circuit and
     # return OUTCOME_BLOCKED (no API call made).
     unlocker_fallback_enabled: bool = Field(default=True, description="Use Bright Data Web Unlocker to render pages that Playwright cannot load")
+
+    # ===========================================
+    # Phase 6.5.9 — Bright Data scope tightening
+    # ===========================================
+    # Phase 6.5 → 6.5.6 expanded BD beyond the rendering ladder:
+    #
+    #   * `_crawl_homepage_links_via_unlocker` calls BD whenever the
+    #     direct homepage crawl returns ≤1 link (a noisy trigger that
+    #     fires on lots of healthy JS-heavy dealer sites).
+    #   * `download_image` routes asset/discovered-image fetches via BD
+    #     for any host that's ever been BD-unlocked in this worker
+    #     process. Once the per-process `_unlocked_hosts` set marks a
+    #     host, every later asset URL on that host gets the BD detour
+    #     for the worker's lifetime — even after the host's render
+    #     strategy is demoted back to playwright_desktop.
+    #
+    # Both expansions degrade match accuracy because BD's edge-rendered
+    # images are JPEG re-encodes of the master, scoring measurably lower
+    # against the approved asset (see log.md 2026-05-01 BD-vs-direct
+    # accuracy note) — and they fire even on hosts where Playwright is
+    # working fine. These two flags scope BD back to "fallback when the
+    # rendering ladder hits its unlocker rung", which is the explicit
+    # intent of the ladder design.
+    #
+    # Defaults flipped to False in 6.5.9. Operators with a BD-dependent
+    # host fleet can flip them back on per-tenant via env vars if
+    # needed; the master `unlocker_fallback_enabled` knob continues to
+    # control the ladder's BD rung.
+    unlocker_asset_fetch_enabled: bool = Field(
+        default=False,
+        description=(
+            "Route asset/discovered-image downloads through Bright Data on hosts "
+            "that have been BD-unlocked this worker. Default OFF — BD edge "
+            "re-encodes images and degrades match scores. When OFF, asset fetches "
+            "always go direct, which fails on a small set of WAF-protected "
+            "asset CDNs but produces master-quality bytes everywhere else."
+        ),
+    )
+    unlocker_discovery_enabled: bool = Field(
+        default=False,
+        description=(
+            "Use Bright Data to crawl the homepage for sub-page links when the "
+            "direct crawl returns ≤1 link or the host is on a WAF-grade strategy. "
+            "Default OFF — the trigger is too noisy and silently expands BD usage "
+            "to healthy hosts. When OFF, page discovery uses sitemap + direct "
+            "crawl only; pages found via the rendering ladder's BD rung are "
+            "unaffected."
+        ),
+    )
     
     # Page Discovery
     enable_page_discovery: bool = Field(default=True, description="Auto-discover subpages on dealer sites")

@@ -304,6 +304,14 @@ class ComplianceCheckResult(BaseModel):
     zombie_ad: bool = False
     zombie_days: Optional[int] = None
     analysis_summary: str
+    # Phase 6.5.10 — Claude's compliance prompt asks "is the campaign
+    # creative actually visible in this image?" and returns
+    # ``asset_visible: false`` when the answer is no (a navigation tile,
+    # a stock photo, an unrelated banner that the matcher localised to
+    # by mistake). Defaults to True so the field is backward compatible
+    # with old rows / external callers; the analyzer fills in the real
+    # value and the matcher gates match recording on it.
+    asset_visible: bool = True
 
 
 class ImageMatchResult(BaseModel):

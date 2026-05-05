@@ -109,14 +109,44 @@ _VALID_IMAGE_CONTENT_TYPES = frozenset({
 })
 
 
+_MIN_VALID_IMAGE_DIM = 80  # pixels — drops 1x1 trackers, favicons, social-icon sprites
+
+
 def _is_valid_image(data: bytes) -> bool:
-    """Return True if Pillow can identify *data* as a supported image format."""
+    """Return True if Pillow can identify *data* as a supported image
+    format AND it's larger than the tracker-pixel threshold.
+
+    Phase 6.5.10 — added the dimension check. A surprising number of
+    discovered URLs on dealer sites are 1×1 GIF tracking pixels, 16×16
+    favicons, or 24×24 social-network sprites stitched into the page
+    HTML. They're "valid images" by Pillow's reckoning but downstream
+    matching against an 80×80 minimum is the cheap way to filter them
+    before they pollute the per-page `discovered_images` count, the
+    hash/CLIP prefilter caches, and (worst case) Claude calls.
+
+    The threshold is deliberately conservative: 80px catches all
+    common tracking-pixel and chrome-icon sizes (16, 24, 32, 48, 64)
+    without affecting any real ad creative — even tiny mobile banner
+    creatives are at minimum 100×100.
+    """
     try:
         img = Image.open(io.BytesIO(data))
         img.verify()
-        return True
     except Exception:
         return False
+    # PIL.Image.verify() invalidates the file pointer for further ops,
+    # so we need a second open to read .size — cheaper than parsing
+    # the format header by hand and the bytes are already in memory.
+    try:
+        img2 = Image.open(io.BytesIO(data))
+        w, h = img2.size
+    except Exception:
+        # If we can't read dimensions but verify() passed, prefer to
+        # accept rather than silently lose a payload.
+        return True
+    if w < _MIN_VALID_IMAGE_DIM or h < _MIN_VALID_IMAGE_DIM:
+        return False
+    return True
 
 
 def _shorten_url_for_log(url: str, max_len: int = 120) -> str:
@@ -250,7 +280,16 @@ async def download_image(url: str) -> bytes:
     # campaign-asset crops *is* a real path, so keep the lazy import).
     from . import unlocker_service
 
-    if unlocker_service.host_needs_unlocker(url):
+    # Phase 6.5.9: BD asset-fetch is now opt-in. The
+    # `host_needs_unlocker` set was the silent regression — once a host
+    # was BD-unlocked once, every later asset URL on that host went via
+    # BD, which re-encodes at the edge and drags match scores down.
+    # When the flag is False (the default after 6.5.9) we always fetch
+    # asset/discovered-image bytes directly, regardless of the host's
+    # render strategy. The rendering ladder still uses BD for HTML —
+    # this only affects the per-image byte fetch step.
+    asset_fetch_enabled = getattr(settings, "unlocker_asset_fetch_enabled", False)
+    if asset_fetch_enabled and unlocker_service.host_needs_unlocker(url):
         # Try direct first — see _try_direct_image_fetch docstring for
         # why this matters for match accuracy.
         direct_body = await _try_direct_image_fetch(url)
@@ -1460,13 +1499,49 @@ async def verify_borderline_match(
         gates_passed = result.get("gates_passed", 0)
         gate_brand = result.get("gate_brand", False)
         gate_product = result.get("gate_product", False)
+        gate_message = result.get("gate_message", False)
+        gate_offer = result.get("gate_offer", False)
+        gate_design = result.get("gate_design", False)
 
-        is_match = result.get("is_match", False) and gate_brand and gate_product and gates_passed >= 3
+        # Phase 6.5.10 — stricter gate rule and continuous scoring.
+        #
+        # Old rule was `is_match AND brand AND product AND gates_passed >= 3`,
+        # which let a creative through on `brand + product + ANY one of
+        # message/offer/design`. With five gates total, "3 of 5" is too
+        # permissive — a navigation-tile ghost crop that happened to share
+        # the dealer's logo and a vaguely-similar product silhouette would
+        # clear the bar. Tightened to `>= 4` so the matcher demands
+        # substantial agreement: brand + product + AT LEAST TWO OF the
+        # message/offer/design gates.
+        #
+        # Old scoring was `gates_passed * 20` which produces only the
+        # discrete buckets {60, 80, 100}. Two visually-very-different
+        # crops both passing 4 gates registered as identical 80% scores,
+        # which made the dashboard's borderline-band useless and made
+        # manual triage impossible. New scoring is a weighted sum that
+        # respects which gates carry signal, then capped by the original
+        # comparison score so verification can REDUCE confidence but
+        # never inflate it above what compare_images saw.
+        is_match = (
+            result.get("is_match", False)
+            and gate_brand
+            and gate_product
+            and gates_passed >= 4
+        )
 
-        verified_score = gates_passed * 20
+        weighted_gate_score = (
+            (25 if gate_brand else 0)
+            + (25 if gate_product else 0)
+            + (20 if gate_design else 0)
+            + (15 if gate_message else 0)
+            + (15 if gate_offer else 0)
+        )
+        verified_score = min(initial_score, weighted_gate_score)
 
-        log.debug("Verification complete: gates_passed=%d, is_match=%s", gates_passed, is_match)
-        log.debug("Gates: brand=%s, product=%s, message=%s, offer=%s, design=%s", gate_brand, gate_product, result.get('gate_message'), result.get('gate_offer'), result.get('gate_design'))
+        log.debug("Verification complete: gates_passed=%d, weighted=%d, capped=%d, is_match=%s",
+                  gates_passed, weighted_gate_score, verified_score, is_match)
+        log.debug("Gates: brand=%s, product=%s, message=%s, offer=%s, design=%s",
+                  gate_brand, gate_product, gate_message, gate_offer, gate_design)
 
         return {
             "verified_score": verified_score,
@@ -1474,11 +1549,12 @@ async def verify_borderline_match(
             "gates": {
                 "brand": gate_brand,
                 "product": gate_product,
-                "message": result.get("gate_message", False),
-                "offer": result.get("gate_offer", False),
-                "design": result.get("gate_design", False),
+                "message": gate_message,
+                "offer": gate_offer,
+                "design": gate_design,
             },
             "gates_passed": gates_passed,
+            "weighted_gate_score": weighted_gate_score,
             "verdict": result.get("verdict", ""),
         }
         
@@ -1555,7 +1631,8 @@ ZOMBIE AD CHECK:
             brand_elements=result.get("brand_elements", {}),
             zombie_ad=result.get("zombie_ad", False),
             zombie_days=None,
-            analysis_summary=result.get("analysis_summary", "")
+            analysis_summary=result.get("analysis_summary", ""),
+            asset_visible=bool(result.get("asset_visible", True)),
         )
         
     except Exception as e:
@@ -1780,11 +1857,34 @@ async def _passes_hash_prefilter(
     asset_hashes_cache: List[Dict[str, Any]],
 ) -> bool:
     """
-    Stage 1 pre-filter: check if the image has ANY perceptual hash
+    Stage 1 pre-filter: check if the image has perceptual hash
     resemblance to at least one campaign asset.
 
     Returns True if the image should continue to the next stage.
     This is free and instant (~0.5ms per comparison).
+
+    Phase 6.5.10 — stricter "both reliable hashes must agree" rule.
+    The previous rule averaged Hamming distance across phash, dhash,
+    whash, and average_hash, then admitted on `mean <= 28`. Two
+    problems with that:
+
+    1. ``whash`` (wavelet) and ``average_hash`` (coarse luma bucket)
+       are noisier than phash/dhash on dealer-site UI elements that
+       share a colour palette but not a layout — a navigation tile
+       could score "similar" on whash by colour-coincidence and
+       drag the mean below the 28 threshold even when phash/dhash
+       firmly disagreed.
+    2. The mean smears the contribution of every hash, so a strong
+       disagreement on one reliable signal got cancelled by a weak
+       agreement on an unreliable one.
+
+    New rule: ``max(phash_diff, dhash_diff) <= threshold`` against
+    any single asset. This requires BOTH of the two reliable hashes
+    to think the image is similar — the "worse of the reliable two
+    must still be ≤ threshold" reading. ``whash`` and
+    ``average_hash`` are kept on the dict for diagnostics but no
+    longer drive admission. Threshold semantics are unchanged so the
+    operator-tunable env var continues to map intuitively.
     """
     img_hashes = await compute_image_hashes(image_bytes)
     if img_hashes is None:
@@ -1793,14 +1893,11 @@ async def _passes_hash_prefilter(
     threshold = settings.hash_prefilter_max_diff
 
     for asset_h in asset_hashes_cache:
-        diffs = [
-            img_hashes["phash"] - asset_h["phash"],
-            img_hashes["dhash"] - asset_h["dhash"],
-            img_hashes["whash"] - asset_h["whash"],
-            img_hashes["average_hash"] - asset_h["average_hash"],
-        ]
-        avg_diff = sum(diffs) / 4
-        if avg_diff <= threshold:
+        phash_diff = img_hashes["phash"] - asset_h["phash"]
+        dhash_diff = img_hashes["dhash"] - asset_h["dhash"]
+        # Both reliable hashes must independently agree — the WORSE
+        # of the two (max distance) is the gate.
+        if max(phash_diff, dhash_diff) <= threshold:
             return True
 
     return False
@@ -2064,9 +2161,38 @@ async def process_discovered_image(
         brand_rules,
         best_match["asset"].get("campaign_end_date")
     )
-    
+
+    # Phase 6.5.10 — final asset-visibility gate.
+    #
+    # Until 6.5.10, ``analyze_compliance`` ran AFTER the match score
+    # was finalised, so a Claude verdict of "the campaign creative is
+    # not actually present in this image" still produced a recorded
+    # match (just one with `compliance.is_compliant=False` and a
+    # confused `analysis_summary`). The dashboard then showed a
+    # high-confidence match against a navigation tile or a stock
+    # photo, which was the most user-visible failure mode of the
+    # matching regression.
+    #
+    # The compliance prompt has always asked Claude for an
+    # ``asset_visible`` boolean — we just weren't reading it. With it
+    # plumbed through ``ComplianceCheckResult`` we can now make this
+    # the authoritative final gate: if Claude says the asset isn't
+    # actually visible, drop the match outright. The compare_images
+    # and verify_borderline_match calls already happened, so we've
+    # paid the upstream Claude cost — but we won't pay the worse
+    # cost of a bad match in the dashboard.
+    if not compliance.asset_visible:
+        log.info(
+            "Match rejected by asset-visibility gate: compliance reports "
+            "creative not actually present (calibrated_score=%d, summary=%r)",
+            calibrated_score,
+            (compliance.analysis_summary or "")[:120],
+        )
+        diagnostics["best_score"] = calibrated_score
+        return None, "compliance_asset_not_visible", diagnostics
+
     match_type = _get_match_type_from_score(calibrated_score)
-    
+
     log.info("Final: %s match, score %d, compliant=%s", match_type, calibrated_score, compliance.is_compliant)
     
     return {

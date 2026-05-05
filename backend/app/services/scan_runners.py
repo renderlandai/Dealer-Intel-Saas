@@ -864,6 +864,7 @@ async def _process_one_dealer(
             "filter_rejected": 0,
             "below_threshold": 0,
             "verification_rejected": 0,
+            "compliance_asset_not_visible": 0,
             "claude_error": 0,
             "claude_errors": 0,
             "matched_new": 0,
@@ -871,6 +872,12 @@ async def _process_one_dealer(
             "drift_detected": 0,
             "errors": 0,
         }
+        # Phase 6.5.10 — per-dealer count of pages that succeeded on a
+        # Playwright rung specifically. Lets the host-policy recorder
+        # auto-demote BD-pinned hosts whose Playwright rendering has
+        # recovered, while leaving genuinely-blocked hosts (success
+        # only via the BD rung) on their current strategy.
+        local_playwright_success_count = 0
 
         try:
             for page_idx, page_url in enumerate(page_urls):
@@ -916,6 +923,16 @@ async def _process_one_dealer(
                 if outcome == extraction_service.OUTCOME_IMAGES:
                     local_total_discovered += count
                     local_pages_scanned += 1
+                    # Phase 6.5.10 — credit "this page worked on a
+                    # Playwright rung" only when the ladder actually
+                    # told us so. Names come from
+                    # render_strategies._PlaywrightAttempt — anything
+                    # that doesn't start with `playwright_` (today only
+                    # `brightdata_unlocker`) does NOT count toward
+                    # auto-demote eligibility.
+                    succeeded_attempt = getattr(res, "succeeded_attempt", None) or ""
+                    if succeeded_attempt.startswith("playwright_"):
+                        local_playwright_success_count += 1
                 elif outcome == extraction_service.OUTCOME_EMPTY:
                     local_pages_empty += 1
                     if (
@@ -1098,6 +1115,7 @@ async def _process_one_dealer(
             "dealer_status": dealer_status,
             "base_url": base_url,
             "distributor_id": str(distributor_id) if distributor_id else None,
+            "playwright_success_count": local_playwright_success_count,
         }
 
 
@@ -1422,6 +1440,13 @@ async def run_website_scan(
             # counter even though it appears in zero `blocked_details` rows.
             from urllib.parse import urlparse as _urlparse
             success_pages_by_host: Dict[str, int] = {}
+            # Phase 6.5.10 — separately track per-host pages that
+            # succeeded on a *Playwright* rung. The host-policy
+            # recorder uses this set to auto-demote BD-pinned hosts
+            # whose Playwright rendering has recovered. Hosts whose
+            # only successes came via the Bright Data rung are NOT
+            # in this map and stay on their current strategy.
+            playwright_success_pages_by_host: Dict[str, int] = {}
 
             for result in dealer_results:
                 if isinstance(result, BaseException):
@@ -1469,6 +1494,12 @@ async def run_website_scan(
                             success_pages_by_host.get(host, 0)
                             + int(result["pages_scanned"])
                         )
+                        pw_succ = int(result.get("playwright_success_count", 0))
+                        if pw_succ > 0:
+                            playwright_success_pages_by_host[host] = (
+                                playwright_success_pages_by_host.get(host, 0)
+                                + pw_succ
+                            )
 
             # Phase 6: feed observed outcomes back into host_scan_policy so
             # the next scan of these hosts skips doomed ladder rungs.
@@ -1480,16 +1511,35 @@ async def run_website_scan(
                 host_policy_service.merge_host_successes(
                     host_aggs, success_pages_by_host,
                 )
-                promotions = host_policy_service.record_host_outcomes(host_aggs)
+                # Phase 6.5.10 — pass the Playwright-rung success
+                # counter alongside the global success counter so the
+                # recorder can demote hosts whose Playwright rendering
+                # has recovered.
+                transitions = host_policy_service.record_host_outcomes(
+                    host_aggs,
+                    playwright_success_by_host=playwright_success_pages_by_host,
+                )
+                promotions = [t for t in transitions if t[3] == "promoted"]
+                demotions = [t for t in transitions if t[3] == "demoted"]
                 if promotions:
                     pipeline_stats["host_promotions"] = [
                         {"hostname": h, "from": old, "to": new}
-                        for (h, old, new) in promotions
+                        for (h, old, new, _) in promotions
                     ]
                     log.info(
                         "host_scan_policy: %d host(s) auto-promoted: %s",
                         len(promotions),
-                        ", ".join(f"{h} ({old}->{new})" for h, old, new in promotions),
+                        ", ".join(f"{h} ({old}->{new})" for h, old, new, _ in promotions),
+                    )
+                if demotions:
+                    pipeline_stats["host_demotions"] = [
+                        {"hostname": h, "from": old, "to": new}
+                        for (h, old, new, _) in demotions
+                    ]
+                    log.info(
+                        "host_scan_policy: %d host(s) auto-demoted: %s",
+                        len(demotions),
+                        ", ".join(f"{h} ({old}->{new})" for h, old, new, _ in demotions),
                     )
             except Exception as policy_err:
                 # Never fail a scan because the learning layer hiccupped.
