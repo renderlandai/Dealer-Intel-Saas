@@ -6223,3 +6223,118 @@ Run on touched modules: **20 new tests pass** (15 in one batch, 5 BD-probe tests
 6. (carried) Local-dev `.env` parsing — leading space tolerance via `tr -d ' '`.
 7. **Frontend surfacing of `claude_errors` and `metadata.pipeline.best_score`.** The data is now in the database; the operator dashboard doesn't show it yet. Lowest-effort: add a `claude_errors` column to the scan-detail table next to `matches_count` and a tooltip showing the kind distribution. Higher-effort: per-image "why didn't this match?" view that reads `metadata.pipeline` and explains the funnel stage in plain English.
 8. **Replace data-URL asset storage with Supabase Storage.** Asset 1 in the May 1 scan is a 2.4 MB base64 data URL — `download_image` decodes inline (no network) but every subsequent step (optimize, hash, CLIP, Claude) then operates on bytes that are 33% larger than they need to be. Storing all assets in Supabase Storage and migrating existing data-URL assets to https URLs would shrink the in-flight payloads and remove the data-URL code path entirely.
+
+---
+
+## 2026-05-05 — Phase 6.5.5 — generic BD safety hardening (size cap, page-cache quirk, runbook, claude_errors UI)
+
+### Why now
+
+Client said `rent.cat.com` is low priority. That changed the meaning of the carry-over follow-up list from the May 1 entry: the items framed as "rent.cat.com cleanup" actually split cleanly into rent.cat.com–specific niceties (defer indefinitely) and **generic Bright Data hardening that applies to whatever WAF-protected dealer site appears next** (ship now). The auto-promotion logic in `host_policy_service.py:330` is going to activate for the *next* Cloudflare-/Imperva-/whatever-protected dealer regardless of who that is, and when it does, we want the safety nets in place and visible to the operator. This phase is that hardening pass — four orthogonal items, one commit.
+
+### Item 1 — Response-size cap on `_post_unlocker` (carry-over #2)
+
+Bright Data faithfully forwards whatever the upstream host returns. A pathological or hostile origin can answer with an unbounded body; the previous implementation buffered the whole thing via `client.post(...)` before returning, so a 500 MB body would (a) blow worker RAM, (b) burn the BD bandwidth bill on bytes we'll never use, and (c) stall the scan timeout. No size guard existed.
+
+**Fix.** Replaced `client.post(...)` with `client.stream("POST", ...)` and a streaming accumulator. Two regimes:
+
+- `_MAX_UNLOCKER_HTML_BYTES = 8 MB` — default. Real dealer pages are <1 MB rendered; 8 MB is a generous cap that catches runaway responses immediately.
+- `_MAX_UNLOCKER_IMAGE_BYTES = 25 MB` — passed through `download_via_unlocker` for asset fetches. Hero PNGs and uncompressed product photos can run 5–15 MB; 25 MB is the comfortable ceiling for real images.
+
+Two enforcement layers per request:
+
+1. **Pre-flight Content-Length check.** When the upstream advertises a too-large body via `Content-Length`, we bail before draining a single chunk and call `resp.aclose()` so the connection is reusable.
+2. **Mid-flight stream cap.** We accumulate `aiter_bytes()` chunks against a running total and break out of the loop the moment we'd exceed the cap. Connection is dropped, no further bytes traverse the wire.
+
+Both paths return the new structured error `brightdata_response_too_large`, which lands in `pipeline_stats.blocked_details` so an operator can see exactly which dealer URL produced the runaway. The cap applies to both successful unlocks (where it's the legitimate body) AND error response bodies (so a hostile error page can't grief us either).
+
+This change is a pure tighten — every previously-successful response path still completes. The only behavioural difference is that responses larger than the cap, which previously would have been buffered and returned in full, now return None with the new error code.
+
+### Item 2 — `page_cache_service.record_page_hits` `.maybe_single()` quirk (carry-over #1)
+
+Symptom (carried since 2026-04-30): every brand-new page hit was failing through to the `except` branch and silently never inserting. The page-hit-cache early-stop optimisation (the whole point of migration 016) was effectively dead — every scan did full discovery from scratch even when the same dealer/page combo had matched in a prior scan.
+
+**Root cause.** `.maybe_single().execute()` raises `code: '204'` on empty result sets in this version of supabase-py rather than returning `data=None`. Since the lookup runs once per matched page, every "first-time match for this page" scenario was a guaranteed-raise → caught → logged at WARNING → next page. The insert path was never reachable for fresh hits.
+
+**Fix.** Replaced both `.maybe_single().execute()` calls with `.limit(1).execute()` and read `.data[0]` if non-empty. Cleanly returns "no rows" without raising on empty.
+
+While I had the file open, also collapsed the previous double-query (always run the no-campaign lookup, then re-run with campaign filter if set) into a single conditional query — saves one DB round-trip per matched page on every scan, which compounds across hundreds of dealers. The campaign-id matching is now correct in both directions: a `None` campaign uses `is_("campaign_id", "null")` so it doesn't accidentally match per-campaign rows; a non-`None` campaign uses `eq("campaign_id", id)` as before.
+
+**Tests.** New `backend/tests/test_page_cache_service.py` with 5 cases:
+
+1. `test_no_existing_row_inserts_with_campaign_filter` — the regression test. With no existing row, the insert now runs (previously it silently didn't). Also asserts the call sequence is `[select, insert]` (length 2) — the old double-query bug would have made it 3.
+2. `test_no_existing_row_no_campaign_uses_is_null` — confirms the campaign-NULL lookup uses `is_("campaign_id", "null")` not just an absent filter.
+3. `test_failed_insert_does_not_explode_caller` — the `except` branch must keep the loop going if a single page's write fails (preserved behaviour, asserted).
+4. `test_existing_row_merges_assets_and_bumps_hit_count` — when a row exists, hit_count increments and the asset id set merges as the union.
+5. `test_empty_page_matches_does_nothing` — early exit on empty input.
+
+All 5 pass cleanly.
+
+### Item 3 — On-call runbook for `host_scan_policy` (carry-over #4)
+
+Created `backend/docs/host_scan_policy_runbook.md` (~280 lines) covering everything an on-call would need:
+
+- One-paragraph "what the system does" framing (per-host adaptive strategy + auto-promotion at `PROMOTE_THRESHOLD = 2` consecutive failures).
+- The strategy ladder table with cost-per-page for every rung — including the dollar number that lets an operator estimate spend impact when promoting / demoting hosts.
+- **Five health-check SQL queries** copy-pasteable into the Supabase SQL editor: (1) policy for a specific host, (2) recently-promoted hosts, (3) hosts on `unlocker_only`/`unreachable` (where the spend is), (4) stale rows, (5) BD spend correlated with a host via `cost.line_items`.
+- **Symptom → action** flowcharts for the three real failure modes that have happened or could plausibly happen: "scanner finds zero matches on dealer X", "BD spend looks too high", "BD itself is failing — every unlock returns an error" (with a table mapping every `last_block_reason` value to the right remediation).
+- **Manual interventions** — copy-pasteable SQL for: promote a host, demote a host, pin to `unreachable`, reset 30-day counters, wipe a row to force re-probe. Each one explains when to use it and what `manual_override` does/doesn't do.
+- **How to verify the system is working** post-intervention.
+- A "deliberately NOT in this runbook" section so the next operator doesn't try to bulk-update 50 hosts at once or invent new strategies under pressure.
+
+This is the doc the next person who gets a "scans returning zero matches" page at 2am will want to find. Closes the part of carry-over #4 that's actually carry-over-able. Schema design and code changes still live in `host_policy_service.py` docstrings + this runbook now references them.
+
+### Item 4 — Frontend surfacing of `claude_errors` (carry-over #7)
+
+Phase 6.5.4 wrote the diagnostics into `pipeline_stats` but nothing in the operator UI read them, so the operator could not actually tell whether a low match count was Anthropic infra pressure or genuine "Claude said no". Two changes to `frontend/app/scans/page.tsx`:
+
+1. **Row-level badge.** Below the "N matches found" text on every scan row, when `pipeline_stats.claude_errors > 0`, a rose-coloured line: "12 Claude errors (3 fully)". The "fully" clause is the count from `claude_error` (every comparison errored — funnel-rejected for an infra reason rather than a real Claude verdict). Tooltip explains the distinction between "rate limit / timeout / parse error" vs "Claude said this isn't a match". Renders only when non-zero, so quiet scans stay quiet.
+
+2. **Per-kind breakdown panel** in the expanded Pipeline Funnel. New `ClaudeErrorBreakdownPanel` component reads every `claude_error_<kind>` key out of `pipeline_stats` (the per-kind buckets `_classify_claude_error` populates: `rate_limit`, `timeout`, `overloaded`, `json_parse`, `image_optimize`, `network`, `other`), sorts descending, and renders a labeled grid. Headline shows total unique images affected + the "fully errored" subset. A short paragraph explains the operational read of each kind ("rate_limit dominant → BD-driven traffic bumping into Anthropic quota; timeout dominant → look at network or model-overload; json_parse dominant → recent prompt drift").
+
+   The funnel itself also gets a new "Claude Errors" stage row (rose-coloured bar) that shows up only when `claude_error > 0` — sits between "Verification Rejected" and "Errors" so the visual ordering matches the funnel's actual stage order.
+
+The TypeScript `PipelineStats` interface gets `claude_error?: number; claude_errors?: number;` plus `[key: \`claude_error_${string}\`]: number | undefined;` — the templated index signature is the right shape for "we know there are dynamic keys with this prefix carrying numbers, but we don't know which ones in advance because they depend on which Anthropic failure modes actually fired this scan."
+
+Rendering is permissive: missing keys / older scans default to 0 cleanly, so historical scans pre-Phase-6.5.4 don't produce empty error panels.
+
+### What did NOT change
+
+Carry-overs from May 1 that we explicitly leave untouched per the strategic call (`rent.cat.com` low priority means rent.cat.com–specific cleanup gets deferred):
+
+- **#3 Sitemap-via-unlocker for very large dealer sites.** Was speculative and mostly an AEM concern.
+- **#5 Distributor mapping bug** (every `rent.cat.com` match attributes to one seed distributor). Cosmetic; `source_url` carries truth; matters only when rent.cat.com analytics are valued.
+- **#6 Local-dev `.env` parsing.** Still trivial, still not worth the diff.
+- **#8 Replace data-URL asset storage with Supabase Storage.** Bigger project; not a same-day item.
+
+The Bright Data integration is structurally complete and stays as-is. The `host_policy_service` auto-promotion logic still arms BD for any future dealer site that starts returning 403s — the runbook (item 3) is what makes that activation operable when it happens.
+
+### Files
+
+- `backend/app/services/unlocker_service.py` — new constants `_MAX_UNLOCKER_HTML_BYTES` / `_MAX_UNLOCKER_IMAGE_BYTES`. `_post_unlocker(...)` rewritten to stream + cap. `download_via_unlocker(...)` passes the larger image cap.
+- `backend/app/services/page_cache_service.py` — `.maybe_single()` → `.limit(1).execute()`, double-query collapse, NULL/non-NULL campaign handling.
+- `backend/docs/host_scan_policy_runbook.md` — **new file**, on-call runbook.
+- `frontend/app/scans/page.tsx` — `PipelineStats` interface gains the Phase-6.5.4 keys with templated index signature; `ClaudeErrorBreakdownPanel` component; row-level Claude-errors badge; new "Claude Errors" funnel stage.
+- `backend/tests/test_unlocker_service.py` — new `TestPostUnlockerResponseSizeCap` (4 cases: Content-Length pre-flight reject, mid-stream overflow abort, in-cap pass-through, image-cap override). Existing `test_clean_url_is_passed_through_to_payload` updated for the new streaming HTTP path.
+- `backend/tests/test_page_cache_service.py` — **new file**, 5 cases on the `.maybe_single()` regression fix.
+
+### Test results
+
+- **Backend:** `pytest tests/` shows 222 passed + 5 errors. The 5 errors are all in `TestUnlockedHostDirectFirstProbe` and are the documented pre-existing Python-3.9 cross-test event-loop quirk (`asyncio.run()` in two test classes in the same process). When run in isolation: `pytest tests/test_ai_service_diagnostics.py::TestUnlockedHostDirectFirstProbe -q` → **5 passed**. CI runs Python 3.11 where this is fine. New tests added this phase: 9 total (4 size-cap + 5 page-cache), all green.
+- **Frontend:** `npx tsc --noEmit` clean (no type errors with the new templated index signature). `npm test` 24/24 passed.
+
+### Verification on next scan
+
+- `pipeline_stats.blocked_details` will surface `brightdata_response_too_large` for any dealer URL whose body exceeds the cap. Should be zero on healthy dealer sites; if it ever fires, the row points the operator at the responsible dealer + URL.
+- `pipeline_stats.cost.line_items` BD entries should be unchanged in count for healthy hosts. If a misbehaving host previously was burning bytes after the no-cap point, those BD line items will be cheaper now (we abort mid-stream instead of buffering the full payload).
+- Page-hit cache: re-scanning a previously-matched dealer should now show `cache_hit: true` or `cached_pages_used: > 0` in the funnel — previously these were stuck at zero on every scan because the cache writes never landed.
+- Operator dashboard: any scan with non-zero `claude_errors` now surfaces the rose-coloured row badge and the per-kind panel inside the expanded funnel. Existing scans (pre-6.5.4) have these counters as 0 / absent and render unchanged.
+
+### Open follow-ups (still not in this commit)
+
+1. (carried) Sitemap-via-unlocker for very large dealer sites. *Deferred indefinitely per `rent.cat.com` deprioritization.*
+2. (carried) Distributor mapping bug — `rent.cat.com` matches all attribute to one seed distributor. *Deferred indefinitely.*
+3. (carried) Local-dev `.env` parsing — leading-space tolerance via `tr -d ' '`.
+4. (carried) Replace data-URL asset storage with Supabase Storage. Bigger project; not blocking anything.
+5. **Per-host Claude-error trend in the operator dashboard.** Phase 6.5.5 surfaces the per-scan numbers. Aggregating across the last N scans per host (so an operator can see "host X has been hitting rate_limit at 30%+ for the last 10 scans") would tell us whether to throttle or whether the issue is host-specific. Requires a small RPC + a chart on the host-detail page; deferred until we have the next genuinely-blocked dealer to motivate it.
+6. **Migration to drop the no-longer-valid `screenshotone` strategy values from `host_scan_policy.notes` history.** Migration 031 already rewrites the `strategy` column itself; the `notes` and `last_block_reason` text fields still carry old SS1-era strings on long-lived hosts. Cosmetic only — no on-call should ever see these as actionable — but worth a one-line `UPDATE` to clean up the operator UI eventually.

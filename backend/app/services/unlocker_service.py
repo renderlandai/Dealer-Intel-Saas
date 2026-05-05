@@ -76,6 +76,25 @@ DEFAULT_UNLOCK_TIMEOUT = 60.0
 # auth is genuinely broken.
 SMOKE_TEST_FAILURE_TTL_SECONDS = 300
 
+# Per-response byte caps. Bright Data is happy to forward whatever the
+# upstream host returns, so a hostile or pathological host can produce
+# multi-GB bodies that would (a) burn the BD bandwidth bill, (b) blow
+# the worker's RAM, and (c) leave the scan stuck waiting for a body
+# that will never finish. Two regimes:
+#
+# * HTML page unlocks. Real dealer pages are <1 MB rendered. 8 MB is
+#   ~10x the largest legitimate page we've seen and tight enough that a
+#   runaway body is killed early.
+# * Asset (image) unlocks. Hero PNGs and uncompressed product photos
+#   can run 5-15 MB. 25 MB is generous; anything over that is almost
+#   certainly a file-server misconfiguration, not a real banner.
+#
+# When the cap fires we return ``brightdata_response_too_large`` so
+# pipeline_stats.blocked_details surfaces the dealer URL responsible
+# and the operator can blocklist it via host_scan_policy.notes.
+_MAX_UNLOCKER_HTML_BYTES = 8 * 1024 * 1024
+_MAX_UNLOCKER_IMAGE_BYTES = 25 * 1024 * 1024
+
 
 # ---------------------------------------------------------------------------
 # Runtime availability flag (set by smoke test in main.py lifespan)
@@ -289,6 +308,7 @@ async def _post_unlocker(
     url: str,
     *,
     min_body_bytes: int = 100,
+    max_body_bytes: int = _MAX_UNLOCKER_HTML_BYTES,
 ) -> Tuple[Optional[bytes], Optional[int], Optional[str]]:
     """Make one POST to Bright Data Web Unlocker, returning raw bytes.
 
@@ -301,6 +321,13 @@ async def _post_unlocker(
     100 is the right floor for HTML (any real page is many KB); for
     image downloads the caller can lower it (a 1-pixel tracking GIF is
     ~43 bytes and would be a real, if useless, image).
+
+    ``max_body_bytes`` caps how much we will buffer from a single
+    response. The body is read via streaming so a runaway response is
+    aborted mid-flight — we never allocate the full payload in memory
+    or pay BD for the bytes after the cap. On overflow we return
+    ``brightdata_response_too_large``. Defaults to the HTML cap; the
+    image-download path overrides it via :func:`download_via_unlocker`.
     """
     token = _api_token()
     zone = _zone_name()
@@ -337,43 +364,94 @@ async def _post_unlocker(
 
     try:
         async with httpx.AsyncClient(timeout=DEFAULT_UNLOCK_TIMEOUT) as client:
-            resp = await client.post(
-                BRIGHTDATA_REQUEST_URL, json=payload, headers=headers,
-            )
+            async with client.stream(
+                "POST",
+                BRIGHTDATA_REQUEST_URL,
+                json=payload,
+                headers=headers,
+            ) as resp:
+                status_code = resp.status_code
+
+                # Cheap pre-flight on Content-Length when the upstream
+                # advertises it. Saves draining the stream when we can
+                # tell from the header alone the body is too large.
+                cl_header = resp.headers.get("content-length")
+                if cl_header:
+                    try:
+                        if int(cl_header) > max_body_bytes:
+                            log.warning(
+                                "Bright Data response too large (content-length=%s, cap=%d) for %s",
+                                cl_header, max_body_bytes, _shorten_url_for_log(url),
+                            )
+                            # Best-effort drain so the connection can be
+                            # reused; httpx complains if we exit without
+                            # reading on some versions.
+                            try:
+                                await resp.aclose()
+                            except Exception:
+                                pass
+                            return None, status_code, "brightdata_response_too_large"
+                    except ValueError:
+                        # Non-integer Content-Length is rare but real on
+                        # some upstream proxies; fall through to streamed
+                        # cap which will catch overflow regardless.
+                        pass
+
+                # Surface 4xx/5xx the same way the buffered version did,
+                # but read at most ``max_body_bytes`` of the error body
+                # so a hostile error response can't blow memory either.
+                if status_code in (401, 403):
+                    _mark_unavailable()
+                    log.error(
+                        "Bright Data auth/permission error (%d) for %s — disabling rung for %ds",
+                        status_code, url[:80], SMOKE_TEST_FAILURE_TTL_SECONDS,
+                    )
+                    return None, status_code, f"brightdata_auth_{status_code}"
+
+                # Stream the body, accumulating chunks under the cap.
+                chunks: List[bytes] = []
+                total = 0
+                overflow = False
+                async for chunk in resp.aiter_bytes():
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_body_bytes:
+                        overflow = True
+                        break
+                    chunks.append(chunk)
+
+                if overflow:
+                    log.warning(
+                        "Bright Data response exceeded %d-byte cap mid-stream for %s",
+                        max_body_bytes, _shorten_url_for_log(url),
+                    )
+                    return None, status_code, "brightdata_response_too_large"
+
+                body = b"".join(chunks)
     except httpx.TimeoutException:
         return None, None, "brightdata_timeout"
     except httpx.HTTPError as e:
         log.warning("Bright Data network error for %s: %s", url[:80], e)
         return None, None, f"brightdata_network_error: {str(e)[:80]}"
 
-    if resp.status_code in (401, 403):
-        # Auth-style failure — disable the rung for a while so we don't
-        # keep paying for guaranteed errors.
-        _mark_unavailable()
-        log.error(
-            "Bright Data auth/permission error (%d) for %s — disabling rung for %ds",
-            resp.status_code, url[:80], SMOKE_TEST_FAILURE_TTL_SECONDS,
-        )
-        return None, resp.status_code, f"brightdata_auth_{resp.status_code}"
-
-    if resp.status_code >= 400:
+    if status_code >= 400:
         # Show first 200 bytes in the log for diagnostic context. Force
         # latin-1 decode (1:1 byte->char) so we never crash on binary.
-        snippet = resp.content[:200].decode("latin-1", errors="replace")
+        snippet = body[:200].decode("latin-1", errors="replace") if body else ""
         log.warning(
             "Bright Data returned HTTP %d for %s: %s",
-            resp.status_code, url[:80], snippet,
+            status_code, url[:80], snippet,
         )
-        return None, resp.status_code, f"brightdata_http_{resp.status_code}"
+        return None, status_code, f"brightdata_http_{status_code}"
 
-    body = resp.content
     if not body or len(body) < min_body_bytes:
         # A "successful" unlock that returns ~0 bytes is almost always a
         # JS-only page where the unlocker didn't actually wait for the
         # render. Treat as failure rather than empty content.
-        return None, resp.status_code, "brightdata_empty_response"
+        return None, status_code, "brightdata_empty_response"
 
-    return body, resp.status_code, None
+    return body, status_code, None
 
 
 async def _post_unlocker_text(url: str) -> Tuple[Optional[str], Optional[int], Optional[str]]:
@@ -404,7 +482,11 @@ async def download_via_unlocker(image_url: str) -> Optional[bytes]:
     """
     if not is_available():
         return None
-    body, status, err = await _post_unlocker(image_url, min_body_bytes=20)
+    body, status, err = await _post_unlocker(
+        image_url,
+        min_body_bytes=20,
+        max_body_bytes=_MAX_UNLOCKER_IMAGE_BYTES,
+    )
     try:
         from . import cost_tracker
         cost_tracker.record_unlocker(

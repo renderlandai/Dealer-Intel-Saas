@@ -50,6 +50,17 @@ def record_page_hits(
 
     Args:
         page_matches: mapping of page_url -> set of matched asset_ids
+
+    Implementation note: previously this used ``.maybe_single().execute()``
+    on the lookup, which raises a ``code: '204'`` error on empty result
+    sets in this version of supabase-py — every brand-new page hit was
+    failing through to the ``except`` branch and silently never inserting.
+    The fix is to use ``.limit(1).execute()`` and read ``.data[0]`` if the
+    list is non-empty, which returns cleanly on no match.
+
+    Also collapses the previous "always run the no-campaign query, then
+    overwrite if campaign_id is set" into a single conditional query so
+    we don't burn a wasted DB round-trip on every page.
     """
     if not page_matches:
         return
@@ -58,32 +69,34 @@ def record_page_hits(
 
     for page_url, asset_ids in page_matches.items():
         try:
-            existing = supabase.table("page_hit_cache") \
+            query = supabase.table("page_hit_cache") \
                 .select("id, hit_count, asset_ids_matched") \
                 .eq("organization_id", org_id) \
                 .eq("distributor_id", distributor_id) \
-                .eq("page_url", page_url) \
-                .maybe_single().execute()
+                .eq("page_url", page_url)
 
+            # The cache row's ``campaign_id`` is nullable. When the caller
+            # didn't pin a campaign, lookups must match the IS NULL row;
+            # when they did, lookups must match the specific UUID. Doing
+            # both with one query keeps insert/lookup symmetric.
             if campaign_id:
-                existing = supabase.table("page_hit_cache") \
-                    .select("id, hit_count, asset_ids_matched") \
-                    .eq("organization_id", org_id) \
-                    .eq("distributor_id", distributor_id) \
-                    .eq("campaign_id", campaign_id) \
-                    .eq("page_url", page_url) \
-                    .maybe_single().execute()
+                query = query.eq("campaign_id", campaign_id)
+            else:
+                query = query.is_("campaign_id", "null")
 
-            if existing and existing.data:
-                prev_assets = set(existing.data.get("asset_ids_matched") or [])
+            res = query.limit(1).execute()
+            existing_row = (res.data or [None])[0] if getattr(res, "data", None) else None
+
+            if existing_row:
+                prev_assets = set(existing_row.get("asset_ids_matched") or [])
                 merged = list(prev_assets | asset_ids)
                 supabase.table("page_hit_cache") \
                     .update({
-                        "hit_count": existing.data["hit_count"] + 1,
+                        "hit_count": (existing_row.get("hit_count") or 0) + 1,
                         "last_hit_at": now,
                         "asset_ids_matched": merged,
                     }) \
-                    .eq("id", existing.data["id"]).execute()
+                    .eq("id", existing_row["id"]).execute()
             else:
                 supabase.table("page_hit_cache").insert({
                     "organization_id": org_id,

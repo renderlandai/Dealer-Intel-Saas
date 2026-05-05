@@ -433,28 +433,19 @@ class TestPostUnlockerSkipsBadUrls:
 
     def test_clean_url_is_passed_through_to_payload(self):
         """End-to-end: a normal URL reaches BD with the path encoded but
-        otherwise unchanged."""
+        otherwise unchanged. Updated post-Phase-6.5.5 to use the
+        streaming HTTP path (``client.stream(...)``) that the response
+        size cap enforces."""
         from app.services import unlocker_service
 
         captured = {}
+        client = _StreamingFakeClient(
+            status_code=200,
+            chunks=[b"x" * 200],
+            captured=captured,
+        )
 
-        class _FakeResp:
-            status_code = 200
-            content = b"x" * 200
-
-        class _FakeClient:
-            def __init__(self, *a, **kw):
-                pass
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *a):
-                return False
-            async def post(self, url, json=None, headers=None):
-                captured["url"] = url
-                captured["payload"] = json
-                return _FakeResp()
-
-        with patch.object(unlocker_service.httpx, "AsyncClient", _FakeClient), \
+        with patch.object(unlocker_service.httpx, "AsyncClient", lambda *a, **kw: client), \
              patch.object(unlocker_service, "_api_token", return_value="tok"), \
              patch.object(unlocker_service, "_zone_name", return_value="zone"):
             body, status, err = _run(unlocker_service._post_unlocker(
@@ -464,3 +455,193 @@ class TestPostUnlockerSkipsBadUrls:
         assert err is None
         assert status == 200
         assert captured["payload"]["url"] == "https://x.com/promo%20page"
+        assert captured["method"] == "POST"
+
+
+# ---------------------------------------------------------------------------
+# Phase 6.5.5 — Response-size cap on `_post_unlocker`
+# ---------------------------------------------------------------------------
+#
+# A pathological or malicious upstream host could return an unbounded
+# body to Bright Data, which would forward every byte to us — burning
+# BD bandwidth, blowing the worker's RAM, and stretching the scan
+# timeout into oblivion. The cap aborts both pre-flight (Content-Length
+# header) and mid-flight (chunk accumulation) so we cap actual bytes
+# read, not just nominal allocation.
+
+class _StreamingResponse:
+    """Minimal stand-in for httpx.Response in a streaming context.
+
+    Supports the four attributes/methods ``_post_unlocker`` actually
+    touches: ``status_code``, ``headers`` (case-insensitive get),
+    ``aiter_bytes()`` async iterator, and ``aclose()``.
+    """
+    def __init__(self, status_code: int, chunks, headers=None):
+        self.status_code = status_code
+        self._chunks = list(chunks)
+        self.headers = httpx_like_headers(headers or {})
+
+    async def aiter_bytes(self):
+        for c in self._chunks:
+            yield c
+
+    async def aclose(self):
+        return None
+
+
+class _StreamCtx:
+    def __init__(self, response: "_StreamingResponse"):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _StreamingFakeClient:
+    """An httpx.AsyncClient look-alike that records the streamed POST."""
+    def __init__(self, status_code: int, chunks, captured: dict, headers=None):
+        self._status = status_code
+        self._chunks = chunks
+        self._captured = captured
+        self._headers = headers or {}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    def stream(self, method, url, *, json=None, headers=None):
+        # httpx's AsyncClient.stream is sync-returning the ctx manager,
+        # not async — match that contract so ``async with client.stream(...)``
+        # works.
+        self._captured["method"] = method
+        self._captured["url"] = url
+        self._captured["payload"] = json
+        self._captured["headers"] = headers
+        return _StreamCtx(_StreamingResponse(self._status, self._chunks, self._headers))
+
+
+class httpx_like_headers(dict):
+    """Tiny shim over a dict that returns case-insensitive get like
+    httpx.Headers does for the one header we read (``content-length``)."""
+    def get(self, name, default=None):
+        target = name.lower()
+        for k, v in self.items():
+            if k.lower() == target:
+                return v
+        return default
+
+
+class TestPostUnlockerResponseSizeCap:
+    """Belt-and-suspenders cap: BD will faithfully forward whatever the
+    upstream host returns, including a malicious or misconfigured body
+    of arbitrary size. We refuse to buffer past the cap (HTML default
+    8 MB, image override 25 MB)."""
+
+    def test_content_length_header_over_cap_short_circuits(self):
+        """Cheap pre-flight: when the upstream advertises a too-large
+        body via Content-Length, we don't drain a single chunk."""
+        from app.services import unlocker_service
+
+        captured = {}
+        # Body chunks below the cap, but Content-Length lies and says
+        # the body is huge. We must trust the header and bail.
+        client = _StreamingFakeClient(
+            status_code=200,
+            chunks=[b"x" * 100],
+            captured=captured,
+            headers={"content-length": str(unlocker_service._MAX_UNLOCKER_HTML_BYTES + 1)},
+        )
+
+        with patch.object(unlocker_service.httpx, "AsyncClient", lambda *a, **kw: client), \
+             patch.object(unlocker_service, "_api_token", return_value="tok"), \
+             patch.object(unlocker_service, "_zone_name", return_value="zone"):
+            body, status, err = _run(unlocker_service._post_unlocker(
+                "https://x.com/page",
+            ))
+
+        assert body is None
+        assert status == 200
+        assert err == "brightdata_response_too_large"
+
+    def test_streamed_overflow_is_aborted_mid_flight(self):
+        """When Content-Length isn't present (or lies low), streaming
+        accumulation must catch the overflow and abort."""
+        from app.services import unlocker_service
+
+        captured = {}
+        # Each chunk is 1 MB; with a 3 MB cap, the 4th chunk triggers
+        # the overflow.
+        chunks = [b"x" * (1024 * 1024)] * 4
+        client = _StreamingFakeClient(
+            status_code=200,
+            chunks=chunks,
+            captured=captured,
+        )
+
+        with patch.object(unlocker_service.httpx, "AsyncClient", lambda *a, **kw: client), \
+             patch.object(unlocker_service, "_api_token", return_value="tok"), \
+             patch.object(unlocker_service, "_zone_name", return_value="zone"):
+            body, status, err = _run(unlocker_service._post_unlocker(
+                "https://x.com/page",
+                max_body_bytes=3 * 1024 * 1024,
+            ))
+
+        assert body is None
+        assert status == 200
+        assert err == "brightdata_response_too_large"
+
+    def test_body_within_cap_is_returned_intact(self):
+        """A body well under the cap must round-trip with no truncation."""
+        from app.services import unlocker_service
+
+        captured = {}
+        chunks = [b"hello", b" ", b"world", b"!" * 200]
+        client = _StreamingFakeClient(
+            status_code=200,
+            chunks=chunks,
+            captured=captured,
+        )
+
+        with patch.object(unlocker_service.httpx, "AsyncClient", lambda *a, **kw: client), \
+             patch.object(unlocker_service, "_api_token", return_value="tok"), \
+             patch.object(unlocker_service, "_zone_name", return_value="zone"):
+            body, status, err = _run(unlocker_service._post_unlocker(
+                "https://x.com/page",
+            ))
+
+        assert err is None
+        assert status == 200
+        assert body == b"".join(chunks)
+
+    def test_image_path_uses_larger_cap(self):
+        """``download_via_unlocker`` overrides the HTML cap with the
+        image cap so a 10 MB hero PNG (which is over the HTML cap but
+        under the image cap) still comes through."""
+        from app.services import unlocker_service
+
+        unlocker_service._mark_available()
+        captured = {}
+        # 10 MB: would overflow the 8 MB HTML cap, but should pass the
+        # 25 MB image cap that download_via_unlocker passes through.
+        chunks = [b"x" * (1024 * 1024)] * 10
+        client = _StreamingFakeClient(
+            status_code=200,
+            chunks=chunks,
+            captured=captured,
+        )
+
+        with patch.object(unlocker_service.httpx, "AsyncClient", lambda *a, **kw: client), \
+             patch.object(unlocker_service, "_api_token", return_value="tok"), \
+             patch.object(unlocker_service, "_zone_name", return_value="zone"), \
+             patch.object(unlocker_service, "is_available", return_value=True):
+            result = _run(unlocker_service.download_via_unlocker(
+                "https://rent.cat.com/dam/banner.png",
+            ))
+
+        assert result is not None
+        assert len(result) == 10 * 1024 * 1024

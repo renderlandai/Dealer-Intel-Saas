@@ -56,6 +56,21 @@ interface PipelineStats {
   matched_confirmed: number;
   drift_detected: number;
   errors: number;
+  // Phase 6.5.4 funnel additions:
+  // - claude_error: images where EVERY ensemble call errored (the 0
+  //   score that landed in below_threshold isn't a real "Claude said
+  //   no" signal — it's infra noise).
+  // - claude_errors: broader counter — images that experienced ANY
+  //   Claude failure across their per-asset comparisons, including
+  //   ones that ultimately matched on a different asset.
+  // Per-kind buckets (claude_error_rate_limit, claude_error_timeout,
+  // claude_error_overloaded, claude_error_json_parse,
+  // claude_error_network, claude_error_image_optimize,
+  // claude_error_other) populate dynamically — not every kind shows up
+  // every scan, so we treat the stats blob as permissive on those keys.
+  claude_error?: number;
+  claude_errors?: number;
+  [key: `claude_error_${string}`]: number | undefined;
   image_cache?: { hits: number; misses: number; hit_rate: number; cached_entries: number; cached_mb: number };
   pages_discovered?: number;
   pages_scanned?: number;
@@ -87,6 +102,53 @@ interface PipelineStats {
   // Legacy fields for backward compat with older scans
   matched?: number;
   duplicates_skipped?: number;
+}
+
+// Friendly labels for the claude_error_<kind> tooltip. Keys match the
+// `_classify_claude_error` buckets in backend/app/services/ai_service.py.
+const CLAUDE_ERROR_KIND_LABELS: Record<string, string> = {
+  rate_limit: "Rate limit",
+  timeout: "Timeout",
+  overloaded: "Overloaded",
+  json_parse: "Parse failure",
+  image_optimize: "Image optimize",
+  network: "Network",
+  other: "Other",
+};
+
+interface ClaudeErrorBreakdown {
+  total: number;            // total comparisons that errored (sum of per-kind buckets)
+  uniqueImages: number;     // distinct images that experienced any Claude error
+  fullyErrored: number;     // images where every comparison errored (real funnel rejection)
+  byKind: Array<[string, number]>;
+}
+
+function summarizeClaudeErrors(stats: PipelineStats): ClaudeErrorBreakdown | null {
+  const total = Number(stats.claude_errors ?? 0);
+  const fullyErrored = Number(stats.claude_error ?? 0);
+  const byKind: Array<[string, number]> = [];
+  for (const k of Object.keys(stats)) {
+    if (!k.startsWith("claude_error_")) continue;
+    const value = Number(stats[k as `claude_error_${string}`] ?? 0);
+    if (value <= 0) continue;
+    const kind = k.slice("claude_error_".length);
+    byKind.push([kind, value]);
+  }
+  byKind.sort((a, b) => b[1] - a[1]);
+  if (total === 0 && fullyErrored === 0 && byKind.length === 0) {
+    return null;
+  }
+  // The per-kind sum can exceed `claude_errors` because one image can
+  // bump multiple buckets if its asset comparisons fail with different
+  // kinds. Use that sum, not claude_errors, as the true comparison-level
+  // total for the tooltip.
+  const comparisonTotal = byKind.reduce((acc, [, v]) => acc + v, 0) || total;
+  return {
+    total: comparisonTotal,
+    uniqueImages: total,
+    fullyErrored,
+    byKind,
+  };
 }
 
 interface ScanJob {
@@ -300,11 +362,57 @@ function CostBreakdown({ cost }: { cost: CostSummary }) {
   );
 }
 
+function ClaudeErrorBreakdownPanel({ breakdown }: { breakdown: ClaudeErrorBreakdown }) {
+  return (
+    <div className="mt-2 pt-2 border-t border-border/30 text-xs">
+      <div className="flex items-center justify-between mb-1.5 text-muted-foreground">
+        <span className="font-medium text-amber-400">Claude infra errors</span>
+        <span className="font-mono tabular-nums text-muted-foreground/80">
+          {breakdown.uniqueImages} image{breakdown.uniqueImages === 1 ? "" : "s"} affected
+          {breakdown.fullyErrored > 0 && (
+            <span className="text-red-400">
+              {" "}· {breakdown.fullyErrored} fully errored
+            </span>
+          )}
+        </span>
+      </div>
+      {breakdown.byKind.length > 0 ? (
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1">
+          {breakdown.byKind.map(([kind, count]) => (
+            <div key={kind} className="flex justify-between">
+              <span className="text-muted-foreground">
+                {CLAUDE_ERROR_KIND_LABELS[kind] || kind}
+              </span>
+              <span className="font-mono tabular-nums">{count}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="text-muted-foreground/80 italic">
+          No per-kind breakdown recorded
+        </div>
+      )}
+      <p className="mt-1.5 text-muted-foreground/70">
+        These are scans where Claude itself failed (rate limit, timeout, parse
+        error) — not "Claude said this isn't a match". Spikes correlate with
+        Anthropic infra pressure or Bright-Data-driven traffic bumping into
+        quota.
+      </p>
+    </div>
+  );
+}
+
 function PipelineFunnel({ stats }: { stats: PipelineStats }) {
   const newMatches = stats.matched_new ?? stats.matched ?? 0;
   const confirmed = stats.matched_confirmed ?? 0;
   const drift = stats.drift_detected ?? 0;
+  const claudeErrorStage = Number(stats.claude_error ?? 0);
+  const claudeBreakdown = summarizeClaudeErrors(stats);
 
+  // Phase 6.5.4 surfaces ``claude_error`` (the funnel stage where every
+  // comparison errored) separately from ``below_threshold`` so a spike
+  // in Anthropic pressure is visible at a glance instead of silently
+  // depressing the match rate. Only show the row when it actually fired.
   const stages = [
     { label: "Total Images", value: stats.total_images, color: "bg-slate-500" },
     { label: "Download Failed", value: stats.download_failed, color: "bg-red-500" },
@@ -313,6 +421,9 @@ function PipelineFunnel({ stats }: { stats: PipelineStats }) {
     { label: "Haiku Filter Rejected", value: stats.filter_rejected, color: "bg-yellow-500" },
     { label: "Below Threshold", value: stats.below_threshold, color: "bg-purple-500" },
     { label: "Verification Rejected", value: stats.verification_rejected, color: "bg-pink-500" },
+    ...(claudeErrorStage > 0
+      ? [{ label: "Claude Errors", value: claudeErrorStage, color: "bg-rose-500" }]
+      : []),
     { label: "Errors", value: stats.errors, color: "bg-red-600" },
     { label: "New Matches", value: newMatches, color: "bg-green-500" },
     { label: "Confirmed Matches", value: confirmed, color: "bg-emerald-400" },
@@ -377,6 +488,7 @@ function PipelineFunnel({ stats }: { stats: PipelineStats }) {
           <span>{stats.image_cache.cached_mb} MB cached</span>
         </div>
       )}
+      {claudeBreakdown && <ClaudeErrorBreakdownPanel breakdown={claudeBreakdown} />}
       {stats.cost && <CostBreakdown cost={stats.cost} />}
     </div>
   );
@@ -647,6 +759,21 @@ export default function ScansPage() {
                         ) : (
                           <p className="text-xs text-muted-foreground">
                             {job.total_items} images scanned
+                          </p>
+                        )}
+                        {/* Claude-infra-error count surfaces here so a low
+                            match-count caused by Anthropic pressure is
+                            distinguishable at-a-glance from a genuine
+                            "nothing matched" outcome. Only renders when
+                            the counter is non-zero — quiet otherwise. */}
+                        {job.pipeline_stats && Number(job.pipeline_stats.claude_errors ?? 0) > 0 && (
+                          <p className="text-xs text-rose-400 mt-0.5" title="Images where Claude itself failed (rate limit / timeout / parse error). Expand the Pipeline Funnel for a per-kind breakdown.">
+                            {Number(job.pipeline_stats.claude_errors)} Claude error{Number(job.pipeline_stats.claude_errors) === 1 ? "" : "s"}
+                            {Number(job.pipeline_stats.claude_error ?? 0) > 0 && (
+                              <span className="text-rose-300/80">
+                                {" "}({Number(job.pipeline_stats.claude_error)} fully)
+                              </span>
+                            )}
                           </p>
                         )}
                       </div>
