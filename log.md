@@ -6338,3 +6338,63 @@ The Bright Data integration is structurally complete and stays as-is. The `host_
 4. (carried) Replace data-URL asset storage with Supabase Storage. Bigger project; not blocking anything.
 5. **Per-host Claude-error trend in the operator dashboard.** Phase 6.5.5 surfaces the per-scan numbers. Aggregating across the last N scans per host (so an operator can see "host X has been hitting rate_limit at 30%+ for the last 10 scans") would tell us whether to throttle or whether the issue is host-specific. Requires a small RPC + a chart on the host-detail page; deferred until we have the next genuinely-blocked dealer to motivate it.
 6. **Migration to drop the no-longer-valid `screenshotone` strategy values from `host_scan_policy.notes` history.** Migration 031 already rewrites the `strategy` column itself; the `notes` and `last_block_reason` text fields still carry old SS1-era strings on long-lived hosts. Cosmetic only — no on-call should ever see these as actionable — but worth a one-line `UPDATE` to clean up the operator UI eventually.
+
+---
+
+## 2026-05-05 — Phase 6.5.6 — two-tier asset upload size cap (PSDs over 25 MB now accepted)
+
+### Why
+
+Operator (live, in-product) tried to upload `CAT_CC_ATTENTIVENESS_RA.psd` (30.6 MB) and got rejected with "File too large (30.6 MB). Maximum is 25 MB." This was a genuine UX dead-end because:
+
+1. The asset upload endpoint at `backend/app/routers/campaigns.py:upload_asset` was running the size check on the **raw uploaded bytes** before the PSD-rasterization step, so the cap was being applied to a layered Photoshop source whose composite would have been a fraction of that size.
+2. Layered PSDs from dealer creative teams routinely run 30–60 MB. The 25 MB cap pre-dated the PSD support and was never adjusted to reflect the realistic source-file size.
+3. A flatten-and-resave workaround in Photoshop is fine for one-off uploads but defeats the purpose of having a server-side PSD rasterizer in the first place.
+
+### What changed
+
+`backend/app/routers/campaigns.py:upload_asset` now enforces **two separate caps** instead of one:
+
+- `MAX_RAW_UPLOAD_BYTES = 75 * 1024 * 1024` — the raw multipart payload ceiling. Bumped from 25 MB to 75 MB so realistic layered Photoshop sources come through. Still bounded enough that worker RAM is safe at typical concurrency.
+- `MAX_STORED_BYTES = 25 * 1024 * 1024` — the post-rasterization stored ceiling. **Unchanged** from the historical 25 MB. Applies to whatever bytes actually land in storage and feed the matcher pipeline (hash, CLIP, Claude). For non-PSD uploads the stored bytes are the raw bytes; for PSDs the stored bytes are the flattened PNG composite.
+
+The check sequence is now:
+
+1. File-type allowlist (unchanged — accept image/* + .psd by extension/magic bytes).
+2. `await file.read()`.
+3. **Raw cap check** (new — 75 MB). Rejection message tells the user to flatten or export to PNG/JPG.
+4. Empty-file check (unchanged).
+5. PSD rasterization (unchanged — `psd_tools.PSDImage.composite` → PNG bytes).
+6. **Stored cap check** (new — 25 MB). Rejection message tells the user the flattened image is still too large; suggests reducing canvas resolution. Different copy for PSD vs non-PSD inputs so the user knows whether the issue was their source file or the post-flatten output.
+
+### Why two tiers instead of just bumping the one cap to 75 MB
+
+Considered, rejected. Bumping the single cap to 75 MB would mean every non-PSD upload (PNG/JPG/WebP at 30, 50, 70 MB) would be accepted and stored at full size. The matcher pipeline downstream — hash perception, CLIP embedding, Claude visual comparison — has been tuned and load-tested against ~25 MB stored assets. A 70 MB stored PNG would slow every single Claude verification call against that asset (the image is base64-encoded inside every Claude prompt) and inflate Anthropic spend across the lifetime of the asset. Keeping the stored cap at 25 MB means the pipeline's per-asset RAM footprint and per-call cost are unchanged; only the upload pipe got wider.
+
+The asymmetry — accept large input, store only flat output — is exactly the asymmetry the PSD rasterizer was added for in the first place. The previous one-cap design just hadn't been updated to reflect that decoupling.
+
+### What this changes in practice
+
+- **Realistic dealer PSDs (30–60 MB layered) now upload successfully.** The flatten step usually produces a 2–10 MB PNG, well under the stored cap.
+- **Non-PSD oversize uploads still get rejected**, but with a clearer error message that tells the user *which* threshold they hit and what to do about it.
+- **Pathological PSDs (where even the flat composite is >25 MB, e.g. 12000×8000 print masters) get a specific rejection** that names the canvas-resolution fix, not the generic "file too large" message.
+
+### What did NOT change
+
+- **Storage backend.** Still uses Supabase Storage with the data-URL fallback when the bucket isn't configured. Carry-over follow-up #4 ("replace data-URL asset storage with Supabase Storage") is still on the list.
+- **Rate limit.** `@limiter.limit("10/minute")` on the upload endpoint is unchanged.
+- **Frontend client.** No changes needed — the React upload UI just renders whatever `4xx detail` the backend returns, so the new error copy flows through automatically.
+
+### Files
+
+- `backend/app/routers/campaigns.py` — `MAX_FILE_SIZE` removed; replaced with `MAX_RAW_UPLOAD_BYTES` (75 MB) + `MAX_STORED_BYTES` (25 MB) constants. Stored-size check added after the PSD rasterization branch with separate copy for PSD and non-PSD failures.
+
+### Tests
+
+`pytest tests/test_campaigns.py tests/test_unlocker_service.py tests/test_page_cache_service.py` → **47 passed, 0 failed.** No new tests added for this change because the existing test infrastructure covers the surrounding endpoints; the size-cap branches are dominated by simple integer comparisons whose behaviour is observable from the wire (the rejection message). If we see this branch produce surprising failures in production we can add a dedicated multipart-upload integration test then; not worth fabricating one against a contrived `UploadFile` mock now.
+
+### Verification on next upload
+
+- A 30 MB layered PSD that previously rejected with "File too large (30 MB). Maximum is 25 MB." should now upload successfully, land in storage as a flattened PNG (typically 2–8 MB), and appear in the campaign assets list with the PSD source replaced by its rasterized composite.
+- A 90 MB anything (PSD or otherwise) should still reject, but with the new copy: "File too large (90 MB). Maximum upload size is 75 MB. Flatten the file or export to PNG/JPG before re-uploading."
+- A pathological PSD whose composite is >25 MB (rare; only happens with print-resolution masters) rejects post-rasterization with the canvas-resolution hint rather than the upload-size hint.

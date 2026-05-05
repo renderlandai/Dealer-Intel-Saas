@@ -236,7 +236,22 @@ async def upload_asset(
 
     ALLOWED_TYPES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp", "image/svg+xml"}
     PSD_TYPES = {"image/vnd.adobe.photoshop", "image/x-photoshop", "application/x-photoshop"}
-    MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB (PSDs are larger than flat images)
+
+    # Two-tier size cap. The raw upload cap protects worker RAM from
+    # arbitrary client payloads; the stored cap bounds what the matcher
+    # pipeline (hash, CLIP, Claude) actually has to operate on.
+    #
+    # Why two tiers instead of one. Layered Photoshop sources from
+    # dealer creative teams routinely run 30-60 MB even when the visible
+    # composite would render as a 2-5 MB PNG. The previous single 25 MB
+    # cap rejected those PSDs before rasterization had a chance to flatten
+    # them, even though the *stored* asset would have been small. The
+    # raw cap is generous enough to absorb a typical print-quality PSD;
+    # the stored cap stays at the historical 25 MB so non-PSD uploads
+    # see no behaviour change and the matcher pipeline's per-asset RAM
+    # footprint is unchanged.
+    MAX_RAW_UPLOAD_BYTES = 75 * 1024 * 1024   # raw multipart payload ceiling
+    MAX_STORED_BYTES = 25 * 1024 * 1024       # post-rasterization ceiling
 
     raw_filename = file.filename or "unnamed"
     incoming_ext = os.path.splitext(raw_filename)[1].lower()
@@ -261,10 +276,14 @@ async def upload_asset(
 
     content = await file.read()
 
-    if len(content) > MAX_FILE_SIZE:
+    if len(content) > MAX_RAW_UPLOAD_BYTES:
         raise HTTPException(
             status_code=400,
-            detail=f"File too large ({len(content) / 1024 / 1024:.1f} MB). Maximum is {MAX_FILE_SIZE // 1024 // 1024} MB.",
+            detail=(
+                f"File too large ({len(content) / 1024 / 1024:.1f} MB). "
+                f"Maximum upload size is {MAX_RAW_UPLOAD_BYTES // 1024 // 1024} MB. "
+                "Flatten the file or export to PNG/JPG before re-uploading."
+            ),
         )
 
     if len(content) == 0:
@@ -310,6 +329,28 @@ async def upload_asset(
                 f"Accepted: {', '.join(sorted(ALLOWED_TYPES))}, image/vnd.adobe.photoshop (.psd)."
             ),
         )
+
+    # Post-rasterization cap. For non-PSD uploads ``stored_content`` is
+    # ``content`` so this is effectively a second check at the same byte
+    # count — fine, it just costs one comparison. For PSDs the stored
+    # bytes are the flattened PNG, which is what the matcher actually
+    # works on; reject if it's somehow still larger than the matcher
+    # budget (e.g. an absurdly high-res print PSD whose composite is
+    # itself >25 MB even after PNG compression).
+    if len(stored_content) > MAX_STORED_BYTES:
+        if is_psd:
+            detail = (
+                f"Flattened PSD is too large ({len(stored_content) / 1024 / 1024:.1f} MB). "
+                f"Maximum stored size is {MAX_STORED_BYTES // 1024 // 1024} MB. "
+                "Reduce the canvas resolution in Photoshop, then re-upload."
+            )
+        else:
+            detail = (
+                f"File too large ({len(stored_content) / 1024 / 1024:.1f} MB). "
+                f"Maximum stored size is {MAX_STORED_BYTES // 1024 // 1024} MB. "
+                "Re-export at a lower resolution or higher compression and re-upload."
+            )
+        raise HTTPException(status_code=400, detail=detail)
 
     asset_name = name or file_name
 
