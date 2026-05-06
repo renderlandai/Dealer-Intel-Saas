@@ -70,22 +70,6 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# How often to fire a heartbeat from inside the per-image analysis
-# loop. The outer loop already heartbeats once per page (line ~869),
-# but a single page on a heavy AEM-style dealer site can carry 100+
-# creatives and the Claude verification ladder runs several seconds
-# per image; without an inner heartbeat the row's `last_heartbeat_at`
-# can sit stale for 10+ minutes during a perfectly healthy scan.
-#
-# That mattered when the cleanup window was 4 hours (it didn't fire),
-# but with the post-2026-05-05 30-min cleanup window the inner
-# heartbeat is what keeps a slow-but-alive page from being mistakenly
-# auto-failed. Every 10 images is the right cadence: chatty enough to
-# survive a Supabase hiccup on any single write, sparse enough that
-# the heartbeat update itself isn't a meaningful share of scan cost.
-_HEARTBEAT_EVERY_N = 10
-
-
 def _heartbeat(scan_job_id) -> None:
     """Stamp `scan_jobs.last_heartbeat_at` so the cleanup job knows we're alive.
 
@@ -97,10 +81,8 @@ def _heartbeat(scan_job_id) -> None:
 
     Best-effort: failures are logged at debug level and swallowed so a
     transient Supabase hiccup never fails an otherwise-healthy scan.
-    Called at major phase boundaries (per-page, post-discover, etc.)
-    AND every `_HEARTBEAT_EVERY_N` images from the per-image analysis
-    loop, so a slow-but-progressing page keeps `last_heartbeat_at`
-    fresh enough to satisfy the post-2026-05-05 30-min cleanup window.
+    Called once per page from the website runner and at major phase
+    boundaries; per-image calls would be too chatty for the value.
     """
     try:
         supabase.table("scan_jobs").update({
@@ -587,7 +569,7 @@ async def _analyze_single_image(
     Returns the matched asset_id (str) when a match is recorded, else None.
     """
     try:
-        result, stage, diagnostics = await ai_service.process_discovered_image(
+        result, stage = await ai_service.process_discovered_image(
             image["id"],
             image["image_url"],
             campaign_assets,
@@ -600,52 +582,6 @@ async def _analyze_single_image(
 
         if stage != "matched":
             pipeline_stats[stage] = pipeline_stats.get(stage, 0) + 1
-
-        # Track total Claude error volume across the funnel even when
-        # the stage isn't `claude_error` itself (e.g. one asset
-        # comparison errored but another scored normally and won the
-        # match). This is what tells the operator that BD-driven
-        # traffic is bleeding into Anthropic rate limits.
-        if diagnostics.get("had_claude_error"):
-            pipeline_stats["claude_errors"] = pipeline_stats.get("claude_errors", 0) + 1
-            for kind in diagnostics.get("claude_error_kinds", []) or []:
-                key = f"claude_error_{kind}"
-                pipeline_stats[key] = pipeline_stats.get(key, 0) + 1
-
-        # Persist the per-image diagnostic blob on the
-        # discovered_images row so an operator (or the Phase 7 review
-        # tool) can post-mortem any image without re-running the
-        # pipeline. We do this for every non-matched stage — even the
-        # cheap reject stages (hash/CLIP) — because knowing "this
-        # image was killed by hash with best-rung-distance=N" is the
-        # same kind of post-hoc signal we care about.
-        if stage != "matched":
-            try:
-                pipeline_diag = {
-                    "stage": stage,
-                    "best_score": diagnostics.get("best_score", 0),
-                    "best_asset_id": diagnostics.get("best_asset_id"),
-                    "threshold": diagnostics.get("threshold"),
-                    "comparisons_run": diagnostics.get("comparisons_run", 0),
-                    "had_claude_error": bool(diagnostics.get("had_claude_error")),
-                    "claude_error_kinds": diagnostics.get("claude_error_kinds", []),
-                }
-                if diagnostics.get("download_error"):
-                    pipeline_diag["download_error"] = diagnostics["download_error"]
-                # Read-merge-write: discovered_images.metadata is
-                # JSONB and may already carry extraction-side info
-                # (capture_method, full_page, …) we must not clobber.
-                existing = supabase.table("discovered_images")\
-                    .select("metadata").eq("id", image["id"]).limit(1).execute()
-                base_meta = (existing.data[0].get("metadata") if existing.data else {}) or {}
-                base_meta["pipeline"] = pipeline_diag
-                supabase.table("discovered_images").update({
-                    "metadata": base_meta,
-                }).eq("id", image["id"]).execute()
-            except Exception as diag_err:
-                # Diagnostics are best-effort — never fail a scan over
-                # a metadata write hiccup.
-                log.debug("Failed to persist pipeline diagnostics for %s: %s", image["id"], diag_err)
 
         matched_asset_id: Optional[str] = None
 
@@ -864,20 +800,11 @@ async def _process_one_dealer(
             "filter_rejected": 0,
             "below_threshold": 0,
             "verification_rejected": 0,
-            "compliance_asset_not_visible": 0,
-            "claude_error": 0,
-            "claude_errors": 0,
             "matched_new": 0,
             "matched_confirmed": 0,
             "drift_detected": 0,
             "errors": 0,
         }
-        # Phase 6.5.10 — per-dealer count of pages that succeeded on a
-        # Playwright rung specifically. Lets the host-policy recorder
-        # auto-demote BD-pinned hosts whose Playwright rendering has
-        # recovered, while leaving genuinely-blocked hosts (success
-        # only via the BD rung) on their current strategy.
-        local_playwright_success_count = 0
 
         try:
             for page_idx, page_url in enumerate(page_urls):
@@ -923,16 +850,6 @@ async def _process_one_dealer(
                 if outcome == extraction_service.OUTCOME_IMAGES:
                     local_total_discovered += count
                     local_pages_scanned += 1
-                    # Phase 6.5.10 — credit "this page worked on a
-                    # Playwright rung" only when the ladder actually
-                    # told us so. Names come from
-                    # render_strategies._PlaywrightAttempt — anything
-                    # that doesn't start with `playwright_` (today only
-                    # `brightdata_unlocker`) does NOT count toward
-                    # auto-demote eligibility.
-                    succeeded_attempt = getattr(res, "succeeded_attempt", None) or ""
-                    if succeeded_attempt.startswith("playwright_"):
-                        local_playwright_success_count += 1
                 elif outcome == extraction_service.OUTCOME_EMPTY:
                     local_pages_empty += 1
                     if (
@@ -1049,13 +966,6 @@ async def _process_one_dealer(
                             match_buffer=local_buffer,
                             processed_buffer=local_processed,
                         )
-                        # Periodic intra-page heartbeat — pages with 100+
-                        # creatives can spend 10+ minutes inside this
-                        # loop, which would let `last_heartbeat_at` go
-                        # stale past the 30-min cleanup window even
-                        # though the runner is making active progress.
-                        if local_total_images % _HEARTBEAT_EVERY_N == 0:
-                            _heartbeat(scan_job_id)
                         if asset_id:
                             local_page_match_tracker.setdefault(page_url, set()).add(asset_id)
                             async with matched_lock:
@@ -1115,7 +1025,6 @@ async def _process_one_dealer(
             "dealer_status": dealer_status,
             "base_url": base_url,
             "distributor_id": str(distributor_id) if distributor_id else None,
-            "playwright_success_count": local_playwright_success_count,
         }
 
 
@@ -1368,15 +1277,6 @@ async def run_website_scan(
             "filter_rejected": 0,
             "below_threshold": 0,
             "verification_rejected": 0,
-            # New stage: Claude-side failures (rate-limit, timeout,
-            # JSON parse) — every ensemble call for the image errored,
-            # so the resulting 0 score is not a real "no match" verdict.
-            # Tracked separately from below_threshold so a spike in
-            # Anthropic quota pressure is visible at a glance.
-            "claude_error": 0,
-            # Aggregated counters across all images, including those
-            # that ultimately matched on a different asset comparison.
-            "claude_errors": 0,
             "matched_new": 0,
             "matched_confirmed": 0,
             "drift_detected": 0,
@@ -1440,13 +1340,6 @@ async def run_website_scan(
             # counter even though it appears in zero `blocked_details` rows.
             from urllib.parse import urlparse as _urlparse
             success_pages_by_host: Dict[str, int] = {}
-            # Phase 6.5.10 — separately track per-host pages that
-            # succeeded on a *Playwright* rung. The host-policy
-            # recorder uses this set to auto-demote BD-pinned hosts
-            # whose Playwright rendering has recovered. Hosts whose
-            # only successes came via the Bright Data rung are NOT
-            # in this map and stay on their current strategy.
-            playwright_success_pages_by_host: Dict[str, int] = {}
 
             for result in dealer_results:
                 if isinstance(result, BaseException):
@@ -1494,12 +1387,6 @@ async def run_website_scan(
                             success_pages_by_host.get(host, 0)
                             + int(result["pages_scanned"])
                         )
-                        pw_succ = int(result.get("playwright_success_count", 0))
-                        if pw_succ > 0:
-                            playwright_success_pages_by_host[host] = (
-                                playwright_success_pages_by_host.get(host, 0)
-                                + pw_succ
-                            )
 
             # Phase 6: feed observed outcomes back into host_scan_policy so
             # the next scan of these hosts skips doomed ladder rungs.
@@ -1511,35 +1398,16 @@ async def run_website_scan(
                 host_policy_service.merge_host_successes(
                     host_aggs, success_pages_by_host,
                 )
-                # Phase 6.5.10 — pass the Playwright-rung success
-                # counter alongside the global success counter so the
-                # recorder can demote hosts whose Playwright rendering
-                # has recovered.
-                transitions = host_policy_service.record_host_outcomes(
-                    host_aggs,
-                    playwright_success_by_host=playwright_success_pages_by_host,
-                )
-                promotions = [t for t in transitions if t[3] == "promoted"]
-                demotions = [t for t in transitions if t[3] == "demoted"]
+                promotions = host_policy_service.record_host_outcomes(host_aggs)
                 if promotions:
                     pipeline_stats["host_promotions"] = [
                         {"hostname": h, "from": old, "to": new}
-                        for (h, old, new, _) in promotions
+                        for (h, old, new) in promotions
                     ]
                     log.info(
                         "host_scan_policy: %d host(s) auto-promoted: %s",
                         len(promotions),
-                        ", ".join(f"{h} ({old}->{new})" for h, old, new, _ in promotions),
-                    )
-                if demotions:
-                    pipeline_stats["host_demotions"] = [
-                        {"hostname": h, "from": old, "to": new}
-                        for (h, old, new, _) in demotions
-                    ]
-                    log.info(
-                        "host_scan_policy: %d host(s) auto-demoted: %s",
-                        len(demotions),
-                        ", ".join(f"{h} ({old}->{new})" for h, old, new, _ in demotions),
+                        ", ".join(f"{h} ({old}->{new})" for h, old, new in promotions),
                     )
             except Exception as policy_err:
                 # Never fail a scan because the learning layer hiccupped.
@@ -1887,8 +1755,6 @@ async def run_image_analysis(
         "filter_rejected": 0,
         "below_threshold": 0,
         "verification_rejected": 0,
-        "claude_error": 0,
-        "claude_errors": 0,
         "matched_new": 0,
         "matched_confirmed": 0,
         "drift_detected": 0,

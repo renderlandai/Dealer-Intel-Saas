@@ -14,12 +14,9 @@ Channels supported:
 - Google Ads Transparency: ad-card image extraction
 - Facebook / Meta Ad Library: ad creative extraction with fallback
 """
-import gc
 import hashlib
 import io
 import logging
-import resource
-import sys
 import time
 import asyncio
 from dataclasses import dataclass, field
@@ -43,161 +40,6 @@ from ..services.bulk_writers import (
 log = logging.getLogger("dealer_intel.extraction")
 
 settings = get_settings()
-
-
-# ---------------------------------------------------------------------------
-# Phase 6.5.8 — RSS guards for the screenshot+upload critical section
-# ---------------------------------------------------------------------------
-# Backstory: 2026-05-05 OOM at the page-9 evidence-screenshot upload window.
-# Three structural problems converged: full-page PNG buffered in RSS, no
-# upper bound on page height, and N concurrent screenshots in flight as
-# `max_concurrent_dealers` parallel dealer pipelines all reached the
-# screenshot step at the same time.
-#
-# Mitigations in this module:
-#  1. `_take_evidence_screenshot` — single helper for "snapshot the page
-#     for evidence", does the full-page-vs-clipped decision once, defaults
-#     to JPEG so the byte budget is 5-10× smaller than PNG.
-#  2. `_screenshot_semaphore` — global cap on concurrent screenshot+upload
-#     pairs, independent of dealer-level concurrency. The dealer semaphore
-#     decides "how many dealers run in parallel"; this one decides "how
-#     many of those dealers can be in the screenshot RSS spike at once."
-#  3. `_log_rss(label)` — cheap observability via `resource.getrusage` so
-#     we can actually see the RSS profile in prod logs and know whether
-#     these mitigations are doing what they claim.
-#
-# All three are deliberately stdlib-only — no psutil, no extra deps. The
-# `resource` module is available on every POSIX platform we run on
-# (DigitalOcean App Platform = Linux, dev = macOS).
-
-
-_screenshot_semaphore: Optional[asyncio.Semaphore] = None
-
-
-def _get_screenshot_semaphore() -> asyncio.Semaphore:
-    """Lazy-init the screenshot concurrency semaphore.
-
-    Cannot be created at import time because there is no running event
-    loop yet (Python 3.10+ asyncio.Semaphore() doesn't bind to a loop,
-    but we still want the construction deferred so a settings reload
-    can re-take effect).
-    """
-    global _screenshot_semaphore
-    if _screenshot_semaphore is None:
-        cap = max(1, getattr(settings, "max_concurrent_screenshots", 2))
-        _screenshot_semaphore = asyncio.Semaphore(cap)
-    return _screenshot_semaphore
-
-
-def _rss_mb() -> float:
-    """Current process RSS in MB.
-
-    `ru_maxrss` is documented in different units per platform:
-        - Linux: kilobytes
-        - macOS: bytes (not POSIX-compliant but it's what the kernel emits)
-
-    We normalise both to MB so the log line is comparable across dev and
-    prod. The number is the *peak* RSS observed by the kernel for this
-    process, not current — but for our purpose ("did the screenshot step
-    spike RSS?") peak is the right signal.
-    """
-    raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform == "darwin":
-        return raw / (1024 * 1024)
-    return raw / 1024
-
-
-def _log_rss(label: str) -> None:
-    """Emit one INFO-level RSS observation. Best-effort; never raises."""
-    try:
-        log.info("rss=%.0fMB stage=%s", _rss_mb(), label)
-    except Exception:  # pragma: no cover — observability must not crash
-        pass
-
-
-def _evidence_screenshot_extension() -> str:
-    """File extension for the configured evidence screenshot format."""
-    fmt = (getattr(settings, "evidence_screenshot_format", "jpeg") or "jpeg").lower()
-    return "jpg" if fmt == "jpeg" else fmt
-
-
-def _evidence_screenshot_content_type() -> str:
-    """HTTP Content-Type for the configured evidence screenshot format."""
-    fmt = (getattr(settings, "evidence_screenshot_format", "jpeg") or "jpeg").lower()
-    return f"image/{'jpeg' if fmt in ('jpeg', 'jpg') else fmt}"
-
-
-async def _take_evidence_screenshot(page: Page) -> Tuple[bytes, Dict[str, Any]]:
-    """Capture an evidence screenshot under explicit RSS controls.
-
-    Two guards on top of `page.screenshot(...)`:
-
-    1. **Format**: defaults to JPEG (settings.evidence_screenshot_format).
-       JPEG at quality ~82 is 5-10× smaller than PNG for the photographic
-       content that dominates dealer pages, while remaining visually
-       indistinguishable for the audit-trail use case AND surviving the
-       OpenCV template / ORB matchers in `cv_matching` cleanly.
-    2. **Height clip**: pages taller than `settings.max_screenshot_height`
-       are captured via `clip={x:0, y:0, width:viewport, height:cap}`
-       instead of `full_page=True`. This is the structural fix for AEM
-       mega-pages where the *page* is 30000-px tall and the resulting
-       PNG is 50+ MB on its own — far too large for the worker's RSS
-       budget regardless of any other mitigation.
-
-    Returns `(image_bytes, metadata)`. The metadata dict carries
-    `clipped: bool` and the captured dimensions so the caller can attach
-    it to the evidence row for forensic clarity ("why is this screenshot
-    only the top half of the page?").
-    """
-    fmt = (getattr(settings, "evidence_screenshot_format", "jpeg") or "jpeg").lower()
-    quality = max(1, min(95, getattr(settings, "evidence_screenshot_quality", 82)))
-    max_h = max(1000, getattr(settings, "max_screenshot_height", 12000))
-
-    # Probe the page's rendered height up-front so we can decide
-    # full_page vs clipped before paying the screenshot cost. The
-    # evaluate is sub-ms; the screenshot itself is the expensive part.
-    try:
-        page_height = int(await page.evaluate("document.body.scrollHeight"))
-    except Exception:
-        page_height = 0  # fall through to full_page on probe failure
-
-    try:
-        viewport = page.viewport_size or {"width": 1920, "height": 1080}
-    except Exception:
-        viewport = {"width": 1920, "height": 1080}
-
-    metadata: Dict[str, Any] = {
-        "format": "jpeg" if fmt == "jpeg" else fmt,
-        "page_height_px": page_height,
-        "clipped": False,
-    }
-
-    # Build kwargs incrementally so a Playwright version that doesn't
-    # accept `quality` for PNGs (it doesn't) only sees it for JPEGs.
-    shot_kwargs: Dict[str, Any] = {"type": "jpeg" if fmt == "jpeg" else "png"}
-    if fmt == "jpeg":
-        shot_kwargs["quality"] = quality
-
-    if page_height and page_height > max_h:
-        shot_kwargs["clip"] = {
-            "x": 0,
-            "y": 0,
-            "width": int(viewport.get("width", 1920)),
-            "height": max_h,
-        }
-        metadata["clipped"] = True
-        metadata["captured_height_px"] = max_h
-        log.info(
-            "Page height %dpx exceeds cap %dpx — clipping screenshot to top %dpx",
-            page_height, max_h, max_h,
-        )
-    else:
-        shot_kwargs["full_page"] = True
-        metadata["captured_height_px"] = page_height or None
-
-    image_bytes = await page.screenshot(**shot_kwargs)
-    metadata["bytes"] = len(image_bytes)
-    return image_bytes, metadata
 
 
 # ---------------------------------------------------------------------------
@@ -236,15 +78,6 @@ class ExtractionResult:
     outcome: str = OUTCOME_EMPTY
     block_reason: Optional[str] = None
     http_status: Optional[int] = None
-    # Phase 6.5.10 — which ladder rung produced this result, if any.
-    # Populated by `extract_dealer_website` from `LadderResult.succeeded_attempt`
-    # so callers (specifically `_process_one_dealer` in scan_runners) can
-    # tell a Playwright-rung success apart from a Bright-Data-rung success
-    # without round-tripping through the block_reason string.
-    # ``None`` means either the ladder didn't succeed at all (every rung
-    # produced a non-IMAGES outcome) or the result came from a code path
-    # that doesn't use the ladder (e.g. the cv-localizer fallback).
-    succeeded_attempt: Optional[str] = None
 
 
 # Shared browser instance to avoid repeated cold starts
@@ -289,33 +122,6 @@ async def _get_browser() -> Browser:
                     # protecting rent.cat.com) check in the very first
                     # navigator probe.
                     "--disable-blink-features=AutomationControlled",
-                    # ----- Phase 6.5.8: RSS-saving Chromium flags -----
-                    # The page-9 OOM made Chromium's resident-set
-                    # contribution painfully visible. These flags are
-                    # the standard headless-Chrome diet recipe and each
-                    # cuts a slice of RSS without affecting render
-                    # fidelity for the dealer-page workload:
-                    #   * cap V8 old-space heap so a runaway page can't
-                    #     balloon the renderer to 1+ GB
-                    #   * drop background networking, sync, default
-                    #     extensions, translate, breakpad — none of
-                    #     which we need for a one-shot screenshot
-                    #   * disable site-isolation trial features that
-                    #     spawn extra renderer processes per-iframe
-                    "--js-flags=--max-old-space-size=512",
-                    "--disable-background-networking",
-                    "--disable-background-timer-throttling",
-                    "--disable-backgrounding-occluded-windows",
-                    "--disable-breakpad",
-                    "--disable-component-extensions-with-background-pages",
-                    "--disable-default-apps",
-                    "--disable-extensions",
-                    "--disable-features=TranslateUI,BlinkGenPropertyTrees,site-per-process",
-                    "--disable-sync",
-                    "--metrics-recording-only",
-                    "--mute-audio",
-                    "--no-default-browser-check",
-                    "--no-first-run",
                 ],
             )
             _browser_created_at = time.monotonic()
@@ -471,32 +277,18 @@ async def _upload_screenshot(
     scan_job_id: UUID,
     source_url: str,
     bucket: str = "scan-screenshots",
-    *,
-    content_type: Optional[str] = None,
-    extension: Optional[str] = None,
 ) -> Optional[str]:
-    """Upload screenshot bytes to Supabase storage. Returns the public URL.
-
-    Phase 6.5.8: callers can override `content_type` / `extension` if they
-    have format-specific bytes; defaults track the configured evidence
-    format (JPEG by default — see `_take_evidence_screenshot`). Existing
-    callers that pass nothing get JPEG path/content-type via the settings.
-    """
+    """Upload screenshot bytes to Supabase storage. Returns the public URL."""
     try:
         url_hash = hashlib.md5(source_url.encode()).hexdigest()[:12]
         timestamp = int(time.time() * 1000)
-        ext = extension or _evidence_screenshot_extension()
-        ctype = content_type or _evidence_screenshot_content_type()
-        path = f"screenshots/{scan_job_id}/{url_hash}-{timestamp}.{ext}"
+        path = f"screenshots/{scan_job_id}/{url_hash}-{timestamp}.png"
 
         supabase.storage.from_(bucket).upload(
-            path, image_bytes, {"content-type": ctype}
+            path, image_bytes, {"content-type": "image/png"}
         )
         public_url = supabase.storage.from_(bucket).get_public_url(path)
-        log.info(
-            "Evidence screenshot saved (%s, %d bytes): %s",
-            ext, len(image_bytes), public_url[:80],
-        )
+        log.info("Evidence screenshot saved: %s", public_url[:80])
         return public_url
     except Exception as e:
         log.error("Evidence screenshot upload failed: %s", e)
@@ -509,22 +301,28 @@ async def _capture_evidence_screenshot(
     source_url: str,
     bucket: str = "scan-screenshots",
 ) -> Optional[str]:
-    """Take a screenshot under RSS guards and upload it for audit evidence.
-
-    Wraps the screenshot+upload in `_get_screenshot_semaphore()` so the
-    whole worker bounds concurrent screenshot RSS independently of
-    dealer-level concurrency. Bytes are dropped immediately after the
-    upload returns so the caller doesn't hold a stale reference.
-    """
+    """Take a full-page screenshot and upload to Supabase for audit evidence."""
     try:
-        async with _get_screenshot_semaphore():
-            image_bytes, _meta = await _take_evidence_screenshot(page)
-            url = await _upload_screenshot(image_bytes, scan_job_id, source_url, bucket)
-            del image_bytes
-            return url
+        image_bytes = await page.screenshot(full_page=True, type="png")
+        return await _upload_screenshot(image_bytes, scan_job_id, source_url, bucket)
     except Exception as e:
         log.error("Evidence screenshot failed: %s", e)
         return None
+
+
+async def _screenshotone_fallback(url: str, scan_job_id: UUID) -> Optional[str]:
+    """Capture a blocked page via ScreenshotOne's hosted renderer.
+
+    Used when both Playwright viewports came back BLOCKED — ScreenshotOne
+    runs from rotating residential-style IPs that are typically not on
+    Cat/Akamai's headless-Chromium denylist. Returns the storage URL of
+    the uploaded PNG, or None on any failure.
+    """
+    if not getattr(settings, "screenshotone_access_key", ""):
+        return None
+    # Late import to avoid a circular dependency between services.
+    from . import screenshot_service
+    return await screenshot_service.capture_and_upload(url, scan_job_id)
 
 
 async def _extract_images_from_page(page: Page) -> List[Dict[str, Any]]:
@@ -731,17 +529,6 @@ async def _localize_and_crop_assets(
                 match["confidence"], match["method"],
             )
 
-    # Phase 6.5.8: explicitly drop the decoded full-page image before
-    # we return. PIL keeps the decoded pixel buffer alive through the
-    # `full_img` local — for a 1920x12000 RGB this is ~70 MB. Letting
-    # it die at function-return is fine in steady state, but during the
-    # screenshot semaphore window we want it released as early as
-    # possible so the next dealer's screenshot doesn't land on top.
-    try:
-        full_img.close()
-    except Exception:
-        pass
-
     log.info("Created %d cropped creative(s)", len(cropped))
     return cropped
 
@@ -756,22 +543,13 @@ async def localize_screenshot_capture(
     """Run CV localization on a captured full-page screenshot and insert
     each cropped creative as its own ``discovered_images`` row.
 
-    Used when a Playwright extraction returned a screenshot (evidence
-    only) but no individual ``<img>`` rows. The matcher then compares
-    real banner-sized crops against the campaign assets instead of
-    comparing a 1920x3000 full-page screenshot against a 320x50 banner —
-    which previously produced "STRONG MATCH (modified)" verdicts on
-    hosts like ``rent.cat.com`` because the page literally contained
-    the campaign artwork at hero size. See log.md 2026-04-29 for the
-    diagnostic.
-
-    Phase 6.5 note: the Bright Data Web Unlocker rung returns rendered
-    HTML (parsed for ``<img>`` tags directly), so blocked WAF hosts no
-    longer flow through this localizer in practice — they get real
-    extracted-image rows. This helper still runs for the rare case
-    where Playwright captured a screenshot but extracted zero images
-    (typical of single-page apps that render images via canvas or
-    inline SVG).
+    Used when a page was captured via the ScreenshotOne fallback (Playwright
+    couldn't reach it). The matcher is then comparing real banner-sized
+    crops against the campaign assets instead of comparing a 1920x3000
+    full-page screenshot against a 320x50 banner — which previously
+    produced "STRONG MATCH (modified)" verdicts on hosts like
+    ``rent.cat.com`` because the page literally contained the campaign
+    artwork at hero size. See log.md 2026-04-29 for the diagnostic.
 
     Returns the number of crops inserted. Zero is a valid result (no
     campaign creatives detected on the page) and is not an error.
@@ -971,35 +749,18 @@ async def _attempt_extraction(
             if img["src"] not in pre_carousel_srcs:
                 images.append(img)
 
-        # Phase 6.5.8: route through `_take_evidence_screenshot` so the
-        # screenshot is JPEG-compressed, height-clipped if necessary, and
-        # the screenshot+upload pair is bounded by the global semaphore.
-        # Bytes are explicitly dropped after both consumers (upload +
-        # CV localizer) are done so RSS frees before we move to the
-        # next page.
         page_height = await page.evaluate("document.body.scrollHeight")
-        _log_rss(f"pre-screenshot:{viewport_label}")
-        async with _get_screenshot_semaphore():
-            screenshot_bytes, screenshot_meta = await _take_evidence_screenshot(page)
-            _log_rss(f"post-screenshot:{viewport_label}")
-            evidence_url = await _upload_screenshot(
-                screenshot_bytes, scan_job_id, f"{url}#_{viewport_label}",
+        screenshot_bytes = await page.screenshot(full_page=True, type="png")
+        evidence_url = await _upload_screenshot(
+            screenshot_bytes, scan_job_id, f"{url}#_{viewport_label}",
+        )
+
+        if campaign_assets:
+            localized = await _localize_and_crop_assets(
+                screenshot_bytes, scan_job_id, campaign_assets,
             )
-            _log_rss(f"post-upload:{viewport_label}")
-
-            if campaign_assets:
-                localized = await _localize_and_crop_assets(
-                    screenshot_bytes, scan_job_id, campaign_assets,
-                )
-                images.extend(localized)
-                log.info("CV localization added %d cropped creative(s)", len(localized))
-
-        # Drop the screenshot bytes the moment the last consumer
-        # (CV localize) returns. Keeping the local alive across the
-        # downstream `for img in images` insert loop was the literal
-        # source of the page-9 OOM — the bytes had no further use but
-        # were pinned in RSS until the function returned.
-        del screenshot_bytes
+            images.extend(localized)
+            log.info("CV localization added %d cropped creative(s)", len(localized))
 
         log.info(
             "Found %d images+sections (%s) on %s",
@@ -1029,12 +790,6 @@ async def _attempt_extraction(
                     "alt_text": img["alt"],
                     "css_classes": img["classes"],
                     "evidence_screenshot_url": evidence_url,
-                    # Phase 6.5.8: surface whether the evidence screenshot
-                    # was clipped (and to what height) so operators
-                    # auditing a "this image was on the page but the
-                    # screenshot doesn't show it" complaint can tell
-                    # whether the asset is actually below the cap.
-                    "evidence_screenshot": screenshot_meta,
                 },
             })
             added += 1
@@ -1055,18 +810,6 @@ async def _attempt_extraction(
             await page.context.close()
         except Exception:
             pass
-        # Phase 6.5.8: explicit GC after every page-extraction attempt.
-        # Python's generational GC normally lags behind the actual
-        # peak-RSS moments by enough cycles that under back-to-back
-        # heavy pages the worker can stay above its memory ceiling
-        # even when no individual page warrants it. A targeted
-        # `gc.collect()` here reclaims the screenshot/Image/numpy
-        # transients before the next page allocates fresh ones.
-        try:
-            gc.collect()
-        except Exception:
-            pass
-        _log_rss(f"end-page:{viewport_label}")
 
     if nav_outcome == OUTCOME_BLOCKED:
         # Navigation returned 4xx/5xx. We may have a screenshot of the
@@ -1163,11 +906,11 @@ async def extract_dealer_website(
     """Load a dealer page, extract images, and return a structured outcome.
 
     Delegates to :mod:`render_strategies` and :mod:`host_policy_service`
-    so the choice of renderer (Playwright desktop, mobile-first, Bright
-    Data Web Unlocker) is per-host learned data, not a hand-curated env
-    var. First scan of a brand-new host pays for a 5s preflight probe +
-    the full ladder; every scan after that goes straight to whatever
-    already worked.
+    so the choice of renderer (Playwright desktop, mobile-first,
+    ScreenshotOne, ScreenshotOne+residential) is per-host learned data,
+    not a hand-curated env var. First scan of a brand-new host pays for
+    a 5s preflight probe + the full ladder; every scan after that goes
+    straight to whatever already worked.
 
     The returned :class:`ExtractionResult` carries an optional
     ``ladder_attempts`` list on its ``block_reason`` when more than one
@@ -1204,12 +947,6 @@ async def extract_dealer_website(
             f"{a.attempt}={a.outcome}" for a in ladder.attempts
         )
         final.block_reason = f"ladder({strategy}): {trail}"
-
-    # Phase 6.5.10 — propagate which rung succeeded so the caller can
-    # drive the host-policy auto-demote. The ladder result already
-    # tracks this (see render_strategies.LadderResult), it just wasn't
-    # being plumbed onto the ExtractionResult that callers see.
-    final.succeeded_attempt = ladder.succeeded_attempt
 
     log.info(
         "Dealer page %s — strategy=%s succeeded=%s outcome=%s count=%d",
@@ -1384,26 +1121,16 @@ async def _extract_ads_from_viewport(
 
         page_height = await page.evaluate("document.body.scrollHeight")
 
-        # Phase 6.5.8: same RSS guard rails as the website runner — JPEG,
-        # height clip, global semaphore, drop bytes after the localizer.
-        _log_rss(f"pre-screenshot:ads:{viewport_label}")
-        async with _get_screenshot_semaphore():
-            screenshot_bytes, _screenshot_meta = await _take_evidence_screenshot(page)
-            _log_rss(f"post-screenshot:ads:{viewport_label}")
-            evidence_url = await _upload_screenshot(
-                screenshot_bytes, scan_job_id, f"{target_url}#_{viewport_label}",
+        screenshot_bytes = await page.screenshot(full_page=True, type="png")
+        evidence_url = await _upload_screenshot(screenshot_bytes, scan_job_id, f"{target_url}#_{viewport_label}")
+
+        ad_images = await _extract_images_from_page(page)
+
+        if campaign_assets:
+            localized = await _localize_and_crop_assets(
+                screenshot_bytes, scan_job_id, campaign_assets,
             )
-            _log_rss(f"post-upload:ads:{viewport_label}")
-
-            ad_images = await _extract_images_from_page(page)
-
-            if campaign_assets:
-                localized = await _localize_and_crop_assets(
-                    screenshot_bytes, scan_job_id, campaign_assets,
-                )
-                ad_images.extend(localized)
-
-        del screenshot_bytes
+            ad_images.extend(localized)
 
         log.info("Found %d images (%s) for %s", len(ad_images), viewport_label, target_url[:60])
 
@@ -1446,11 +1173,6 @@ async def _extract_ads_from_viewport(
             await page.context.close()
         except Exception:
             pass
-        try:
-            gc.collect()
-        except Exception:
-            pass
-        _log_rss(f"end-page:ads:{viewport_label}")
 
     extracted_count = img_buffer.flush_all()
     return extracted_count, evidence_url, seen_srcs
