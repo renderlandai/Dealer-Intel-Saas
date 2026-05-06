@@ -1731,23 +1731,43 @@ async def process_discovered_image(
             return None, "filter_rejected"
     
     # Stage 4: Ensemble matching against each asset (Claude Opus)
-    log.debug("Stage 4: ensemble matching against %d assets", len(campaign_assets))
+    #
+    # Phase-7 change: the per-asset ensemble used to be a serial `for asset
+    # in campaign_assets:` loop. With N campaign assets every borderline
+    # image was paying N × Opus round-trips back-to-back — for a dealer
+    # with 10 pages, 10 images per page, 5 assets, that's 500 sequential
+    # Opus calls (~25 minutes per dealer just on this loop). asyncio.gather
+    # fires them in parallel; each `ensemble_match` already internally
+    # parallelises its sub-calls (visual + hash) so this is purely a
+    # latency win, no extra tokens or different inputs. Same prompts,
+    # same model, same scoring — only the await order changes.
+    log.debug("Stage 4: ensemble matching against %d assets (parallel)", len(campaign_assets))
+    comparisons = await asyncio.gather(
+        *[
+            ensemble_match(
+                asset["file_url"],
+                image_url,
+                is_screenshot=is_screenshot,
+            )
+            for asset in campaign_assets
+        ],
+        return_exceptions=True,
+    )
+
     best_match = None
     best_score = 0
-    
-    for asset in campaign_assets:
-        log.debug("Comparing with asset: %s", asset.get('name', asset['id']))
-        
-        comparison = await ensemble_match(
-            asset["file_url"],
-            image_url,
-            is_screenshot=is_screenshot
-        )
-        
+    for asset, comparison in zip(campaign_assets, comparisons):
+        if isinstance(comparison, BaseException):
+            log.warning(
+                "Ensemble match raised for asset %s: %s",
+                asset.get("name", asset.get("id")), comparison,
+            )
+            continue
         score = comparison.get("similarity_score", 0)
-        
-        log.debug("Ensemble score: %d", score)
-        
+        log.debug(
+            "Asset %s ensemble score: %d",
+            asset.get("name", asset.get("id")), score,
+        )
         if score > best_score:
             best_score = score
             best_match = {"asset": asset, "comparison": comparison}

@@ -159,6 +159,31 @@ class Settings(BaseSettings):
     # working set in flight. 4 fits comfortably on a 4 GB worker; bump to
     # 6–8 if you move the worker to professional-l (8 GB).
     max_concurrent_dealers: int = Field(default=4, description="Max dealers processed in parallel inside run_website_scan")
+    # Inner-loop concurrency added in the Phase-7 throughput pass:
+    # within each dealer task we now fan pages out instead of walking them
+    # serially, and within each page we fan the per-image AI pipeline out
+    # instead of awaiting one image at a time. The two semaphores are
+    # multiplicative — at default (4 dealers × 4 pages × 5 images) you'll
+    # see at most ~80 in-flight image-analysis coroutines per worker, which
+    # comfortably stays under Anthropic tier-2 limits (50 concurrent Opus
+    # calls + ample Haiku headroom). Drop these if you ever see 429 storms.
+    pages_per_dealer_concurrency: int = Field(default=4, description="Max pages scanned in parallel within a single dealer")
+    images_per_page_concurrency: int = Field(default=5, description="Max images analysed in parallel within a single extracted page")
+    # When True, run_website_scan writes incremental matches_count /
+    # processed_items / total_items to scan_jobs as each dealer finishes,
+    # instead of only at the end. Lets the operator UI show real progress
+    # and ensures partial results survive a watchdog kill.
+    enable_progress_streaming: bool = Field(default=True, description="Stream per-dealer counters to scan_jobs while scan is running")
+    # Hard wall-clock the dispatch wrapper enforces via asyncio.wait_for.
+    # 0 disables the wrapper entirely (idle-detection in the cleanup job
+    # becomes the only kill signal — see scheduler_service._cleanup_stale_scans).
+    # Default 0: trust the heartbeat-based cleanup, which won't kill an
+    # actively-writing scan no matter how long it runs.
+    scan_hard_timeout_seconds: int = Field(default=0, description="Hard asyncio wall-clock timeout for one scan (0 = use heartbeat-based cleanup only)")
+    # Heartbeat freshness threshold the cleanup job uses to decide a scan
+    # is truly stuck. Was hard-coded to 4h; making it configurable so a
+    # tenant scanning hundreds of dealers can give scans more leash.
+    scan_idle_timeout_minutes: int = Field(default=20, description="Mark a running scan failed if its heartbeat is older than this many minutes")
     
     # ===========================================
     # Reports

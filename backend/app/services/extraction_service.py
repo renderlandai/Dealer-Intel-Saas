@@ -151,8 +151,8 @@ if (originalQuery) {
 """
 
 
-async def _new_page(browser: Browser, mobile: bool = False) -> Page:
-    """Create a page with desktop or mobile viewport and matching user-agent."""
+async def _build_context(browser: Browser, mobile: bool):
+    """Create a fresh BrowserContext with desktop or mobile fingerprint."""
     if mobile:
         context = await browser.new_context(
             viewport={"width": 390, "height": 844},
@@ -184,8 +184,89 @@ async def _new_page(browser: Browser, mobile: bool = False) -> Page:
         # Stealth is best-effort — a Playwright/Chromium version mismatch
         # shouldn't block extraction.
         pass
+    return context
+
+
+async def _new_page(browser: Browser, mobile: bool = False) -> Page:
+    """Create a page in a brand-new context (no cookie/session reuse).
+
+    Used when the caller does NOT supply a per-dealer context key. The
+    page-owned context is closed by the caller in its ``finally`` block.
+    """
+    context = await _build_context(browser, mobile)
     page = await context.new_page()
     return page
+
+
+# ---------------------------------------------------------------------------
+# Per-dealer BrowserContext cache (Phase-7 fix #6)
+# ---------------------------------------------------------------------------
+#
+# Without this cache every page extraction created a fresh BrowserContext,
+# which discards cookies, TLS sessions, and any anti-bot challenge tokens
+# from the previous page on the same hostname. For a 15-page dealer that
+# meant repeating the cookie banner / Cloudflare interstitial / consent JS
+# on every single page load. Caching one context per (dealer_key, mobile)
+# pair lets all pages of a single dealer share session state, which
+# typically saves 2–10s/page on session-bearing sites.
+#
+# Lifetime is bounded by the calling runner: when the dealer's page-fanout
+# completes, the runner MUST call ``release_dealer_contexts(dealer_key)``
+# in a finally so the contexts are torn down even on partial failures.
+# Contexts also become orphaned if ``_get_browser`` recycles its underlying
+# browser; ``acquire_dealer_context`` checks the binding and re-creates as
+# needed.
+_dealer_context_cache: Dict[Tuple[str, bool], Any] = {}
+_dealer_context_lock = asyncio.Lock()
+
+
+async def acquire_dealer_context(dealer_key: str, mobile: bool):
+    """Get (or lazily create) a BrowserContext shared across one dealer.
+
+    The same context is returned for every (dealer_key, mobile) call until
+    ``release_dealer_contexts(dealer_key)`` is called. Multiple coroutines
+    asking for the same key get the same context — Playwright contexts
+    support multiple concurrent pages, so per-page concurrency within a
+    dealer remains safe.
+    """
+    cache_key = (dealer_key, mobile)
+    async with _dealer_context_lock:
+        cached = _dealer_context_cache.get(cache_key)
+        browser = await _get_browser()
+        if cached is not None:
+            try:
+                if cached.browser is browser:
+                    return cached
+            except Exception:
+                pass
+            try:
+                await cached.close()
+            except Exception:
+                pass
+        ctx = await _build_context(browser, mobile)
+        _dealer_context_cache[cache_key] = ctx
+        return ctx
+
+
+async def release_dealer_contexts(dealer_key: str) -> None:
+    """Tear down every cached context for ``dealer_key``.
+
+    Idempotent; safe to call from a finally even if the dealer never
+    actually reached the extract step.
+    """
+    async with _dealer_context_lock:
+        keys = [k for k in _dealer_context_cache if k[0] == dealer_key]
+    # Close outside the lock so a slow context.close() doesn't gate
+    # other dealers' acquire calls.
+    for k in keys:
+        async with _dealer_context_lock:
+            ctx = _dealer_context_cache.pop(k, None)
+        if ctx is None:
+            continue
+        try:
+            await ctx.close()
+        except Exception:
+            pass
 
 
 async def _scroll_to_bottom(page: Page, max_scrolls: int = 20) -> None:
@@ -674,6 +755,23 @@ def _classify_playwright_error(exc: BaseException) -> Tuple[str, Optional[str]]:
     return OUTCOME_CRASHED, msg.splitlines()[0][:200] if msg else "unknown"
 
 
+async def _open_page_for_extraction(
+    mobile: bool,
+    dealer_key: Optional[str],
+) -> Tuple[Page, bool]:
+    """Get a Playwright page for one extraction attempt.
+
+    Returns ``(page, owns_context)``. When ``owns_context`` is True the
+    caller MUST close ``page.context`` in its finally; when False the
+    context belongs to the per-dealer cache and only the page is closed.
+    """
+    if dealer_key:
+        ctx = await acquire_dealer_context(dealer_key, mobile)
+        return await ctx.new_page(), False
+    browser = await _get_browser()
+    return await _new_page(browser, mobile=mobile), True
+
+
 async def _attempt_extraction(
     url: str,
     scan_job_id: UUID,
@@ -682,25 +780,30 @@ async def _attempt_extraction(
     seen_srcs: set,
     campaign_assets: Optional[List[Dict[str, Any]]],
     img_buffer: DiscoveredImageBuffer,
+    dealer_key: Optional[str] = None,
 ) -> ExtractionResult:
     """Single end-to-end attempt: open page, navigate, extract, screenshot.
 
-    Always closes its own context. Never recycles the shared browser.
+    When ``dealer_key`` is None this opens (and later closes) its own
+    BrowserContext — the historical behaviour. When ``dealer_key`` is set
+    the page is created inside the cached per-dealer context (see
+    :func:`acquire_dealer_context`); only the page is torn down in the
+    finally so the next page of the same dealer can reuse the warm
+    context. Never recycles the shared browser.
+
     The caller decides whether to retry, switch viewport, or fall back to
     a hosted screenshot service.
     """
     viewport_label = "mobile" if mobile else "desktop"
-    browser = await _get_browser()
     try:
-        page = await _new_page(browser, mobile=mobile)
+        page, owns_context = await _open_page_for_extraction(mobile, dealer_key)
     except Exception as e:
         # Most commonly: TargetClosedError because another task triggered
         # a recycle. Re-acquire and try one more time before giving up.
         outcome, reason = _classify_playwright_error(e)
         if outcome == OUTCOME_CRASHED and reason == "browser_closed":
-            browser = await _get_browser()
             try:
-                page = await _new_page(browser, mobile=mobile)
+                page, owns_context = await _open_page_for_extraction(mobile, dealer_key)
             except Exception as e2:
                 outcome2, reason2 = _classify_playwright_error(e2)
                 return ExtractionResult(
@@ -807,7 +910,10 @@ async def _attempt_extraction(
         )
     finally:
         try:
-            await page.context.close()
+            if owns_context:
+                await page.context.close()
+            else:
+                await page.close()
         except Exception:
             pass
 
@@ -839,10 +945,12 @@ async def _extract_from_viewport(
     mobile: bool,
     seen_srcs: set,
     campaign_assets: Optional[List[Dict[str, Any]]] = None,
+    dealer_key: Optional[str] = None,
 ) -> ExtractionResult:
     """Try once, retry once on transient failure, return a structured result.
 
-    The retry uses a fresh BrowserContext — and re-acquires the shared
+    The retry uses a fresh BrowserContext (or the same per-dealer cached
+    context when ``dealer_key`` is set) — and re-acquires the shared
     browser if a TargetClosedError was raised — but never tears down the
     process-wide browser singleton. That avoids the friendly-fire cascade
     where one slow site's recycle would close every other in-flight page.
@@ -852,7 +960,7 @@ async def _extract_from_viewport(
     result = await _attempt_extraction(
         url=url, scan_job_id=scan_job_id, distributor_id=distributor_id,
         mobile=mobile, seen_srcs=seen_srcs, campaign_assets=campaign_assets,
-        img_buffer=img_buffer,
+        img_buffer=img_buffer, dealer_key=dealer_key,
     )
 
     # Retry once if the first attempt was transient (timeout / crashed /
@@ -871,7 +979,7 @@ async def _extract_from_viewport(
         retry = await _attempt_extraction(
             url=url, scan_job_id=scan_job_id, distributor_id=distributor_id,
             mobile=mobile, seen_srcs=seen_srcs, campaign_assets=campaign_assets,
-            img_buffer=img_buffer,
+            img_buffer=img_buffer, dealer_key=dealer_key,
         )
         # Prefer the retry result, but keep the more informative
         # block_reason if the retry didn't find one.
@@ -902,6 +1010,7 @@ async def extract_dealer_website(
     scan_job_id: UUID,
     distributor_id: Optional[UUID] = None,
     campaign_assets: Optional[List[Dict[str, Any]]] = None,
+    dealer_key: Optional[str] = None,
 ) -> ExtractionResult:
     """Load a dealer page, extract images, and return a structured outcome.
 
@@ -911,6 +1020,12 @@ async def extract_dealer_website(
     not a hand-curated env var. First scan of a brand-new host pays for
     a 5s preflight probe + the full ladder; every scan after that goes
     straight to whatever already worked.
+
+    When ``dealer_key`` is supplied, every Playwright attempt for this
+    page reuses the shared per-dealer BrowserContext (one per
+    mobile/desktop) created on first use. The caller is responsible for
+    invoking :func:`release_dealer_contexts` once the dealer's full page
+    list has been processed.
 
     The returned :class:`ExtractionResult` carries an optional
     ``ladder_attempts`` list on its ``block_reason`` when more than one
@@ -935,6 +1050,7 @@ async def extract_dealer_website(
         scan_job_id=scan_job_id,
         distributor_id=distributor_id,
         campaign_assets=campaign_assets,
+        dealer_key=dealer_key,
     )
     ladder = await render_strategies.run_ladder(ctx, strategy=strategy)
     final = ladder.final

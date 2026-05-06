@@ -116,12 +116,20 @@ class RenderContext:
     across viewport switches within a single page so we never insert the
     same image twice. The ladder threads the same set through every
     attempt.
+
+    ``dealer_key`` (Phase-7) opts the page into the per-dealer
+    BrowserContext cache in :mod:`extraction_service`. When set, every
+    Playwright attempt for this page reuses the same context (one per
+    mobile/desktop) as other pages of the same dealer, preserving
+    cookies + TLS sessions across the dealer's full page list. When None,
+    the legacy fresh-context-per-page path is used.
     """
     url: str
     scan_job_id: UUID
     distributor_id: Optional[UUID] = None
     campaign_assets: Optional[List[Dict[str, Any]]] = None
     seen_srcs: Set[str] = field(default_factory=set)
+    dealer_key: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +176,7 @@ class _PlaywrightAttempt:
             mobile=self.mobile,
             seen_srcs=ctx.seen_srcs,
             campaign_assets=ctx.campaign_assets,
+            dealer_key=ctx.dealer_key,
         )
 
 

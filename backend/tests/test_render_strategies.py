@@ -80,7 +80,7 @@ class TestRunLadder:
         calls = []
 
         async def fake_viewport(*, url, scan_job_id, distributor_id, mobile,
-                                seen_srcs, campaign_assets):
+                                seen_srcs, campaign_assets, dealer_key=None):
             calls.append(("playwright_mobile" if mobile else "playwright_desktop"))
             # First call (desktop) wins.
             return _result("images", count=5)
@@ -113,7 +113,7 @@ class TestRunLadder:
         calls = []
 
         async def fake_viewport(*, url, scan_job_id, distributor_id, mobile,
-                                seen_srcs, campaign_assets):
+                                seen_srcs, campaign_assets, dealer_key=None):
             label = "playwright_mobile" if mobile else "playwright_desktop"
             calls.append(label)
             return _result("blocked", reason="HTTP 403", http_status=403)

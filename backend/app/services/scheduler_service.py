@@ -363,20 +363,27 @@ async def _cleanup_stale_scans() -> None:
     same window still applies because the worker poll interval is seconds,
     not minutes.
 
-    Running cutoff (4 hours) — large 50+ dealer scans on the new worker
-    routinely run for ~30–90 min. The runner now writes
-    `scan_jobs.last_heartbeat_at` once per page (see Phase 5-minimal in
-    log.md / migration 029), so we can use a per-row liveness signal:
-        * If `last_heartbeat_at` is set → consider the scan stuck only when
-          the heartbeat itself is >4h old (the runner has actually stopped
-          touching the row).
-        * If `last_heartbeat_at` is NULL → the runner predates the
-          heartbeat or never made it past prep work; fall back to the
-          original `created_at`-based check at the same 4h horizon.
+    Running cutoff (Phase-7: configurable, default 20 minutes of idle
+    heartbeat) — the runner stamps ``last_heartbeat_at`` after every page
+    extraction AND every per-page progress write (see fix #9). A healthy
+    scan therefore refreshes its heartbeat under a minute; anything older
+    than ``settings.scan_idle_timeout_minutes`` is genuinely stuck (worker
+    OOM'd, network partition, deadlock). The previous 4h cutoff was so
+    forgiving that a hung worker could leave a scan in ``running`` for
+    half a day before any cleanup fired; idle-detection catches the same
+    failures within minutes without ever killing actively-progressing
+    scans.
 
-    The hard backstop is the asyncio.wait_for in tasks.py
-    (SCAN_TIMEOUT_SECONDS) — the cleanup job is a safety net, not the
-    primary timeout.
+    * If ``last_heartbeat_at`` is set → consider the scan stuck when the
+      heartbeat itself is older than the configured idle window.
+    * If ``last_heartbeat_at`` is NULL → the runner predates the
+      heartbeat or never made it past prep work; fall back to the
+      original ``created_at``-based check at the same idle window.
+
+    The hard backstop is the optional ``asyncio.wait_for`` in tasks.py
+    (now disabled by default, controlled by
+    ``settings.scan_hard_timeout_seconds``). With it disabled, this
+    cleanup job is the sole kill signal.
     """
     try:
         now = datetime.now(timezone.utc)
@@ -387,7 +394,15 @@ async def _cleanup_stale_scans() -> None:
             .lt("created_at", pending_cutoff) \
             .execute()
 
-        running_cutoff = (now - timedelta(hours=4)).isoformat()
+        try:
+            from ..config import get_settings
+            idle_minutes = int(getattr(
+                get_settings(), "scan_idle_timeout_minutes", 20,
+            ))
+        except Exception:
+            idle_minutes = 20
+        idle_minutes = max(1, idle_minutes)
+        running_cutoff = (now - timedelta(minutes=idle_minutes)).isoformat()
 
         # Heartbeat-based: row has a heartbeat that has not advanced in 4h.
         stale_by_heartbeat = supabase.table("scan_jobs") \
@@ -418,9 +433,15 @@ async def _cleanup_stale_scans() -> None:
         for job in all_stale:
             supabase.table("scan_jobs").update({
                 "status": "failed",
-                "error_message": "Scan timed out — auto-failed by cleanup job",
+                "error_message": (
+                    f"Scan idle — heartbeat older than {idle_minutes}m, "
+                    "auto-failed by cleanup job"
+                ),
             }).eq("id", job["id"]).execute()
-            log.warning("Auto-failed stale scan: %s", job["id"])
+            log.warning(
+                "Auto-failed stale scan (idle > %dm): %s",
+                idle_minutes, job["id"],
+            )
 
         if all_stale:
             log.info("Cleaned up %d stale scan(s)", len(all_stale))

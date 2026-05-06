@@ -30,14 +30,38 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence
 from uuid import UUID
 
-# 4-hour hard backstop on a single scan-runner coroutine. Cold 50-dealer
-# website scans on a fresh tenant (no warm page-cache, ~15 pages each,
-# pre-concurrency wall clock) measure 1–2h end-to-end; doubling that gives
-# headroom for an outlier dealer with very slow pages without falling back
-# on the scheduler cleanup. The cleanup job in `scheduler_service`
-# (heartbeat-aware, 4h cutoff) is the secondary safety net for runners
-# that crash without raising.
-SCAN_TIMEOUT_SECONDS = 14400
+# Hard wall-clock backstop on a single scan-runner coroutine.
+#
+# Phase-7 fix #10: this is now driven by ``settings.scan_hard_timeout_seconds``
+# and defaults to 0 (disabled). With per-dealer page concurrency + per-page
+# image concurrency a 50-dealer scan finishes in ~90 minutes, but with
+# pathological dealers / Anthropic 429 storms it can legitimately take
+# hours. The previous 4h hard kill murdered actively-progressing scans
+# and threw away every match found mid-scan.
+#
+# The new safety net is heartbeat-based: ``scheduler_service._cleanup_stale_scans``
+# fires every 5 min and flips a ``running``/``analyzing`` row to ``failed``
+# only if its ``last_heartbeat_at`` is older than
+# ``settings.scan_idle_timeout_minutes`` (default 20 min). Since the runner
+# stamps the heartbeat after every page extraction AND every progress
+# stream write, a healthy scan keeps its heartbeat fresh under a minute.
+def _scan_hard_timeout() -> int:
+    """Return the configured asyncio.wait_for timeout, or 0 to disable.
+
+    Read on every dispatch so an operator can flip it via env without a
+    redeploy. 0 disables the wrapper entirely.
+    """
+    try:
+        from .config import get_settings
+        return int(getattr(get_settings(), "scan_hard_timeout_seconds", 0) or 0)
+    except Exception:
+        return 0
+
+
+# Kept as a module-level constant for backwards compat with callers that
+# import it directly. The dispatch wrappers below call _scan_hard_timeout()
+# at run time so a config change is picked up without restart.
+SCAN_TIMEOUT_SECONDS = 0
 
 log = logging.getLogger("dealer_intel.tasks")
 
@@ -248,80 +272,78 @@ def _mark_job_failed(scan_job_id: str, error: str) -> None:
 # Thin wrappers — translate (string args) → actual scan functions
 # ---------------------------------------------------------------------------
 
+async def _run_with_optional_timeout(coro, scan_job_id: str, label: str):
+    """Run a scan coroutine with the (optional) configured hard timeout.
+
+    Phase-7 fix #10: when ``settings.scan_hard_timeout_seconds`` is 0
+    (default) we skip ``asyncio.wait_for`` entirely and let the heartbeat
+    cleanup job in ``scheduler_service`` handle stuck scans. When it's
+    non-zero we honour it as the legacy hard backstop. Either way, all
+    other exceptions are funnelled through ``_mark_job_failed`` with a
+    normalised message.
+    """
+    timeout = _scan_hard_timeout()
+    try:
+        if timeout > 0:
+            await asyncio.wait_for(coro, timeout=timeout)
+        else:
+            await coro
+    except asyncio.TimeoutError:
+        log.error("%s scan timed out after %ds: %s", label, timeout, scan_job_id)
+        _mark_job_failed(
+            scan_job_id, f"Scan exceeded hard timeout ({timeout}s)",
+        )
+    except Exception as e:
+        log.error("%s scan failed for %s: %s", label, scan_job_id, e, exc_info=True)
+        _mark_job_failed(scan_job_id, str(e))
+
+
 async def _run_website_scan(urls, scan_job_id, distributor_mapping, campaign_id=None):
     from .services.scan_runners import run_website_scan
     log.info("RUNNING website scan job=%s urls=%d", scan_job_id, len(urls))
-    try:
-        await asyncio.wait_for(
-            run_website_scan(
-                urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-                UUID(campaign_id) if campaign_id else None,
-            ),
-            timeout=SCAN_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        log.error("Website scan timed out after %ds: %s", SCAN_TIMEOUT_SECONDS, scan_job_id)
-        _mark_job_failed(scan_job_id, f"Scan timed out after {SCAN_TIMEOUT_SECONDS}s")
-    except Exception as e:
-        log.error("Website scan failed for %s: %s", scan_job_id, e, exc_info=True)
-        _mark_job_failed(scan_job_id, str(e))
+    await _run_with_optional_timeout(
+        run_website_scan(
+            urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+            UUID(campaign_id) if campaign_id else None,
+        ),
+        scan_job_id, "Website",
+    )
 
 
 async def _run_google_ads_scan(advertiser_ids, scan_job_id, distributor_mapping, campaign_id=None):
     from .services.scan_runners import run_google_ads_scan
     log.info("RUNNING Google Ads scan job=%s advertisers=%d", scan_job_id, len(advertiser_ids))
-    try:
-        await asyncio.wait_for(
-            run_google_ads_scan(
-                advertiser_ids, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-                UUID(campaign_id) if campaign_id else None,
-            ),
-            timeout=SCAN_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        log.error("Google Ads scan timed out after %ds: %s", SCAN_TIMEOUT_SECONDS, scan_job_id)
-        _mark_job_failed(scan_job_id, f"Scan timed out after {SCAN_TIMEOUT_SECONDS}s")
-    except Exception as e:
-        log.error("Google Ads scan failed for %s: %s", scan_job_id, e, exc_info=True)
-        _mark_job_failed(scan_job_id, str(e))
+    await _run_with_optional_timeout(
+        run_google_ads_scan(
+            advertiser_ids, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+            UUID(campaign_id) if campaign_id else None,
+        ),
+        scan_job_id, "Google Ads",
+    )
 
 
 async def _run_facebook_scan(page_urls, scan_job_id, distributor_mapping, campaign_id=None, channel="facebook"):
     from .services.scan_runners import run_facebook_scan
     log.info("RUNNING Facebook scan job=%s pages=%d", scan_job_id, len(page_urls))
-    try:
-        await asyncio.wait_for(
-            run_facebook_scan(
-                page_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-                UUID(campaign_id) if campaign_id else None, channel,
-            ),
-            timeout=SCAN_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        log.error("Facebook scan timed out after %ds: %s", SCAN_TIMEOUT_SECONDS, scan_job_id)
-        _mark_job_failed(scan_job_id, f"Scan timed out after {SCAN_TIMEOUT_SECONDS}s")
-    except Exception as e:
-        log.error("Facebook scan failed for %s: %s", scan_job_id, e, exc_info=True)
-        _mark_job_failed(scan_job_id, str(e))
+    await _run_with_optional_timeout(
+        run_facebook_scan(
+            page_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+            UUID(campaign_id) if campaign_id else None, channel,
+        ),
+        scan_job_id, "Facebook",
+    )
 
 
 async def _run_instagram_scan(profile_urls, scan_job_id, distributor_mapping, campaign_id=None):
     from .services.scan_runners import run_instagram_scan
     log.info("RUNNING Instagram scan job=%s profiles=%d", scan_job_id, len(profile_urls))
-    try:
-        await asyncio.wait_for(
-            run_instagram_scan(
-                profile_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
-                UUID(campaign_id) if campaign_id else None,
-            ),
-            timeout=SCAN_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        log.error("Instagram scan timed out after %ds: %s", SCAN_TIMEOUT_SECONDS, scan_job_id)
-        _mark_job_failed(scan_job_id, f"Scan timed out after {SCAN_TIMEOUT_SECONDS}s")
-    except Exception as e:
-        log.error("Instagram scan failed for %s: %s", scan_job_id, e, exc_info=True)
-        _mark_job_failed(scan_job_id, str(e))
+    await _run_with_optional_timeout(
+        run_instagram_scan(
+            profile_urls, UUID(scan_job_id), _deserialize_mapping(distributor_mapping),
+            UUID(campaign_id) if campaign_id else None,
+        ),
+        scan_job_id, "Instagram",
+    )
 
 
 async def _run_analyze_scan(scan_job_id, campaign_id=None):

@@ -740,6 +740,277 @@ async def page_discovery_discover(base_url: str) -> List[str]:
     return await page_discovery.discover_pages(base_url, max_pages=s.max_pages_per_site)
 
 
+async def _process_one_page(
+    *,
+    base_url: str,
+    page_url: str,
+    distributor_id: Optional[Any],
+    scan_job_id: UUID,
+    campaign_assets: List[Dict[str, Any]],
+    brand_rules: Dict[str, Any],
+    org_id: Optional[str],
+    asset_hashes: Dict,
+    asset_embeddings: Dict,
+    can_early_stop: bool,
+    all_asset_ids: set,
+    matched_asset_ids: set,
+    matched_lock: asyncio.Lock,
+    early_stop_event: asyncio.Event,
+    extract_sem: asyncio.Semaphore,
+    image_sem: asyncio.Semaphore,
+    match_buffer: MatchBuffer,
+    processed_buffer: ProcessedImageBuffer,
+    settings,
+) -> Dict[str, Any]:
+    """Extract one page, then analyse its images in parallel.
+
+    The two-tier semaphore strategy in this function is the heart of the
+    Phase-7 throughput rework:
+
+    * ``extract_sem`` gates the Playwright extraction step ONLY. This is
+      the resource-heavy phase (Chromium context, screenshot, scroll) and
+      the natural place to bound concurrent browser load.
+    * ``image_sem`` gates per-image AI analysis within this page so a
+      page with 30 images doesn't fire 30 simultaneous Anthropic requests
+      and ruin shared rate-limits. It bounds *per-page* fan-out, not
+      cross-page; cross-page fan-out is bounded by the dealer-side
+      semaphore in :func:`_process_one_dealer`.
+
+    Returns a per-page stats payload the dealer-level aggregator folds
+    back into its dealer-wide totals. The match / processed buffers are
+    shared with the rest of the dealer's pages — that's safe because
+    :mod:`bulk_writers` runs sync Supabase calls (atomic from the
+    asyncio-loop perspective) and ``MatchBuffer.add`` / ``flush`` contain
+    no ``await`` boundaries.
+    """
+    if early_stop_event.is_set():
+        return {
+            "page_url": page_url,
+            "skipped": True,
+            "total_discovered": 0,
+            "pages_scanned": 0,
+            "pages_empty": 0,
+            "pages_blocked": 0,
+            "pages_failed": 0,
+            "total_images": 0,
+            "page_match_tracker": {},
+            "block_details": [],
+            "pipeline_increments": {},
+            "matches_new": 0,
+            "matches_confirmed": 0,
+        }
+
+    page_pipeline: Dict[str, Any] = {
+        "download_failed": 0,
+        "hash_rejected": 0,
+        "clip_rejected": 0,
+        "filter_rejected": 0,
+        "below_threshold": 0,
+        "verification_rejected": 0,
+        "matched_new": 0,
+        "matched_confirmed": 0,
+        "drift_detected": 0,
+        "errors": 0,
+    }
+    block_details: List[Dict[str, Any]] = []
+    page_matched_assets: set = set()
+    total_discovered = 0
+    pages_scanned = 0
+    pages_empty = 0
+    pages_blocked = 0
+    pages_failed = 0
+    total_images_in_page = 0
+    matches_new_before = page_pipeline["matched_new"]
+    matches_confirmed_before = page_pipeline["matched_confirmed"]
+
+    # ── Phase A: Playwright extract (gated by extract_sem) ────────────
+    try:
+        async with extract_sem:
+            log.info("[%s] extracting page: %s", base_url, page_url)
+            _heartbeat(scan_job_id)
+            res = await extraction_service.extract_dealer_website(
+                page_url, scan_job_id, distributor_id,
+                campaign_assets=campaign_assets,
+                dealer_key=base_url,
+            )
+    except Exception as page_err:
+        log.error(
+            "[%s] page extraction crashed for %s: %s",
+            base_url, page_url, page_err, exc_info=True,
+        )
+        page_pipeline["errors"] += 1
+        return {
+            "page_url": page_url,
+            "skipped": False,
+            "total_discovered": 0,
+            "pages_scanned": 0,
+            "pages_empty": 0,
+            "pages_blocked": 0,
+            "pages_failed": 1,
+            "total_images": 0,
+            "page_match_tracker": {},
+            "block_details": [{
+                "page_url": page_url,
+                "outcome": extraction_service.OUTCOME_CRASHED,
+                "reason": str(page_err)[:200],
+            }],
+            "pipeline_increments": page_pipeline,
+            "matches_new": 0,
+            "matches_confirmed": 0,
+        }
+
+    count = res.count
+    evidence_url = res.evidence_url
+    outcome = res.outcome
+
+    # ── Bin the page outcome (same accounting as the legacy serial path) ──
+    if outcome == extraction_service.OUTCOME_IMAGES:
+        total_discovered += count
+        pages_scanned += 1
+    elif outcome == extraction_service.OUTCOME_EMPTY:
+        pages_empty += 1
+        if settings.enable_tiling_fallback and evidence_url:
+            log.info(
+                "[%s] zero images from %s — inserting screenshot for tiling fallback",
+                base_url, page_url,
+            )
+            _safe_insert_discovered_image({
+                "scan_job_id": str(scan_job_id),
+                "distributor_id": str(distributor_id) if distributor_id else None,
+                "source_url": page_url,
+                "image_url": evidence_url,
+                "source_type": "page_screenshot",
+                "channel": "website",
+                "metadata": {
+                    "capture_method": "playwright_fallback",
+                    "full_page": True,
+                    "reason": "no_images_extracted",
+                },
+            })
+            count = 1
+            total_discovered += 1
+            pages_scanned += 1
+    elif outcome == extraction_service.OUTCOME_BLOCKED:
+        pages_blocked += 1
+        block_details.append({
+            "page_url": page_url,
+            "outcome": outcome,
+            "reason": res.block_reason,
+            "http_status": res.http_status,
+        })
+        if evidence_url:
+            _safe_insert_discovered_image({
+                "scan_job_id": str(scan_job_id),
+                "distributor_id": str(distributor_id) if distributor_id else None,
+                "source_url": page_url,
+                "image_url": evidence_url,
+                "source_type": "page_screenshot",
+                "channel": "website",
+                "metadata": {
+                    "capture_method": "blocked_evidence",
+                    "full_page": True,
+                    "reason": res.block_reason or "blocked",
+                    "http_status": res.http_status,
+                },
+            })
+            crops_added = await extraction_service.localize_screenshot_capture(
+                evidence_url=evidence_url,
+                scan_job_id=scan_job_id,
+                page_url=page_url,
+                distributor_id=distributor_id,
+                campaign_assets=campaign_assets,
+            )
+            if crops_added > 0:
+                count = crops_added
+                total_discovered += crops_added
+        log.warning(
+            "[%s] page %s blocked (%s, http=%s) — %d cv-crop(s) inserted",
+            base_url, page_url, res.block_reason,
+            res.http_status,
+            count if evidence_url else 0,
+        )
+    else:
+        pages_failed += 1
+        block_details.append({
+            "page_url": page_url,
+            "outcome": outcome,
+            "reason": res.block_reason,
+        })
+        log.warning(
+            "[%s] page %s failed (%s, %s)",
+            base_url, page_url, outcome, res.block_reason,
+        )
+
+    # ── Phase B: per-image AI analysis (gated by image_sem) ───────────
+    if can_early_stop and count > 0:
+        page_images = (
+            supabase.table("discovered_images")
+            .select("*")
+            .eq("scan_job_id", str(scan_job_id))
+            .eq("source_url", page_url)
+            .eq("is_processed", False)
+            .execute()
+        )
+
+        # Filter out the blocked-evidence row up front — never feed a
+        # full-page screenshot into the matcher (false-positive engine).
+        candidates = [
+            img for img in (page_images.data or [])
+            if (img.get("metadata") or {}).get("capture_method") != "blocked_evidence"
+        ]
+
+        async def _analyze_one(image_row: Dict[str, Any]) -> Optional[str]:
+            async with image_sem:
+                if early_stop_event.is_set():
+                    return None
+                return await _analyze_single_image(
+                    image_row, campaign_assets, brand_rules,
+                    org_id, str(scan_job_id),
+                    asset_hashes, asset_embeddings, page_pipeline,
+                    match_buffer=match_buffer,
+                    processed_buffer=processed_buffer,
+                )
+
+        total_images_in_page = len(candidates)
+        results = await asyncio.gather(
+            *[_analyze_one(img) for img in candidates],
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, BaseException):
+                page_pipeline["errors"] += 1
+                continue
+            if r:
+                page_matched_assets.add(r)
+
+        # Fold this page's matches into the global early-stop set.
+        if page_matched_assets:
+            async with matched_lock:
+                matched_asset_ids.update(page_matched_assets)
+                if all_asset_ids and matched_asset_ids >= all_asset_ids:
+                    early_stop_event.set()
+
+    page_match_tracker: Dict[str, set] = (
+        {page_url: page_matched_assets} if page_matched_assets else {}
+    )
+
+    return {
+        "page_url": page_url,
+        "skipped": False,
+        "total_discovered": total_discovered,
+        "pages_scanned": pages_scanned,
+        "pages_empty": pages_empty,
+        "pages_blocked": pages_blocked,
+        "pages_failed": pages_failed,
+        "total_images": total_images_in_page,
+        "page_match_tracker": page_match_tracker,
+        "block_details": block_details,
+        "pipeline_increments": page_pipeline,
+        "matches_new": page_pipeline["matched_new"] - matches_new_before,
+        "matches_confirmed": page_pipeline["matched_confirmed"] - matches_confirmed_before,
+    }
+
+
 async def _process_one_dealer(
     *,
     base_url: str,
@@ -756,276 +1027,178 @@ async def _process_one_dealer(
     matched_asset_ids: set,
     matched_lock: asyncio.Lock,
     early_stop_event: asyncio.Event,
-    sem: asyncio.Semaphore,
+    extract_sem: asyncio.Semaphore,
     settings,
+    progress_callback: Optional[Any] = None,
 ) -> Dict[str, Any]:
-    """Process one dealer's pages sequentially, with its own buffers.
+    """Process one dealer's pages with bounded page-level + image-level fan-out.
 
-    Designed to be invoked from `run_website_scan`'s `asyncio.gather` over
-    every dealer in the scan. Each dealer instance:
+    Phase-7 changes vs. the previous serial version:
 
-    * Holds the shared semaphore for the duration of its work — so the
-      number of concurrent Playwright contexts AND concurrent in-flight
-      AI batches is bounded by `settings.max_concurrent_dealers`.
-    * Owns its own `MatchBuffer` and `ProcessedImageBuffer` (the bulk
-      writers are explicitly NOT coroutine-safe; sharing across dealers
-      would race on `_pending`).
-    * Owns its own `pipeline_increments` dict and returns it for the
-      caller to fold into the run-wide stats — avoids a contended Lock
-      around ints that fire dozens of times per page.
-    * Honours the global early-stop set via `matched_lock` + the shared
-      `early_stop_event`. The Event is the cheap notify channel; the
-      Lock+set is the source of truth for "do we have everything yet."
+    * Pages within a dealer now run concurrently via ``asyncio.gather``
+      bounded by ``settings.pages_per_dealer_concurrency``. The previous
+      implementation walked pages serially, so a 15-page dealer paid
+      15× the per-page latency end-to-end.
+    * Images within a page are also fanned out — see
+      :func:`_process_one_page` for the per-page image semaphore.
+    * The cross-dealer ``extract_sem`` (passed in by the caller) gates
+      ONLY the Playwright extract step, not the AI step. Previously the
+      semaphore was held for the dealer's entire wall-clock, which
+      starved cross-dealer throughput while one dealer was waiting on
+      Anthropic.
+    * A per-dealer BrowserContext (one per mobile/desktop) is reused
+      across every page of the dealer via ``dealer_key=base_url`` and
+      torn down in this function's finally.
 
-    Returns an aggregation payload the caller folds back in. Any raised
-    exception bubbles out; the gather caller logs it and marks the
-    pipeline_stats `errors` counter.
+    Each dealer still owns its own :class:`MatchBuffer` and
+    :class:`ProcessedImageBuffer`. Sharing them across the dealer's own
+    pages is safe in single-threaded asyncio: ``add`` / ``flush`` are
+    sync (no ``await``) so two coroutines on the same event loop cannot
+    interleave inside the buffer's critical section.
+
+    The optional ``progress_callback`` is invoked with the per-page
+    delta payload as soon as each page finishes, so the runner can
+    stream incremental ``matches_count`` / ``processed_items`` writes
+    to ``scan_jobs`` (Phase-7 fix #9).
     """
-    async with sem:
-        local_buffer = MatchBuffer()
-        local_processed = ProcessedImageBuffer()
-        local_total_discovered = 0
-        local_pages_scanned = 0       # pages that returned >=1 real image
-        local_pages_empty = 0         # pages that loaded but had no images
-        local_pages_blocked = 0       # WAF / 4xx / ERR_ABORTED
-        local_pages_failed = 0        # timeouts / playwright crashes
-        local_total_images = 0
-        local_pages_skipped = 0
-        local_page_match_tracker: Dict[str, set] = {}
-        local_block_details: List[Dict[str, Any]] = []
-        local_pipeline: Dict[str, Any] = {
-            "download_failed": 0,
-            "hash_rejected": 0,
-            "clip_rejected": 0,
-            "filter_rejected": 0,
-            "below_threshold": 0,
-            "verification_rejected": 0,
-            "matched_new": 0,
-            "matched_confirmed": 0,
-            "drift_detected": 0,
-            "errors": 0,
-        }
+    local_buffer = MatchBuffer()
+    local_processed = ProcessedImageBuffer()
 
-        try:
-            for page_idx, page_url in enumerate(page_urls):
-                if early_stop_event.is_set():
-                    local_pages_skipped = len(page_urls) - page_idx
-                    log.info(
-                        "[%s] early-stop signalled — skipping %d remaining page(s)",
-                        base_url, local_pages_skipped,
-                    )
-                    break
+    page_concurrency = max(1, int(getattr(settings, "pages_per_dealer_concurrency", 4)))
+    image_concurrency = max(1, int(getattr(settings, "images_per_page_concurrency", 5)))
+    page_sem = asyncio.Semaphore(page_concurrency)
+    image_sem = asyncio.Semaphore(image_concurrency)
 
-                log.info("[%s] [page %d/%d] Extracting: %s",
-                         base_url, page_idx + 1, len(page_urls), page_url)
-                _heartbeat(scan_job_id)
+    aggregate = {
+        "total_discovered": 0,
+        "pages_scanned": 0,
+        "pages_empty": 0,
+        "pages_blocked": 0,
+        "pages_failed": 0,
+        "total_images": 0,
+        "pages_skipped": 0,
+        "pipeline_increments": {
+            "download_failed": 0, "hash_rejected": 0, "clip_rejected": 0,
+            "filter_rejected": 0, "below_threshold": 0,
+            "verification_rejected": 0, "matched_new": 0,
+            "matched_confirmed": 0, "drift_detected": 0, "errors": 0,
+        },
+        "page_match_tracker": {},
+        "block_details": [],
+    }
 
-                try:
-                    res = await extraction_service.extract_dealer_website(
-                        page_url, scan_job_id, distributor_id,
-                        campaign_assets=campaign_assets,
-                    )
-                except Exception as page_err:
-                    log.error(
-                        "[%s] page extraction crashed for %s: %s",
-                        base_url, page_url, page_err, exc_info=True,
-                    )
-                    local_pipeline["errors"] += 1
-                    local_pages_failed += 1
-                    local_block_details.append({
-                        "page_url": page_url,
-                        "outcome": extraction_service.OUTCOME_CRASHED,
-                        "reason": str(page_err)[:200],
-                    })
-                    continue
+    async def _run_page(page_url: str) -> Dict[str, Any]:
+        # The page-level semaphore bounds how many pages of THIS dealer
+        # are live at once. Cross-dealer bounds are owned by the caller
+        # via extract_sem (which only wraps the actual Playwright phase).
+        async with page_sem:
+            return await _process_one_page(
+                base_url=base_url,
+                page_url=page_url,
+                distributor_id=distributor_id,
+                scan_job_id=scan_job_id,
+                campaign_assets=campaign_assets,
+                brand_rules=brand_rules,
+                org_id=org_id,
+                asset_hashes=asset_hashes,
+                asset_embeddings=asset_embeddings,
+                can_early_stop=can_early_stop,
+                all_asset_ids=all_asset_ids,
+                matched_asset_ids=matched_asset_ids,
+                matched_lock=matched_lock,
+                early_stop_event=early_stop_event,
+                extract_sem=extract_sem,
+                image_sem=image_sem,
+                match_buffer=local_buffer,
+                processed_buffer=local_processed,
+                settings=settings,
+            )
 
-                count = res.count
-                evidence_url = res.evidence_url
-                outcome = res.outcome
-
-                # Bin the page outcome. The inserted screenshot row is now
-                # optional and never bumps `pages_scanned` — it exists only
-                # so the user can see *what* was on the page (a WAF
-                # challenge, a 404, an empty SPA shell, etc.).
-                if outcome == extraction_service.OUTCOME_IMAGES:
-                    local_total_discovered += count
-                    local_pages_scanned += 1
-                elif outcome == extraction_service.OUTCOME_EMPTY:
-                    local_pages_empty += 1
-                    if (
-                        settings.enable_tiling_fallback
-                        and evidence_url
-                    ):
-                        log.info(
-                            "[%s] zero images from %s — inserting screenshot for tiling fallback",
-                            base_url, page_url,
-                        )
-                        _safe_insert_discovered_image({
-                            "scan_job_id": str(scan_job_id),
-                            "distributor_id": str(distributor_id) if distributor_id else None,
-                            "source_url": page_url,
-                            "image_url": evidence_url,
-                            "source_type": "page_screenshot",
-                            "channel": "website",
-                            "metadata": {
-                                "capture_method": "playwright_fallback",
-                                "full_page": True,
-                                "reason": "no_images_extracted",
-                            },
-                        })
-                        # Tiling fallback can produce a usable creative, so
-                        # treat as a real (low-confidence) scanned page.
-                        count = 1
-                        local_total_discovered += 1
-                        local_pages_scanned += 1
-                elif outcome == extraction_service.OUTCOME_BLOCKED:
-                    local_pages_blocked += 1
-                    local_block_details.append({
-                        "page_url": page_url,
-                        "outcome": outcome,
-                        "reason": res.block_reason,
-                        "http_status": res.http_status,
-                    })
-                    if evidence_url:
-                        # Surface the WAF/error page itself so the user can
-                        # see *why* we couldn't scan, but mark it clearly
-                        # as evidence of a block — not as a scanned page.
-                        # The "blocked_evidence" capture_method is a sentinel
-                        # the analyzer below uses to skip this row (we don't
-                        # want a 320x50 banner matched against a 1920x3000
-                        # full-page screenshot).
-                        _safe_insert_discovered_image({
-                            "scan_job_id": str(scan_job_id),
-                            "distributor_id": str(distributor_id) if distributor_id else None,
-                            "source_url": page_url,
-                            "image_url": evidence_url,
-                            "source_type": "page_screenshot",
-                            "channel": "website",
-                            "metadata": {
-                                "capture_method": "blocked_evidence",
-                                "full_page": True,
-                                "reason": res.block_reason or "blocked",
-                                "http_status": res.http_status,
-                            },
-                        })
-                        # Layer 1: run CV localization on the SS1 capture so
-                        # the matcher only sees real banner-sized crops, not
-                        # the entire hero section. Each crop becomes its own
-                        # ``extracted_image`` row that the analyzer below
-                        # will pick up.
-                        crops_added = await extraction_service.localize_screenshot_capture(
-                            evidence_url=evidence_url,
-                            scan_job_id=scan_job_id,
-                            page_url=page_url,
-                            distributor_id=distributor_id,
-                            campaign_assets=campaign_assets,
-                        )
-                        if crops_added > 0:
-                            count = crops_added
-                            local_total_discovered += crops_added
-                    log.warning(
-                        "[%s] page %s blocked (%s, http=%s) — %d cv-crop(s) inserted",
-                        base_url, page_url, res.block_reason,
-                        res.http_status,
-                        count if evidence_url else 0,
-                    )
-                else:
-                    local_pages_failed += 1
-                    local_block_details.append({
-                        "page_url": page_url,
-                        "outcome": outcome,
-                        "reason": res.block_reason,
-                    })
-                    log.warning(
-                        "[%s] page %s failed (%s, %s)",
-                        base_url, page_url, outcome, res.block_reason,
-                    )
-
-                if can_early_stop and count > 0:
-                    page_images = supabase.table("discovered_images")\
-                        .select("*")\
-                        .eq("scan_job_id", str(scan_job_id))\
-                        .eq("source_url", page_url)\
-                        .eq("is_processed", False)\
-                        .execute()
-
-                    for image in (page_images.data or []):
-                        # Layer 2: never run the matcher against the raw
-                        # full-page screenshot we kept for evidence — the
-                        # localized crops above are the matchable artifacts.
-                        # Letting the full page through produced false
-                        # "modified" verdicts on big hero shots.
-                        meta = image.get("metadata") or {}
-                        if meta.get("capture_method") == "blocked_evidence":
-                            continue
-                        local_total_images += 1
-                        asset_id = await _analyze_single_image(
-                            image, campaign_assets, brand_rules,
-                            org_id, str(scan_job_id),
-                            asset_hashes, asset_embeddings, local_pipeline,
-                            match_buffer=local_buffer,
-                            processed_buffer=local_processed,
-                        )
-                        if asset_id:
-                            local_page_match_tracker.setdefault(page_url, set()).add(asset_id)
-                            async with matched_lock:
-                                matched_asset_ids.add(asset_id)
-                                if all_asset_ids and matched_asset_ids >= all_asset_ids:
-                                    early_stop_event.set()
-
-                # End-of-page check for early-stop so we leave the loop
-                # before paying for the next page's Playwright load.
-                if all_asset_ids:
-                    async with matched_lock:
-                        if matched_asset_ids >= all_asset_ids:
-                            early_stop_event.set()
-                if early_stop_event.is_set():
-                    local_pages_skipped = len(page_urls) - (page_idx + 1)
-                    if local_pages_skipped > 0:
-                        log.info(
-                            "[%s] early-stop after page %d/%d (%d skipped)",
-                            base_url, page_idx + 1, len(page_urls), local_pages_skipped,
-                        )
-                    break
-
-        finally:
-            inserted = local_buffer.flush_all()
-            if inserted or local_buffer.total_failed:
-                log.info(
-                    "[%s] match buffer flushed: %d inserted, %d failed",
-                    base_url, inserted, local_buffer.total_failed,
+    try:
+        page_tasks = [
+            asyncio.create_task(_run_page(p), name=f"page:{base_url}:{i}")
+            for i, p in enumerate(page_urls)
+        ]
+        for coro in asyncio.as_completed(page_tasks):
+            try:
+                page_result = await coro
+            except Exception as page_err:
+                log.error(
+                    "[%s] page task crashed: %s", base_url, page_err, exc_info=True,
                 )
-            marked = local_processed.flush_all()
-            if marked:
-                log.debug("[%s] processed buffer flushed: %d marked", base_url, marked)
+                aggregate["pipeline_increments"]["errors"] += 1
+                aggregate["pages_failed"] += 1
+                continue
 
-        # Per-dealer status used by the aggregator and email summary.
-        if local_pages_scanned == 0 and local_pages_blocked > 0:
-            dealer_status = "blocked"
-        elif local_pages_scanned == 0 and local_pages_failed > 0:
-            dealer_status = "failed"
-        elif local_pages_scanned == 0:
-            dealer_status = "empty"
-        elif local_pages_blocked > 0 or local_pages_failed > 0:
-            dealer_status = "partial"
-        else:
-            dealer_status = "ok"
+            if page_result.get("skipped"):
+                aggregate["pages_skipped"] += 1
+                continue
 
-        return {
-            "total_discovered": local_total_discovered,
-            "pages_scanned": local_pages_scanned,
-            "pages_empty": local_pages_empty,
-            "pages_blocked": local_pages_blocked,
-            "pages_failed": local_pages_failed,
-            "total_images": local_total_images,
-            "pages_skipped": local_pages_skipped,
-            "pipeline_increments": local_pipeline,
-            "page_match_tracker": local_page_match_tracker,
-            "block_details": local_block_details,
-            "dealer_status": dealer_status,
-            "base_url": base_url,
-            "distributor_id": str(distributor_id) if distributor_id else None,
-        }
+            for k in (
+                "total_discovered", "pages_scanned", "pages_empty",
+                "pages_blocked", "pages_failed", "total_images",
+            ):
+                aggregate[k] += page_result.get(k, 0)
+            for k, v in (page_result.get("pipeline_increments") or {}).items():
+                aggregate["pipeline_increments"][k] = (
+                    aggregate["pipeline_increments"].get(k, 0) + v
+                )
+            for url, asset_ids in (page_result.get("page_match_tracker") or {}).items():
+                aggregate["page_match_tracker"].setdefault(url, set()).update(asset_ids)
+            if page_result.get("block_details"):
+                aggregate["block_details"].extend(page_result["block_details"])
+
+            if progress_callback is not None:
+                try:
+                    progress_callback(page_result)
+                except Exception as cb_err:
+                    log.debug(
+                        "Progress callback raised (non-fatal): %s", cb_err,
+                    )
+
+    finally:
+        inserted = local_buffer.flush_all()
+        if inserted or local_buffer.total_failed:
+            log.info(
+                "[%s] match buffer flushed: %d inserted, %d failed",
+                base_url, inserted, local_buffer.total_failed,
+            )
+        marked = local_processed.flush_all()
+        if marked:
+            log.debug("[%s] processed buffer flushed: %d marked", base_url, marked)
+        # Tear down the cached per-dealer BrowserContext(s) so memory
+        # stays bounded as later dealers ramp up.
+        try:
+            await extraction_service.release_dealer_contexts(base_url)
+        except Exception as ctx_err:
+            log.debug("[%s] release_dealer_contexts: %s", base_url, ctx_err)
+
+    if aggregate["pages_scanned"] == 0 and aggregate["pages_blocked"] > 0:
+        dealer_status = "blocked"
+    elif aggregate["pages_scanned"] == 0 and aggregate["pages_failed"] > 0:
+        dealer_status = "failed"
+    elif aggregate["pages_scanned"] == 0:
+        dealer_status = "empty"
+    elif aggregate["pages_blocked"] > 0 or aggregate["pages_failed"] > 0:
+        dealer_status = "partial"
+    else:
+        dealer_status = "ok"
+
+    return {
+        "total_discovered": aggregate["total_discovered"],
+        "pages_scanned": aggregate["pages_scanned"],
+        "pages_empty": aggregate["pages_empty"],
+        "pages_blocked": aggregate["pages_blocked"],
+        "pages_failed": aggregate["pages_failed"],
+        "total_images": aggregate["total_images"],
+        "pages_skipped": aggregate["pages_skipped"],
+        "pipeline_increments": aggregate["pipeline_increments"],
+        "page_match_tracker": aggregate["page_match_tracker"],
+        "block_details": aggregate["block_details"],
+        "dealer_status": dealer_status,
+        "base_url": base_url,
+        "distributor_id": str(distributor_id) if distributor_id else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1049,6 +1222,38 @@ async def run_website_scan(
     cached pages alone, full page discovery is skipped entirely.
     """
     from . import page_cache_service
+
+    # Phase-7 fix #8: dedupe input URLs by hostname so a campaign that
+    # was assembled from multiple sources (e.g. distributors + manual
+    # additions) doesn't pay to scan the same dealer twice. Preserve the
+    # first occurrence's full URL so any path-specific entry point is
+    # respected; collapse strict duplicates and same-host repeats.
+    from urllib.parse import urlparse as _urlparse_dedupe
+    seen_keys: set = set()
+    deduped_urls: List[str] = []
+    duplicates: List[str] = []
+    for raw in website_urls:
+        if not raw:
+            continue
+        try:
+            host = (_urlparse_dedupe(raw).hostname or "").lower()
+        except Exception:
+            host = ""
+        # Hostname is the dedupe key when present; fall back to the raw
+        # string so URLs with no schema/host (rare manual entries) still
+        # collapse on exact-string match.
+        key = host or raw.strip().lower()
+        if key in seen_keys:
+            duplicates.append(raw)
+            continue
+        seen_keys.add(key)
+        deduped_urls.append(raw)
+    if duplicates:
+        log.info(
+            "URL dedupe removed %d duplicate dealer URL(s): %s",
+            len(duplicates), duplicates[:5],
+        )
+    website_urls = deduped_urls
 
     log.info("Website scan started for job %s — URLs: %s, campaign: %s",
              scan_job_id, website_urls, campaign_id)
@@ -1305,7 +1510,55 @@ async def run_website_scan(
         if not cache_early_stopped and per_dealer_pages:
             early_stop_event = asyncio.Event()
             matched_lock = asyncio.Lock()
-            sem = asyncio.Semaphore(max(1, _settings.max_concurrent_dealers))
+
+            # The Phase-7 extract semaphore is the cross-dealer Playwright
+            # bound. It only wraps the actual page navigation+screenshot
+            # step (see _process_one_page), so a dealer waiting on
+            # Anthropic for AI analysis no longer holds a slot that some
+            # other dealer's extractor could be using. Concurrency caps
+            # for the AI side now live inside _process_one_page (per-page
+            # fan-out) and inside the per-image semaphore set by
+            # ``settings.images_per_page_concurrency``.
+            extract_sem = asyncio.Semaphore(
+                max(1, _settings.max_concurrent_dealers)
+                * max(1, getattr(_settings, "pages_per_dealer_concurrency", 4))
+            )
+
+            stream_progress = bool(getattr(_settings, "enable_progress_streaming", True))
+            progress_state = {
+                "total_items": int(total_discovered),
+                "processed_items": 0,
+                "matches_count": 0,
+            }
+
+            def _stream_page_progress(page_result: Dict[str, Any]) -> None:
+                """Write incremental counters to scan_jobs as each page lands.
+
+                Phase-7 fix #9: previously the row only got
+                ``total_items`` / ``processed_items`` / ``matches_count``
+                values at end-of-scan, so the operator saw 0 in the UI
+                for hours and a watchdog kill lost everything visually.
+                Now each completed page deltas the counters so the UI
+                shows real progress and partial results survive a kill.
+                """
+                if not stream_progress:
+                    return
+                progress_state["total_items"] += int(page_result.get("total_discovered", 0))
+                progress_state["processed_items"] += int(page_result.get("total_images", 0))
+                # `matches_new` from the per-page payload is the diff in
+                # newly-created match rows seen during that page; confirmed
+                # rows are existing matches re-validated and don't bump
+                # the visible count.
+                progress_state["matches_count"] += int(page_result.get("matches_new", 0))
+                try:
+                    supabase.table("scan_jobs").update({
+                        "total_items": progress_state["total_items"],
+                        "processed_items": progress_state["processed_items"],
+                        "matches_count": progress_state["matches_count"],
+                        "last_heartbeat_at": _utc_now(),
+                    }).eq("id", str(scan_job_id)).execute()
+                except Exception as e:
+                    log.debug("Streaming progress write failed: %s", e)
 
             dealer_tasks = [
                 asyncio.create_task(
@@ -1324,8 +1577,9 @@ async def run_website_scan(
                         matched_asset_ids=matched_asset_ids,
                         matched_lock=matched_lock,
                         early_stop_event=early_stop_event,
-                        sem=sem,
+                        extract_sem=extract_sem,
                         settings=_settings,
+                        progress_callback=_stream_page_progress,
                     ),
                     name=f"dealer:{base_url}",
                 )
