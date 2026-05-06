@@ -36,8 +36,10 @@ ACTOR_ID = "nourishing_courier~meta-ads-scraper-pro"
 
 # Apify run statuses
 _TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
-_POLL_INTERVAL_SEC = 5
-_MAX_POLL_TIME_SEC = 300  # 5 minute ceiling per run
+# Poll cadence and ceiling are configurable via settings — large multi-dealer
+# Meta Ad Library runs (50+ pages) routinely take 15-30 minutes.
+_POLL_INTERVAL_SEC = settings.apify_poll_interval_seconds
+_MAX_POLL_TIME_SEC = settings.apify_max_poll_seconds
 
 # Playwright fallback settings
 _PW_AD_LIBRARY_TIMEOUT = 20_000  # 20s page load timeout

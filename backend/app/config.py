@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     
     # Apify (Meta Ad Library — Facebook & Instagram)
     apify_api_key: str = ""
+    # Max seconds we'll poll an Apify run before giving up. Large multi-dealer
+    # scans (50+ pages) can legitimately take 15-30 minutes inside Apify, so
+    # the default ceiling is generous. The Apify run itself keeps executing
+    # regardless — this only bounds how long *our* worker waits.
+    apify_max_poll_seconds: int = Field(default=2400, description="Max seconds to poll an Apify run before timing out (default 40 min)")
+    apify_poll_interval_seconds: int = Field(default=10, description="Seconds between Apify run status polls")
     
     # Stripe (billing)
     stripe_secret_key: str = ""

@@ -27,8 +27,10 @@ APIFY_BASE = "https://api.apify.com/v2"
 TASK_ID = "diamanted~instagram-scraper-task"
 
 _TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
-_POLL_INTERVAL_SEC = 5
-_MAX_POLL_TIME_SEC = 300
+# Configurable so large multi-dealer Instagram scans aren't killed prematurely
+# while the Apify run is still actively producing items.
+_POLL_INTERVAL_SEC = settings.apify_poll_interval_seconds
+_MAX_POLL_TIME_SEC = settings.apify_max_poll_seconds
 
 
 def _extract_username(url: str) -> Optional[str]:
