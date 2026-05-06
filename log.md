@@ -6022,3 +6022,137 @@ Caterpillar's official US page) and confirm:
 If Tier 1 returns zero images for a dealer with active ads, that's
 the signal to set `APIFY_META_PROXY_URL`.
 
+
+---
+
+## 2026-05-06 — Hotfix: slug→pageId resolver via apify/facebook-pages-scraper
+
+### What broke
+
+First production run of the new Meta scanner (commit `93a078d`) at
+22:00 UTC immediately surfaced this in the runtime logs:
+
+```
+HTTP page-id probe missed for foleycaterpillar — falling back to Playwright
+Could not resolve numeric page ID for crescorent. The
+  whoareyouanas/meta-ad-scraper actor requires a pageId.
+  Skipping this dealer for the current scan.
+HTTP page-id probe missed for gregorypoolemarine — falling back to Playwright
+Could not resolve numeric page ID for fabickcat. ...
+... [repeats for every dealer]
+```
+
+Every single dealer's pageId resolution failed.
+
+### Root cause
+
+The HTTP probe and Playwright fallback I shipped both rely on
+unauthenticated access to facebook.com — they look for patterns like
+`"pageID":"<NUM>"` and `<meta property="al:android:url" ...>` in the
+server-rendered HTML. Facebook has steadily tightened its logged-out
+wall over the past year and now serves a near-pure JS shell with the
+numeric ID nowhere in the markup. Playwright doesn't help because we're
+still anonymous — the wall is keyed on session, not IP/UA.
+
+The patterns I encoded against were a year-old version of Facebook's
+response. They don't fire on 2026-05 markup.
+
+### The fix
+
+A four-tier resolver, each tier strictly more expensive than the last:
+
+1. **In-process cache** (`_PAGE_ID_CACHE`) — same-scan re-resolution
+   never happens.
+2. **Persisted column** `distributors.facebook_page_id` (added in
+   migration 032). After the first successful resolution, every
+   subsequent scan hits this and pays zero resolver cost.
+3. **Anonymous HTTP probe** — kept as a free first try. Mostly fails
+   today, but cheap enough to retain for the occasional dealer that
+   leaks its ID anonymously.
+4. **`apify/facebook-pages-scraper` actor**, batched. Runs as one
+   call against every dealer the prior tiers missed. Pricing
+   $6.60/1000 pages = ~$0.33 for a 50-dealer cold-start scan.
+
+Successful resolutions from tiers 3 + 4 are written back to
+`distributors` so the next scan starts from tier 2.
+
+The pages-scraper actor's output looks like:
+
+```json
+{
+  "pageUrl": "https://www.facebook.com/foleycaterpillar",
+  "pageId": "100064...",
+  "facebookId": "100064...",
+  "pageAdLibrary": {"id": "..."}
+}
+```
+
+We use `pageId` (with `facebookId` fallback) because that's the value
+the meta-ad-scraper actor consumes. The separate `pageAdLibrary.id`
+is a different identifier and must NOT be used here — verified
+against the operator-supplied URL pattern
+`?...&view_all_page_id=<NUM>` which corresponds to `pageId`.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `supabase/migrations/032_distributor_facebook_page_id.sql` | NEW — adds `distributors.facebook_page_id` (text, nullable, indexed) and `facebook_page_id_resolved_at` (timestamptz). Idempotent (`IF NOT EXISTS`). |
+| `backend/app/services/apify_meta_service.py` | Replaced the dead Playwright resolver with `_resolve_page_ids_via_apify` (batched pages-scraper call) and the four-tier `_resolve_facebook_page_ids_batch` orchestrator. Refactored `scan_meta_ads` to resolve ALL dealer pageIds in one upfront batch before fanning out the per-dealer meta-ad-scraper runs. `_run_actor_for_page` now takes a pre-resolved `page_id` argument instead of re-resolving inside each fan-out task. |
+| `log.md` | this entry |
+
+### Cost & latency math
+
+* First scan after deploy (50 dealers, none cached): one
+  pages-scraper batch call at $0.33 + the fan-out meta-ad-scraper
+  cost. Pages-scraper run takes 5–10 min on 50 URLs.
+* Steady state (50 dealers, all cached in `distributors`): zero
+  resolver cost, no extra latency.
+* If a single dealer is added to the system, its first scan pays
+  one pages-scraper call ($0.0066) + persists.
+
+### Backwards compatibility
+
+* Public `scan_meta_ads(page_urls, scan_job_id, distributor_mapping,
+  *, channel, campaign_assets)` signature unchanged.
+* Migration 032 is idempotent and additive — no existing column or
+  index is touched. Safe to apply with the worker offline or live.
+* If the worker rolls out before migration 032 applies, the
+  resolver's tier-2 lookup logs a `debug` message and the scan
+  proceeds via tier-3 + tier-4. **Production stays correct in either
+  ordering of code-deploy / migration-apply.**
+
+### Tests
+
+* `pytest -q` → **157 passed** (no regressions).
+* No new tests added — the resolver is heavily I/O-bound and would
+  require a sizeable network mock harness for limited extra
+  signal. The dispatcher-level tests already exercise that
+  `scan_meta_ads` is called with the right kwargs.
+
+### Verification path
+
+After this commit deploys + migration 032 applies:
+
+1. Open DigitalOcean → backend → Runtime Logs while a Meta scan
+   runs. You should see:
+   ```
+   Tier-4 (apify/facebook-pages-scraper) resolving N dealer(s) ...
+   apify/facebook-pages-scraper resolved N/N dealer(s)
+   Facebook page-id resolution: N/N dealers resolved
+     (cache+DB hit X, HTTP probe added Y, Apify added Z, 0 missed)
+   Apify Meta run started for foleycaterpillar (pageId=100064...): ...
+   ```
+2. After the first scan completes, query Supabase:
+   ```sql
+   SELECT name, facebook_page_id, facebook_page_id_resolved_at
+     FROM distributors
+    WHERE facebook_page_id IS NOT NULL
+    ORDER BY facebook_page_id_resolved_at DESC;
+   ```
+   This should populate every dealer that successfully ran in the
+   first post-fix scan.
+3. The second Meta scan should show the resolution log line as
+   `(cache+DB hit N, HTTP probe added 0, Apify added 0, 0 missed)`
+   — i.e. zero paid lookups.
+

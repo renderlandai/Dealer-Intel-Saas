@@ -48,6 +48,12 @@ settings = get_settings()
 
 APIFY_BASE = "https://api.apify.com/v2"
 ACTOR_ID = "whoareyouanas~meta-ad-scraper"
+# Slug → numeric pageId resolver actor. Different from the meta-ad
+# scraper above. apify/facebook-pages-scraper accepts a batch of
+# Facebook page URLs and returns their numeric IDs at $6.60/1000
+# pages — its rendered crawl gets through the logged-out walls that
+# block our anonymous httpx / Playwright probes.
+PAGES_SCRAPER_ACTOR_ID = "apify~facebook-pages-scraper"
 
 # Apify run statuses we treat as terminal (the run will not progress
 # further, regardless of whether it succeeded).
@@ -103,9 +109,15 @@ _PAGE_ID_CACHE: Dict[str, str] = {}
 
 
 async def _http_resolve_page_id(slug: str) -> Optional[str]:
-    """First-pass resolver: a plain GET against facebook.com/<slug> and
-    m.facebook.com/<slug>, scanning the response body for any of
+    """Free first-pass resolver: a plain GET against facebook.com/<slug>
+    and m.facebook.com/<slug>, scanning the response body for any of
     ``_PAGE_ID_PATTERNS``.
+
+    Cheap and fast when it works. Increasingly doesn't, because Meta
+    walls anonymous traffic — see the 2026-05-06 22:00 UTC log entry.
+    Kept as the first tier because (a) cache-warm dealers shouldn't
+    need an Apify call to re-resolve, and (b) any slug that DOES leak
+    its ID anonymously costs us nothing.
 
     Uses a desktop user-agent because Meta returns slightly different
     markup to "modern" UAs and the mobile UA path occasionally
@@ -142,103 +154,279 @@ async def _http_resolve_page_id(slug: str) -> Optional[str]:
     return None
 
 
-async def _playwright_resolve_page_id(slug: str) -> Optional[str]:
-    """Fallback resolver. Reuses the existing Playwright browser pool.
+async def _resolve_page_ids_via_apify(
+    page_urls: List[str],
+) -> Dict[str, str]:
+    """Tier-2 resolver. Calls the ``apify/facebook-pages-scraper``
+    actor on a batch of dealer URLs and returns ``{page_url: pageId}``
+    for every page it could resolve.
 
-    Many Facebook pages serve a logged-out wall to anonymous HTTP
-    clients but render the underlying page metadata when JS executes.
-    We don't need to interact with anything — once the page has loaded
-    we read ``window.__INITIAL_STATE__`` / meta tags directly.
+    The pages-scraper is purpose-built for this — its rendered crawl
+    blasts through the logged-out wall that breaks our anonymous
+    probes. Pricing is $6.60 per 1000 pages, so a 50-dealer batch
+    costs ~$0.33. After we persist results to ``distributors``, the
+    long-run amortised cost is essentially zero.
+
+    Returns an empty dict on failure rather than raising; the caller
+    logs a per-dealer skip and the scan continues for whatever pages
+    *did* resolve.
     """
-    try:
-        from .extraction_service import _get_browser, _new_page
-    except Exception as e:
-        log.debug("Playwright unavailable for page-id resolution: %s", e)
-        return None
-
-    page = None
-    try:
-        browser = await _get_browser()
-        page = await _new_page(browser, mobile=True)
-        await page.goto(
-            f"https://m.facebook.com/{slug}",
-            wait_until="domcontentloaded",
-            timeout=_PW_AD_LIBRARY_TIMEOUT,
+    if not page_urls:
+        return {}
+    if not settings.apify_api_key:
+        log.warning(
+            "Apify pages-scraper resolver requested but APIFY_API_KEY "
+            "is unset — cannot resolve %d dealer(s)", len(page_urls),
         )
-        # Brief settle so Meta's client-side hydration drops the page id
-        # into a meta tag or inline script.
-        await asyncio.sleep(2)
-        page_id = await page.evaluate(
-            """() => {
-                const sel = (q) => document.querySelector(q)?.content || null;
-                const m1 = sel('meta[property="al:android:url"]');
-                if (m1) {
-                    const m = m1.match(/id=(\\d+)/);
-                    if (m) return m[1];
-                }
-                const m2 = sel('meta[property="al:ios:url"]');
-                if (m2) {
-                    const m = m2.match(/profile\\/(\\d+)/);
-                    if (m) return m[1];
-                }
-                const html = document.documentElement.outerHTML;
-                const patterns = [
-                    /"pageID"\\s*:\\s*"(\\d+)"/,
-                    /"entity_id"\\s*:\\s*"(\\d+)"/,
-                    /"page_id"\\s*:\\s*"(\\d+)"/,
-                    /"profile_id"\\s*:\\s*"(\\d+)"/,
-                ];
-                for (const p of patterns) {
-                    const m = html.match(p);
-                    if (m) return m[1];
-                }
-                return null;
-            }"""
-        )
-        if page_id and str(page_id).isdigit():
-            return str(page_id)
-    except Exception as e:
-        log.debug("Playwright page-id resolution failed for %s: %s", slug, e)
-    finally:
-        if page is not None:
-            try:
-                await page.context.close()
-            except Exception:
-                pass
-    return None
+        return {}
 
+    actor_input = {
+        "startUrls": [
+            {"url": _normalize_fb_url(u)} for u in page_urls
+        ],
+    }
 
-async def _resolve_facebook_page_id(page_url: str) -> Optional[str]:
-    """Resolve a Facebook page URL/slug to its numeric page ID.
-
-    Returns ``None`` if neither the HTTP probe nor Playwright fallback
-    can find one — the caller is expected to skip that dealer with a
-    warning rather than fail the entire scan.
-    """
-    slug = _extract_page_slug(page_url)
-    if not slug:
-        return None
-    if slug in _PAGE_ID_CACHE:
-        return _PAGE_ID_CACHE[slug]
-
-    page_id = await _http_resolve_page_id(slug)
-    if not page_id:
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{APIFY_BASE}/acts/{PAGES_SCRAPER_ACTOR_ID}/runs",
+                params={"token": settings.apify_api_key},
+                json=actor_input,
+            )
+            resp.raise_for_status()
+            run_data = resp.json()["data"]
+        run_id = run_data["id"]
         log.info(
-            "HTTP page-id probe missed for %s — falling back to Playwright",
-            slug,
+            "apify/facebook-pages-scraper started for %d dealer(s) "
+            "(run_id=%s)", len(page_urls), run_id,
         )
-        page_id = await _playwright_resolve_page_id(slug)
 
-    if page_id:
-        _PAGE_ID_CACHE[slug] = page_id
-        log.info("Resolved %s -> pageId=%s", slug, page_id)
-    else:
+        completed = await _poll_run(run_id)
+    except TimeoutError:
+        log.error(
+            "apify/facebook-pages-scraper run timed out for %d dealer(s) "
+            "— skipping resolution this scan", len(page_urls),
+        )
+        return {}
+    except Exception as e:
+        log.warning("apify/facebook-pages-scraper run failed: %s", e)
+        return {}
+
+    if completed.get("status") != "SUCCEEDED":
+        log.warning(
+            "apify/facebook-pages-scraper ended with status %s "
+            "(run_id=%s)", completed.get("status"), completed.get("id"),
+        )
+        return {}
+
+    dataset_id = completed.get("defaultDatasetId")
+    if not dataset_id:
+        log.warning("Pages scraper succeeded but no dataset id returned")
+        return {}
+
+    try:
+        items = await _fetch_dataset_items(dataset_id)
+    except Exception as e:
+        log.warning("Pages scraper dataset fetch failed: %s", e)
+        return {}
+
+    # Cost-tracker capture for this auxiliary resolver run, if the
+    # tracker is active in this scan's context.
+    try:
+        from . import cost_tracker
+        cost_tracker.record_apify_run(
+            actor_or_task=PAGES_SCRAPER_ACTOR_ID,
+            run_id=completed.get("id"),
+            usage_total_usd=completed.get("usageTotalUsd"),
+            items_returned=len(items),
+        )
+    except Exception as cost_err:
+        log.debug("Cost capture skipped (pages scraper): %s", cost_err)
+
+    # Match dataset rows back to input URLs by slug — the actor often
+    # rewrites the URL (canonicalises ``www``, drops trailing slash,
+    # rewrites ``profile.php?id=...``), so equality on the raw string
+    # is fragile. Slug match is what survives every rewrite shape.
+    out: Dict[str, str] = {}
+    slug_to_input: Dict[str, str] = {
+        _extract_page_slug(u): u for u in page_urls
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_url = item.get("pageUrl") or item.get("facebookUrl") or ""
+        item_slug = _extract_page_slug(item_url) if item_url else ""
+        # Prefer pageId; fall back to facebookId (in the sample these
+        # are identical, but pageId is the documented field). The
+        # pageAdLibrary.id field is a separate Ad Library identifier
+        # and is NOT the right value for whoareyouanas/meta-ad-scraper.
+        pid = item.get("pageId") or item.get("facebookId")
+        if not pid:
+            continue
+        pid_s = str(pid)
+        if not pid_s.isdigit():
+            continue
+        # Map back to original input URL via slug.
+        original = slug_to_input.get(item_slug)
+        if original:
+            out[original] = pid_s
+
+    log.info(
+        "apify/facebook-pages-scraper resolved %d/%d dealer(s)",
+        len(out), len(page_urls),
+    )
+    return out
+
+
+async def _resolve_facebook_page_ids_batch(
+    page_urls: List[str],
+    distributor_mapping: Optional[Dict[str, UUID]] = None,
+) -> Dict[str, str]:
+    """Tiered resolver — the public entrypoint used by ``scan_meta_ads``.
+
+    Resolves a batch of dealer URLs to their numeric Facebook page IDs
+    in this priority order:
+
+        1. In-process cache (``_PAGE_ID_CACHE``).
+        2. Persisted ``distributors.facebook_page_id`` column (set by
+           a previous successful scan). This is the steady-state path
+           and the reason the migration in 032 exists.
+        3. Anonymous HTTP probe (free; mostly fails as of 2026-05-06).
+        4. ``apify/facebook-pages-scraper`` batch call (paid; reliable).
+
+    Successful resolutions from tiers 3+4 are written back to the
+    distributors row (best-effort) so future scans don't re-pay.
+
+    Returns ``{page_url: pageId}``. URLs that couldn't be resolved by
+    any tier are simply absent from the result; the caller is expected
+    to log a per-dealer skip warning and continue.
+    """
+    if not page_urls:
+        return {}
+    distributor_mapping = distributor_mapping or {}
+    result: Dict[str, str] = {}
+
+    # Tier 1: in-process cache.
+    for url in page_urls:
+        slug = _extract_page_slug(url)
+        if slug and slug in _PAGE_ID_CACHE:
+            result[url] = _PAGE_ID_CACHE[slug]
+
+    # Tier 2: persisted column on distributors. Single batched select.
+    pending = [u for u in page_urls if u not in result]
+    if pending:
+        slug_to_dist = _build_url_to_distributor_map(pending, distributor_mapping)
+        dist_ids = list({
+            slug_to_dist[s] for s in (
+                _extract_page_slug(u) for u in pending
+            ) if s and s in slug_to_dist
+        })
+        if dist_ids:
+            try:
+                resp = (
+                    supabase.table("distributors")
+                    .select("id, facebook_page_id")
+                    .in_("id", [str(i) for i in dist_ids])
+                    .execute()
+                )
+                dist_id_to_page_id: Dict[str, str] = {}
+                for row in (resp.data or []):
+                    pid = row.get("facebook_page_id")
+                    if pid and str(pid).isdigit():
+                        dist_id_to_page_id[str(row["id"])] = str(pid)
+
+                for url in pending:
+                    slug = _extract_page_slug(url)
+                    dist_id = slug_to_dist.get(slug)
+                    if dist_id and str(dist_id) in dist_id_to_page_id:
+                        result[url] = dist_id_to_page_id[str(dist_id)]
+                        if slug:
+                            _PAGE_ID_CACHE[slug] = result[url]
+            except Exception as e:
+                # Migration 032 may not have applied yet; degrade
+                # gracefully to the live-resolution path.
+                log.debug(
+                    "DB lookup of distributors.facebook_page_id "
+                    "failed (migration 032 may be pending): %s", e,
+                )
+
+    # Tier 3: anonymous HTTP probe.
+    pending = [u for u in page_urls if u not in result]
+    http_resolved_urls: set = set()
+    if pending:
+        for url in pending:
+            slug = _extract_page_slug(url)
+            if not slug:
+                continue
+            pid = await _http_resolve_page_id(slug)
+            if pid:
+                result[url] = pid
+                http_resolved_urls.add(url)
+                _PAGE_ID_CACHE[slug] = pid
+
+    # Tier 4: paid Apify pages scraper, batched.
+    needs_apify = [u for u in page_urls if u not in result]
+    apify_resolved: Dict[str, str] = {}
+    if needs_apify:
+        log.info(
+            "Tier-4 (apify/facebook-pages-scraper) resolving %d dealer(s) "
+            "the anonymous probe could not crack", len(needs_apify),
+        )
+        apify_resolved = await _resolve_page_ids_via_apify(needs_apify)
+        for url, pid in apify_resolved.items():
+            result[url] = pid
+            slug = _extract_page_slug(url)
+            if slug:
+                _PAGE_ID_CACHE[slug] = pid
+
+    # Tally the four tier outcomes for the operator log line below.
+    # We compute this BEFORE the persistence write-back so the
+    # numbers reflect where each URL was actually resolved (vs. where
+    # we re-stored it).
+    cache_or_db_hits = len(result) - len(http_resolved_urls) - len(apify_resolved)
+    missed = [u for u in page_urls if u not in result]
+
+    # Persist Tier 3 + Tier 4 results back to the DB so the next scan
+    # finds them at Tier 2 and pays no resolver cost. Best-effort —
+    # missing column / RLS blocks just log at debug.
+    fresh_writes = http_resolved_urls | set(apify_resolved.keys())
+    if distributor_mapping and fresh_writes:
+        slug_to_dist_full = _build_url_to_distributor_map(
+            page_urls, distributor_mapping,
+        )
+        now = datetime.now(timezone.utc).isoformat()
+        for url in fresh_writes:
+            pid = result.get(url)
+            slug = _extract_page_slug(url)
+            dist_id = slug_to_dist_full.get(slug) if slug else None
+            if not (pid and dist_id):
+                continue
+            try:
+                supabase.table("distributors").update({
+                    "facebook_page_id": pid,
+                    "facebook_page_id_resolved_at": now,
+                }).eq("id", str(dist_id)).execute()
+            except Exception as e:
+                log.debug(
+                    "Could not persist facebook_page_id for %s: %s "
+                    "(migration 032 pending?)", slug, e,
+                )
+
+    log.info(
+        "Facebook page-id resolution: %d/%d dealers resolved "
+        "(cache+DB hit %d, HTTP probe added %d, Apify added %d, %d missed)",
+        len(result), len(page_urls),
+        cache_or_db_hits, len(http_resolved_urls), len(apify_resolved),
+        len(missed),
+    )
+    for url in missed:
         log.warning(
             "Could not resolve numeric page ID for %s. The "
             "whoareyouanas/meta-ad-scraper actor requires a pageId. "
-            "Skipping this dealer for the current scan.", slug,
+            "Skipping this dealer for the current scan.",
+            _extract_page_slug(url) or url,
         )
-    return page_id
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -549,19 +737,20 @@ async def _resolve_images_for_ads(
 
 async def _run_actor_for_page(
     page_url: str,
+    page_id: str,
     *,
     country: str = "US",
     active_status: str = "all",
     media_type: str = "all",
 ) -> Tuple[str, List[Dict[str, Any]], Optional[float], Optional[str]]:
-    """Run one actor invocation for one dealer page.
+    """Run one actor invocation for one dealer page, given a
+    pre-resolved numeric ``page_id``.
 
     Returns ``(page_url, ads, usage_total_usd, run_id)``. Always
     returns — actor / network failures degrade to an empty ad list and
     a logged WARNING rather than raising, so one dealer's outage
     doesn't fail the whole multi-dealer scan.
     """
-    page_id = await _resolve_facebook_page_id(page_url)
     if not page_id:
         return page_url, [], None, None
 
@@ -627,9 +816,13 @@ async def scan_meta_ads(
     list of dealer Facebook URLs and we fan out internally.
 
     Steps:
-        1. Resolve every page URL to its numeric Facebook pageId.
-        2. Fan out actor runs in parallel (bounded by
-           ``settings.apify_meta_max_parallel_runs``).
+        1. Resolve every page URL to its numeric Facebook pageId via
+           the tiered resolver (cache → DB → HTTP probe → Apify
+           pages scraper).
+        2. Fan out meta-ad-scraper runs in parallel (bounded by
+           ``settings.apify_meta_max_parallel_runs``) over the
+           dealers whose pageId resolved successfully. Dealers that
+           didn't resolve are logged as warnings and skipped.
         3. For each ad, pull image URLs (3-tier fallback).
         4. Insert each image as a ``discovered_images`` row, tagging
            the source dealer via the page_url that triggered the run.
@@ -656,15 +849,39 @@ async def scan_meta_ads(
         "started_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", str(scan_job_id)).execute()
 
-    # 1+2: Fan out — bounded parallel actor runs.
+    # 1: Resolve every dealer URL to a numeric Facebook pageId in
+    # one batch. Tier 1 (cache) and Tier 2 (DB column) are free; only
+    # genuinely new dealers fall through to the paid pages-scraper
+    # actor, and that runs as a single batched call rather than N
+    # sequential per-dealer probes (which is what we did before and
+    # produced the 2026-05-06 wave of "Could not resolve" warnings).
+    page_id_map = await _resolve_facebook_page_ids_batch(
+        page_urls, distributor_mapping,
+    )
+    if not page_id_map:
+        log.warning(
+            "No Facebook page IDs could be resolved for any of the %d "
+            "supplied dealer URLs — meta scan cannot proceed",
+            len(page_urls),
+        )
+        supabase.table("scan_jobs").update({
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "total_items": 0,
+        }).eq("id", str(scan_job_id)).execute()
+        return 0
+
+    # 2: Fan out — bounded parallel actor runs over RESOLVED dealers.
     fan_sem = asyncio.Semaphore(max(1, settings.apify_meta_max_parallel_runs))
 
-    async def _bounded(page_url: str):
+    async def _bounded(page_url: str, page_id: str):
         async with fan_sem:
-            return await _run_actor_for_page(page_url, active_status="all")
+            return await _run_actor_for_page(
+                page_url, page_id, active_status="all",
+            )
 
     fan_results = await asyncio.gather(
-        *[_bounded(u) for u in page_urls],
+        *[_bounded(url, pid) for url, pid in page_id_map.items()],
         return_exceptions=True,
     )
 
