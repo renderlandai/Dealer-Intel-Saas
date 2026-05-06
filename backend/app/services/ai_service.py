@@ -109,155 +109,21 @@ _VALID_IMAGE_CONTENT_TYPES = frozenset({
 })
 
 
-_MIN_VALID_IMAGE_DIM = 80  # pixels — drops 1x1 trackers, favicons, social-icon sprites
-
-
 def _is_valid_image(data: bytes) -> bool:
-    """Return True if Pillow can identify *data* as a supported image
-    format AND it's larger than the tracker-pixel threshold.
-
-    Phase 6.5.10 — added the dimension check. A surprising number of
-    discovered URLs on dealer sites are 1×1 GIF tracking pixels, 16×16
-    favicons, or 24×24 social-network sprites stitched into the page
-    HTML. They're "valid images" by Pillow's reckoning but downstream
-    matching against an 80×80 minimum is the cheap way to filter them
-    before they pollute the per-page `discovered_images` count, the
-    hash/CLIP prefilter caches, and (worst case) Claude calls.
-
-    The threshold is deliberately conservative: 80px catches all
-    common tracking-pixel and chrome-icon sizes (16, 24, 32, 48, 64)
-    without affecting any real ad creative — even tiny mobile banner
-    creatives are at minimum 100×100.
-    """
+    """Return True if Pillow can identify *data* as a supported image format."""
     try:
         img = Image.open(io.BytesIO(data))
         img.verify()
-    except Exception:
-        return False
-    # PIL.Image.verify() invalidates the file pointer for further ops,
-    # so we need a second open to read .size — cheaper than parsing
-    # the format header by hand and the bytes are already in memory.
-    try:
-        img2 = Image.open(io.BytesIO(data))
-        w, h = img2.size
-    except Exception:
-        # If we can't read dimensions but verify() passed, prefer to
-        # accept rather than silently lose a payload.
         return True
-    if w < _MIN_VALID_IMAGE_DIM or h < _MIN_VALID_IMAGE_DIM:
+    except Exception:
         return False
-    return True
-
-
-def _shorten_url_for_log(url: str, max_len: int = 120) -> str:
-    """Shorten a URL for log display while preserving the discriminating
-    parts (host + filename) that operators need to read.
-
-    Naive ``url[:80]`` chopped off filenames on AEM/CMS URLs like
-    ``.../_jcr_content/.../responsivegrid_<id>/image.coreimg.jpeg/.../file.jpeg``
-    — every variant collapsed to the same prefix and the operator
-    couldn't tell whether they were 3 retries of one URL or 3 distinct
-    image renditions. Keep ``host + start of path + "..." + end of path``
-    so the discriminating filename survives.
-    """
-    if not url:
-        return ""
-    if len(url) <= max_len:
-        return url
-    # Reserve ~30 chars for the tail (typical filename) and ~80 for
-    # scheme + host + start of path. Glue with an ellipsis so it's
-    # obvious to the reader that something was elided.
-    head_len = max_len - 33
-    if head_len < 20:
-        head_len = 20
-    return url[:head_len] + "..." + url[-30:]
-
-
-# Realistic browser headers — most CDNs don't actively block plain
-# python-httpx, but a non-trivial number of dealer sites have basic
-# anti-bot rules that 403 anything without an Accept header. Sending
-# the same UA Playwright uses (Chrome on macOS) means a successful
-# Playwright extraction is followed by successful image downloads
-# from the same origin.
-_DOWNLOAD_HEADERS: dict = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "image/avif,image/webp,image/apng,image/svg+xml,"
-        "image/*,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Fetch-Dest": "image",
-    "Sec-Fetch-Mode": "no-cors",
-    "Sec-Fetch-Site": "same-origin",
-}
-
-
-# Short timeout for the speculative direct fetch on hosts whose page
-# was unlocked by Bright Data. The whole point of this rung is "if
-# the public CDN happens to be reachable, prefer the original master
-# bytes" — if direct hangs we don't want to delay the inevitable BD
-# fallback by 30s. 6s is long enough for a fast TLS handshake and a
-# 1MB image on residential bandwidth, short enough that the BD round
-# trip still beats the page-budget timeout.
-_UNLOCKED_DIRECT_PROBE_TIMEOUT = 6.0
-
-
-async def _try_direct_image_fetch(
-    url: str, *, timeout: float = _UNLOCKED_DIRECT_PROBE_TIMEOUT,
-) -> Optional[bytes]:
-    """Best-effort direct httpx fetch.
-
-    Returns the image bytes on success, or None on ANY failure. Never
-    raises and only logs at DEBUG — callers use this as a probe and
-    have their own fallback path. Used by ``download_image`` to give
-    DAM/CDN paths on Bright-Data-unlocked hosts a chance to come back
-    as the original master file rather than BD's re-encoded edge
-    rendition (which scores measurably lower with Claude — see
-    log.md 2026-05-01 BD-vs-direct accuracy investigation).
-    """
-    try:
-        async with httpx.AsyncClient(timeout=timeout, headers=_DOWNLOAD_HEADERS) as client:
-            response = await client.get(url, follow_redirects=True)
-            response.raise_for_status()
-            if not _is_valid_image(response.content):
-                log.debug(
-                    "Direct image probe returned non-image content (%d bytes): %s",
-                    len(response.content), _shorten_url_for_log(url),
-                )
-                return None
-            return response.content
-    except Exception as e:
-        log.debug(
-            "Direct image probe failed (%s) for %s — will fall back",
-            type(e).__name__, _shorten_url_for_log(url),
-        )
-        return None
 
 
 async def download_image(url: str) -> bytes:
     """Download image from URL with caching, timeout, and error handling.
 
-    Routing rules:
-      * ``data:`` URIs are decoded inline (no network).
-      * Hosts that have been successfully unlocked by Bright Data this
-        process (see ``unlocker_service.host_needs_unlocker``) FIRST
-        try a short direct httpx fetch. Empirically, even on
-        WAF-protected dealer hosts the static-asset path
-        (``/content/dam/...``, ``/sites/.../files/...``) is often
-        served from a public CDN edge that has no WAF — direct fetch
-        wins us the original master image bytes, which Claude scores
-        much higher than BD's re-encoded edge rendition. If the
-        direct probe fails (timeout, 4xx, garbage), we fall back to
-        Bright Data exactly like before.
-      * Everything else falls through to a direct httpx.get() with
-        Chrome-equivalent headers.
-
-    Results are cached in-memory so the same URL is only fetched once
-    per worker lifetime (or until the LRU evicts it).
+    Results are cached in-memory so the same URL is only fetched once per
+    server lifetime (or until the LRU evicts it).
     """
     if url.startswith("data:"):
         try:
@@ -274,49 +140,7 @@ async def download_image(url: str) -> bytes:
     if cached is not None:
         return cached
 
-    # Late import to avoid a circular dep at module load time
-    # (unlocker_service imports nothing from ai_service today, so this
-    # is defensive — but unlocker → ai_service.download_image for
-    # campaign-asset crops *is* a real path, so keep the lazy import).
-    from . import unlocker_service
-
-    # Phase 6.5.9: BD asset-fetch is now opt-in. The
-    # `host_needs_unlocker` set was the silent regression — once a host
-    # was BD-unlocked once, every later asset URL on that host went via
-    # BD, which re-encodes at the edge and drags match scores down.
-    # When the flag is False (the default after 6.5.9) we always fetch
-    # asset/discovered-image bytes directly, regardless of the host's
-    # render strategy. The rendering ladder still uses BD for HTML —
-    # this only affects the per-image byte fetch step.
-    asset_fetch_enabled = getattr(settings, "unlocker_asset_fetch_enabled", False)
-    if asset_fetch_enabled and unlocker_service.host_needs_unlocker(url):
-        # Try direct first — see _try_direct_image_fetch docstring for
-        # why this matters for match accuracy.
-        direct_body = await _try_direct_image_fetch(url)
-        if direct_body is not None:
-            log.debug(
-                "Unlocked-host image came back via direct fetch (%d bytes) — preferring over BD",
-                len(direct_body),
-            )
-            _image_cache.put(url, direct_body)
-            return direct_body
-
-        body = await unlocker_service.download_via_unlocker(url)
-        if body is None:
-            log.warning(
-                "Unlocker download returned None for %s — falling back to direct fetch",
-                url[:100],
-            )
-        else:
-            if not _is_valid_image(body):
-                raise ValueError(
-                    f"Unlocker returned non-image content "
-                    f"({len(body)} bytes): {url[:100]}"
-                )
-            _image_cache.put(url, body)
-            return body
-
-    async with httpx.AsyncClient(timeout=30.0, headers=_DOWNLOAD_HEADERS) as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             response = await client.get(url, follow_redirects=True)
             response.raise_for_status()
@@ -1206,30 +1030,6 @@ async def filter_image(
         )
 
 
-def _classify_claude_error(exc: BaseException) -> str:
-    """Bucket Claude failure modes so the funnel can show *why* a
-    comparison returned 0, not just that it did.
-
-    Distinguishing rate-limit / timeout / decode failures from "Claude
-    actually evaluated this and said no" is the whole point of the
-    `claude_error` funnel stage — without classification the operator
-    can't tell whether a low match rate means a real visual mismatch
-    or that the BD-driven traffic spike is melting the Anthropic quota.
-    """
-    msg = str(exc).lower()
-    if "rate" in msg or "429" in msg or "quota" in msg:
-        return "rate_limit"
-    if "timeout" in msg or "timed out" in msg:
-        return "timeout"
-    if "overload" in msg or "503" in msg or "unavailable" in msg:
-        return "overloaded"
-    if "json" in msg or "decode" in msg or "parse" in msg:
-        return "json_parse"
-    if "connection" in msg or "network" in msg:
-        return "network"
-    return "other"
-
-
 async def compare_images(
     source_image_url: str,
     target_image_url: str
@@ -1237,11 +1037,6 @@ async def compare_images(
     """
     Compare two images for similarity and modifications.
     Uses Claude Opus 4.5 for accurate comparison.
-
-    On ANY failure path the returned dict carries an ``error`` string
-    AND an ``error_kind`` discriminator so the pipeline funnel can
-    bucket the call as a distinct ``claude_error`` outcome instead of
-    a silent below-threshold zero.
     """
     try:
         source_bytes = await download_image(source_image_url)
@@ -1258,40 +1053,22 @@ async def compare_images(
                 "is_match": False,
                 "match_type": "none",
                 "modifications": [],
-                "error": f"{failed} image failed validation",
-                "error_kind": "image_optimize",
+                "error": f"{failed} image failed validation"
             }
         
         prompt = get_comparison_prompt()
         
         response_text = await call_anthropic_with_retry(prompt, [source_bytes, target_bytes], model=ENSEMBLE_MODEL)
-        try:
-            parsed = extract_json_from_response(response_text)
-        except Exception as parse_err:
-            log.warning("Claude response JSON parse failed: %s", parse_err)
-            return {
-                "similarity_score": 0,
-                "is_match": False,
-                "match_type": "none",
-                "modifications": [],
-                "error": f"json_parse: {parse_err}",
-                "error_kind": "json_parse",
-            }
-        # Normal success path — make sure callers can rely on the
-        # error_kind key being present (None == "no error").
-        parsed.setdefault("error_kind", None)
-        return parsed
+        return extract_json_from_response(response_text)
         
     except Exception as e:
-        kind = _classify_claude_error(e)
-        log.error("Comparison error (%s): %s", kind, e)
+        log.error("Comparison error: %s", e)
         return {
             "similarity_score": 0,
             "is_match": False,
             "match_type": "none",
             "modifications": [],
-            "error": str(e),
-            "error_kind": kind,
+            "error": str(e)
         }
 
 
@@ -1321,8 +1098,7 @@ async def detect_asset_in_screenshot(
             return {
                 "asset_found": False, "similarity_score": 0,
                 "is_match": False, "match_type": "none",
-                "modifications": [], "error": "Asset image failed validation",
-                "error_kind": "image_optimize",
+                "modifications": [], "error": "Asset image failed validation"
             }
 
         if settings.enable_tiling_fallback:
@@ -1331,16 +1107,14 @@ async def detect_asset_in_screenshot(
             return await _detect_asset_single(asset_bytes, screenshot_bytes)
 
     except Exception as e:
-        kind = _classify_claude_error(e)
-        log.error("Error detecting asset (%s): %s", kind, e, exc_info=True)
+        log.error("Error detecting asset: %s", e, exc_info=True)
         return {
             "asset_found": False,
             "similarity_score": 0,
             "is_match": False,
             "match_type": "none",
             "modifications": [],
-            "error": str(e),
-            "error_kind": kind,
+            "error": str(e)
         }
 
 
@@ -1499,49 +1273,13 @@ async def verify_borderline_match(
         gates_passed = result.get("gates_passed", 0)
         gate_brand = result.get("gate_brand", False)
         gate_product = result.get("gate_product", False)
-        gate_message = result.get("gate_message", False)
-        gate_offer = result.get("gate_offer", False)
-        gate_design = result.get("gate_design", False)
 
-        # Phase 6.5.10 — stricter gate rule and continuous scoring.
-        #
-        # Old rule was `is_match AND brand AND product AND gates_passed >= 3`,
-        # which let a creative through on `brand + product + ANY one of
-        # message/offer/design`. With five gates total, "3 of 5" is too
-        # permissive — a navigation-tile ghost crop that happened to share
-        # the dealer's logo and a vaguely-similar product silhouette would
-        # clear the bar. Tightened to `>= 4` so the matcher demands
-        # substantial agreement: brand + product + AT LEAST TWO OF the
-        # message/offer/design gates.
-        #
-        # Old scoring was `gates_passed * 20` which produces only the
-        # discrete buckets {60, 80, 100}. Two visually-very-different
-        # crops both passing 4 gates registered as identical 80% scores,
-        # which made the dashboard's borderline-band useless and made
-        # manual triage impossible. New scoring is a weighted sum that
-        # respects which gates carry signal, then capped by the original
-        # comparison score so verification can REDUCE confidence but
-        # never inflate it above what compare_images saw.
-        is_match = (
-            result.get("is_match", False)
-            and gate_brand
-            and gate_product
-            and gates_passed >= 4
-        )
+        is_match = result.get("is_match", False) and gate_brand and gate_product and gates_passed >= 3
 
-        weighted_gate_score = (
-            (25 if gate_brand else 0)
-            + (25 if gate_product else 0)
-            + (20 if gate_design else 0)
-            + (15 if gate_message else 0)
-            + (15 if gate_offer else 0)
-        )
-        verified_score = min(initial_score, weighted_gate_score)
+        verified_score = gates_passed * 20
 
-        log.debug("Verification complete: gates_passed=%d, weighted=%d, capped=%d, is_match=%s",
-                  gates_passed, weighted_gate_score, verified_score, is_match)
-        log.debug("Gates: brand=%s, product=%s, message=%s, offer=%s, design=%s",
-                  gate_brand, gate_product, gate_message, gate_offer, gate_design)
+        log.debug("Verification complete: gates_passed=%d, is_match=%s", gates_passed, is_match)
+        log.debug("Gates: brand=%s, product=%s, message=%s, offer=%s, design=%s", gate_brand, gate_product, result.get('gate_message'), result.get('gate_offer'), result.get('gate_design'))
 
         return {
             "verified_score": verified_score,
@@ -1549,12 +1287,11 @@ async def verify_borderline_match(
             "gates": {
                 "brand": gate_brand,
                 "product": gate_product,
-                "message": gate_message,
-                "offer": gate_offer,
-                "design": gate_design,
+                "message": result.get("gate_message", False),
+                "offer": result.get("gate_offer", False),
+                "design": result.get("gate_design", False),
             },
             "gates_passed": gates_passed,
-            "weighted_gate_score": weighted_gate_score,
             "verdict": result.get("verdict", ""),
         }
         
@@ -1631,8 +1368,7 @@ ZOMBIE AD CHECK:
             brand_elements=result.get("brand_elements", {}),
             zombie_ad=result.get("zombie_ad", False),
             zombie_days=None,
-            analysis_summary=result.get("analysis_summary", ""),
-            asset_visible=bool(result.get("asset_visible", True)),
+            analysis_summary=result.get("analysis_summary", "")
         )
         
     except Exception as e:
@@ -1660,18 +1396,14 @@ async def ensemble_match(
     - Perceptual hashing (fast pre-filter)
     """
     log.info("Starting ensemble match")
-
+    
     # Run methods in parallel
     if is_screenshot:
         # For screenshots, only run detection — perceptual hashing the whole
         # page against a small asset is meaningless and drags down scores.
         detection_result = await detect_asset_in_screenshot(asset_url, discovered_url)
         if isinstance(detection_result, Exception):
-            detection_result = {
-                "similarity_score": 0, "asset_found": False,
-                "error": str(detection_result),
-                "error_kind": _classify_claude_error(detection_result),
-            }
+            detection_result = {"similarity_score": 0, "asset_found": False}
         hash_result = {"similarity_score": 0}
         visual_result = {"similarity_score": 0}
 
@@ -1681,14 +1413,7 @@ async def ensemble_match(
             compare_with_hash(asset_url, discovered_url),
             return_exceptions=True
         )
-        if isinstance(results[0], Exception):
-            visual_result = {
-                "similarity_score": 0,
-                "error": str(results[0]),
-                "error_kind": _classify_claude_error(results[0]),
-            }
-        else:
-            visual_result = results[0]
+        visual_result = results[0] if not isinstance(results[0], Exception) else {"similarity_score": 0}
         hash_result = results[1] if not isinstance(results[1], Exception) else {"similarity_score": 0}
         detection_result = {"similarity_score": 0, "asset_found": False}
     
@@ -1742,23 +1467,7 @@ async def ensemble_match(
     
     log.debug("Ensemble scores - Visual: %d, Detection: %d, Hash: %d", visual_score, detection_score, hash_score)
     log.debug("Ensemble final: %.1f, Match: %s, Type: %s", final_score, is_match, match_type)
-
-    # Surface the AI-side error kind (rate-limit, timeout, json-parse,
-    # …) up to ``process_discovered_image`` so the funnel can report
-    # it as a distinct outcome. Hash-only failures are tracked
-    # implicitly by hash_score==0 and don't get an error_kind because
-    # hashing is local-only (any failure is a real visual mismatch).
-    visual_error_kind = visual_result.get("error_kind")
-    detection_error_kind = detection_result.get("error_kind")
-    # When BOTH AI rungs that ran for this asset errored we know the
-    # final_score=0 result is a Claude failure, not a real verdict.
-    # For screenshots only detection runs; for regular images only
-    # the visual rung runs (hash is local), so a single rung is
-    # the full AI verdict.
-    ai_error_kind = (
-        detection_error_kind if is_screenshot else visual_error_kind
-    )
-
+    
     return {
         "similarity_score": round(final_score),
         "is_match": is_match,
@@ -1770,9 +1479,7 @@ async def ensemble_match(
             "hash": hash_score
         },
         "modifications": visual_result.get("modifications", []) or detection_result.get("modifications", []),
-        "analysis": visual_result.get("analysis", "") or detection_result.get("analysis", ""),
-        "error_kind": ai_error_kind,
-        "error": visual_result.get("error") or detection_result.get("error"),
+        "analysis": visual_result.get("analysis", "") or detection_result.get("analysis", "")
     }
 
 
@@ -1857,34 +1564,11 @@ async def _passes_hash_prefilter(
     asset_hashes_cache: List[Dict[str, Any]],
 ) -> bool:
     """
-    Stage 1 pre-filter: check if the image has perceptual hash
+    Stage 1 pre-filter: check if the image has ANY perceptual hash
     resemblance to at least one campaign asset.
 
     Returns True if the image should continue to the next stage.
     This is free and instant (~0.5ms per comparison).
-
-    Phase 6.5.10 — stricter "both reliable hashes must agree" rule.
-    The previous rule averaged Hamming distance across phash, dhash,
-    whash, and average_hash, then admitted on `mean <= 28`. Two
-    problems with that:
-
-    1. ``whash`` (wavelet) and ``average_hash`` (coarse luma bucket)
-       are noisier than phash/dhash on dealer-site UI elements that
-       share a colour palette but not a layout — a navigation tile
-       could score "similar" on whash by colour-coincidence and
-       drag the mean below the 28 threshold even when phash/dhash
-       firmly disagreed.
-    2. The mean smears the contribution of every hash, so a strong
-       disagreement on one reliable signal got cancelled by a weak
-       agreement on an unreliable one.
-
-    New rule: ``max(phash_diff, dhash_diff) <= threshold`` against
-    any single asset. This requires BOTH of the two reliable hashes
-    to think the image is similar — the "worse of the reliable two
-    must still be ≤ threshold" reading. ``whash`` and
-    ``average_hash`` are kept on the dict for diagnostics but no
-    longer drive admission. Threshold semantics are unchanged so the
-    operator-tunable env var continues to map intuitively.
     """
     img_hashes = await compute_image_hashes(image_bytes)
     if img_hashes is None:
@@ -1893,11 +1577,14 @@ async def _passes_hash_prefilter(
     threshold = settings.hash_prefilter_max_diff
 
     for asset_h in asset_hashes_cache:
-        phash_diff = img_hashes["phash"] - asset_h["phash"]
-        dhash_diff = img_hashes["dhash"] - asset_h["dhash"]
-        # Both reliable hashes must independently agree — the WORSE
-        # of the two (max distance) is the gate.
-        if max(phash_diff, dhash_diff) <= threshold:
+        diffs = [
+            img_hashes["phash"] - asset_h["phash"],
+            img_hashes["dhash"] - asset_h["dhash"],
+            img_hashes["whash"] - asset_h["whash"],
+            img_hashes["average_hash"] - asset_h["average_hash"],
+        ]
+        avg_diff = sum(diffs) / 4
+        if avg_diff <= threshold:
             return True
 
     return False
@@ -1978,42 +1665,16 @@ async def process_discovered_image(
     """
     Full processing pipeline for a discovered image.
 
-    Returns ``(result_dict, stage, diagnostics)`` where ``stage``
-    indicates the last pipeline stage reached and ``diagnostics`` is
-    a dict the caller can persist on the discovered_images row to
-    explain *why* the image did or didn't match without re-running
-    the pipeline.
-
-    When no match is found ``result_dict`` is None but ``diagnostics``
-    still carries the best ensemble score, the asset that produced it,
-    the active threshold, and any Claude error kinds encountered. This
-    is critical for distinguishing "Claude said no" (real visual
-    mismatch) from "Claude crashed" (rate-limit / timeout collateral
-    damage from Bright Data-driven traffic spikes), which used to
-    look identical in the funnel.
+    Returns (result_dict, stage) where stage indicates the last pipeline
+    stage reached.  When no match is found result_dict is None.
 
     Stages: "download_failed", "hash_rejected", "clip_rejected",
             "filter_rejected", "below_threshold", "verification_rejected",
-            "claude_error", "matched"
+            "matched"
     """
-    log.info("Processing image: %s", _shorten_url_for_log(image_url))
+    log.info("Processing image: %s", image_url[:80])
     log.debug("Source type: %s", source_type or "not specified")
-
-    # Diagnostics is mutated as the image traverses the pipeline so
-    # that the early-exit branches (download_failed, hash_rejected,
-    # clip_rejected, filter_rejected) still return the partial signal
-    # they collected. The caller persists this onto discovered_images
-    # so Phase 7 can root-cause without re-running.
-    diagnostics: Dict[str, Any] = {
-        "best_score": 0,
-        "best_asset_id": None,
-        "threshold": None,
-        "claude_error_kinds": [],   # one entry per asset comparison that errored
-        "had_claude_error": False,
-        "all_comparisons_errored": False,
-        "comparisons_run": 0,
-    }
-
+    
     # Determine if this is a screenshot — ONLY trust the explicit source_type flag.
     # URL-based checks matched the Supabase bucket name ("scan-screenshots")
     # and caused every stored image to bypass all pre-filters.
@@ -2025,34 +1686,32 @@ async def process_discovered_image(
             image_bytes_for_prefilter = await download_image(image_url)
         except Exception as e:
             log.warning("Could not download image for pre-filter: %s", e)
-            diagnostics["download_error"] = str(e)[:200]
-            return None, "download_failed", diagnostics
+            return None, "download_failed"
 
         # Stage 1: Hash pre-filter
         if asset_hashes_cache:
             passes_hash = await _passes_hash_prefilter(image_bytes_for_prefilter, asset_hashes_cache)
             if not passes_hash:
                 log.debug("REJECTED by hash pre-filter (no asset resemblance)")
-                return None, "hash_rejected", diagnostics
+                return None, "hash_rejected"
 
         # Stage 2: CLIP embedding pre-filter
         if asset_embeddings_cache:
             passes_clip = await _passes_clip_prefilter(image_bytes_for_prefilter, asset_embeddings_cache)
             if not passes_clip:
                 log.debug("REJECTED by CLIP pre-filter (low semantic similarity)")
-                return None, "clip_rejected", diagnostics
-
+                return None, "clip_rejected"
+    
     # Get adaptive threshold for this source/channel
     adaptive_threshold, threshold_meta = await get_adaptive_threshold(
         source_type or ("page_screenshot" if is_screenshot else "website_banner"),
         channel or "website"
     )
-    diagnostics["threshold"] = adaptive_threshold
-
+    
     log.debug("Using adaptive threshold: %d (Confidence: %s)", adaptive_threshold, threshold_meta['confidence'])
-
+    
     log.debug("Image type: %s", "SCREENSHOT" if is_screenshot else "regular image")
-
+    
     # Stage 3: Claude Haiku relevance filter (skip for screenshots)
     if is_screenshot:
         log.debug("Stage 3: skipping filter for screenshot")
@@ -2066,65 +1725,42 @@ async def process_discovered_image(
         asset_urls = [a["file_url"] for a in campaign_assets if a.get("file_url")] or None
         filter_result = await filter_image(image_url, asset_urls=asset_urls)
         log.debug("Filter: is_relevant=%s, confidence=%.2f", filter_result.is_relevant, filter_result.confidence)
-
+        
         if not filter_result.is_relevant:
             log.debug("Image filtered out as not relevant")
-            return None, "filter_rejected", diagnostics
-
+            return None, "filter_rejected"
+    
     # Stage 4: Ensemble matching against each asset (Claude Opus)
     log.debug("Stage 4: ensemble matching against %d assets", len(campaign_assets))
     best_match = None
     best_score = 0
-
+    
     for asset in campaign_assets:
         log.debug("Comparing with asset: %s", asset.get('name', asset['id']))
-
+        
         comparison = await ensemble_match(
             asset["file_url"],
             image_url,
             is_screenshot=is_screenshot
         )
-
-        diagnostics["comparisons_run"] += 1
-        err_kind = comparison.get("error_kind")
-        if err_kind:
-            diagnostics["claude_error_kinds"].append(err_kind)
-            diagnostics["had_claude_error"] = True
-
+        
         score = comparison.get("similarity_score", 0)
-
+        
         log.debug("Ensemble score: %d", score)
-
+        
         if score > best_score:
             best_score = score
             best_match = {"asset": asset, "comparison": comparison}
-
-    diagnostics["best_score"] = best_score
-    if best_match:
-        diagnostics["best_asset_id"] = str(best_match["asset"].get("id"))
-    # When EVERY ensemble call errored AND the resulting best score
-    # is zero we have no real Claude verdict to act on — bucket as
-    # claude_error so the funnel surfaces it instead of attributing
-    # the zero to "Claude said it's not a match".
-    if (
-        diagnostics["comparisons_run"] > 0
-        and len(diagnostics["claude_error_kinds"]) == diagnostics["comparisons_run"]
-    ):
-        diagnostics["all_comparisons_errored"] = True
-
+    
     threshold = adaptive_threshold
-
+    
     if not best_match:
         log.info("No match found")
-        if diagnostics["all_comparisons_errored"]:
-            return None, "claude_error", diagnostics
-        return None, "below_threshold", diagnostics
-
+        return None, "below_threshold"
+    
     if best_score < threshold:
         log.debug("Best score %d below threshold %d — rejected", best_score, threshold)
-        if diagnostics["all_comparisons_errored"]:
-            return None, "claude_error", diagnostics
-        return None, "below_threshold", diagnostics
+        return None, "below_threshold"
     
     # Verify borderline matches
     needs_verification = await should_verify_match(
@@ -2143,10 +1779,9 @@ async def process_discovered_image(
         
         if not verification.get("is_match", False):
             log.debug("Verification rejected match")
-            return None, "verification_rejected", diagnostics
+            return None, "verification_rejected"
         
         best_score = verification.get("verified_score", best_score)
-        diagnostics["best_score"] = best_score
         log.debug("Verification passed with score: %d", best_score)
     
     # Apply confidence calibration
@@ -2161,38 +1796,9 @@ async def process_discovered_image(
         brand_rules,
         best_match["asset"].get("campaign_end_date")
     )
-
-    # Phase 6.5.10 — final asset-visibility gate.
-    #
-    # Until 6.5.10, ``analyze_compliance`` ran AFTER the match score
-    # was finalised, so a Claude verdict of "the campaign creative is
-    # not actually present in this image" still produced a recorded
-    # match (just one with `compliance.is_compliant=False` and a
-    # confused `analysis_summary`). The dashboard then showed a
-    # high-confidence match against a navigation tile or a stock
-    # photo, which was the most user-visible failure mode of the
-    # matching regression.
-    #
-    # The compliance prompt has always asked Claude for an
-    # ``asset_visible`` boolean — we just weren't reading it. With it
-    # plumbed through ``ComplianceCheckResult`` we can now make this
-    # the authoritative final gate: if Claude says the asset isn't
-    # actually visible, drop the match outright. The compare_images
-    # and verify_borderline_match calls already happened, so we've
-    # paid the upstream Claude cost — but we won't pay the worse
-    # cost of a bad match in the dashboard.
-    if not compliance.asset_visible:
-        log.info(
-            "Match rejected by asset-visibility gate: compliance reports "
-            "creative not actually present (calibrated_score=%d, summary=%r)",
-            calibrated_score,
-            (compliance.analysis_summary or "")[:120],
-        )
-        diagnostics["best_score"] = calibrated_score
-        return None, "compliance_asset_not_visible", diagnostics
-
+    
     match_type = _get_match_type_from_score(calibrated_score)
-
+    
     log.info("Final: %s match, score %d, compliant=%s", match_type, calibrated_score, compliance.is_compliant)
     
     return {
@@ -2219,7 +1825,7 @@ async def process_discovered_image(
             "ensemble_scores": best_match["comparison"].get("method_scores", {}),
             "calibration_applied": best_score != calibrated_score
         }
-    }, "matched", diagnostics
+    }, "matched"
 
 
 async def process_images_batch(
@@ -2265,7 +1871,7 @@ async def process_images_batch(
         for j, result in enumerate(batch_results):
             if isinstance(result, Exception):
                 log.error("Error processing image in batch: %s", result)
-                results.append((None, "error", {"crash_error": str(result)[:200]}))
+                results.append((None, "error"))
             else:
                 results.append(result)
         

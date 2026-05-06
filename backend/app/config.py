@@ -17,13 +17,9 @@ class Settings(BaseSettings):
     # Anthropic AI (Claude for all image analysis)
     anthropic_api_key: str
     
-    # Bright Data Web Unlocker — used as the WAF-bypass rung in
-    # render_strategies. Replaced ScreenshotOne in Phase 6.5; see
-    # services/unlocker_service.py for the integration. Empty values
-    # are tolerated (the smoke test in main.py disables the rung at
-    # boot) so local dev without a BD account still works.
-    brightdata_api_token: str = ""
-    brightdata_unlocker_zone: str = ""
+    # ScreenshotOne (website & ad page capture)
+    screenshotone_access_key: str
+    screenshotone_secret_key: str = ""
     
     # SerpApi (Google Ads Transparency Center)
     serpapi_api_key: str = ""
@@ -139,91 +135,11 @@ class Settings(BaseSettings):
     enable_tiling_fallback: bool = Field(default=True, description="Tile screenshots when extraction fails")
     tile_height: int = Field(default=1080, description="Height of each screenshot tile in pixels")
     tile_overlap: int = Field(default=200, description="Overlap between adjacent tiles in pixels")
-
-    # ===========================================
-    # Phase 6.5.8 — Evidence-screenshot RSS hardening
-    # ===========================================
-    # The 2026-05-05 OOM-during-page-9 incident traced to a single
-    # full-page PNG screenshot held in RSS alongside Playwright +
-    # CLIP + an in-flight Supabase Storage upload. These knobs cut
-    # peak RSS at the screenshot step by ~80–90%:
-    #
-    # - JPEG instead of PNG cuts the byte budget per shot 5–10×
-    #   without affecting the CV matcher (`cv_matching` uses
-    #   cv2.imdecode, OpenCV is format-agnostic) or the audit-trail
-    #   value (operators view the screenshot as a thumbnail).
-    # - The full-page height cap stops AEM-style 30000-px landing
-    #   pages from producing 50+ MB shots that would never fit in
-    #   the worker's RSS budget. The cap is generous (most useful
-    #   creative is in the first 6000 px); tall pages are clipped
-    #   from the top down with a metadata flag noting the truncation.
-    # - The screenshot-concurrency semaphore is independent of
-    #   `max_concurrent_dealers`. Even with 4-way dealer parallelism,
-    #   only N screenshot+upload pairs are hot in RSS at once. The
-    #   default of 2 keeps worst-case concurrent screenshot RSS at
-    #   ~2 × MAX_JPEG_SIZE ≈ a few MB, vs. the pre-fix worst case of
-    #   4 × MAX_PNG_SIZE ≈ tens of MB.
-    evidence_screenshot_format: str = Field(default="jpeg", description="Evidence screenshot format: 'jpeg' (RSS-cheap, default) or 'png' (lossless)")
-    evidence_screenshot_quality: int = Field(default=82, description="JPEG quality 1-95 — only used when format is 'jpeg'. 82 is visually lossless for thumbnail audit use.")
-    max_screenshot_height: int = Field(default=12000, description="Maximum page height (px) to capture in a single full-page screenshot. Pages taller than this are clipped from y=0 down so the screenshot never exceeds RSS budget.")
-    max_concurrent_screenshots: int = Field(default=2, description="Max in-flight page.screenshot+upload pairs across the whole worker. Independent of max_concurrent_dealers.")
-    # When Playwright is consistently blocked (anti-bot WAF), the
-    # render_strategies ladder escalates to Bright Data Web Unlocker
-    # (configured above). This flag is the master kill-switch; flip it
-    # off only if BD billing is in dispute and you want every scan to
-    # stop at Playwright. host_policy_service.preflight_probe still
-    # picks unlocker strategies but the rung will short-circuit and
-    # return OUTCOME_BLOCKED (no API call made).
-    unlocker_fallback_enabled: bool = Field(default=True, description="Use Bright Data Web Unlocker to render pages that Playwright cannot load")
-
-    # ===========================================
-    # Phase 6.5.9 — Bright Data scope tightening
-    # ===========================================
-    # Phase 6.5 → 6.5.6 expanded BD beyond the rendering ladder:
-    #
-    #   * `_crawl_homepage_links_via_unlocker` calls BD whenever the
-    #     direct homepage crawl returns ≤1 link (a noisy trigger that
-    #     fires on lots of healthy JS-heavy dealer sites).
-    #   * `download_image` routes asset/discovered-image fetches via BD
-    #     for any host that's ever been BD-unlocked in this worker
-    #     process. Once the per-process `_unlocked_hosts` set marks a
-    #     host, every later asset URL on that host gets the BD detour
-    #     for the worker's lifetime — even after the host's render
-    #     strategy is demoted back to playwright_desktop.
-    #
-    # Both expansions degrade match accuracy because BD's edge-rendered
-    # images are JPEG re-encodes of the master, scoring measurably lower
-    # against the approved asset (see log.md 2026-05-01 BD-vs-direct
-    # accuracy note) — and they fire even on hosts where Playwright is
-    # working fine. These two flags scope BD back to "fallback when the
-    # rendering ladder hits its unlocker rung", which is the explicit
-    # intent of the ladder design.
-    #
-    # Defaults flipped to False in 6.5.9. Operators with a BD-dependent
-    # host fleet can flip them back on per-tenant via env vars if
-    # needed; the master `unlocker_fallback_enabled` knob continues to
-    # control the ladder's BD rung.
-    unlocker_asset_fetch_enabled: bool = Field(
-        default=False,
-        description=(
-            "Route asset/discovered-image downloads through Bright Data on hosts "
-            "that have been BD-unlocked this worker. Default OFF — BD edge "
-            "re-encodes images and degrades match scores. When OFF, asset fetches "
-            "always go direct, which fails on a small set of WAF-protected "
-            "asset CDNs but produces master-quality bytes everywhere else."
-        ),
-    )
-    unlocker_discovery_enabled: bool = Field(
-        default=False,
-        description=(
-            "Use Bright Data to crawl the homepage for sub-page links when the "
-            "direct crawl returns ≤1 link or the host is on a WAF-grade strategy. "
-            "Default OFF — the trigger is too noisy and silently expands BD usage "
-            "to healthy hosts. When OFF, page discovery uses sitemap + direct "
-            "crawl only; pages found via the rendering ladder's BD rung are "
-            "unaffected."
-        ),
-    )
+    # When Playwright is consistently blocked (anti-bot WAF), fall back to
+    # ScreenshotOne's hosted renderer so the user at least has visual
+    # evidence and the page is counted as "blocked, captured externally"
+    # rather than silently lost.
+    screenshotone_fallback_enabled: bool = Field(default=True, description="Use ScreenshotOne to capture pages that Playwright cannot load")
     
     # Page Discovery
     enable_page_discovery: bool = Field(default=True, description="Auto-discover subpages on dealer sites")

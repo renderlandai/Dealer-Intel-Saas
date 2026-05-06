@@ -717,11 +717,6 @@ export const retryScan = async (jobId: string): Promise<ScanJob> => {
   return data;
 };
 
-export const cancelScan = async (jobId: string): Promise<ScanJob> => {
-  const { data } = await api.post(`/scans/${jobId}/cancel`);
-  return data;
-};
-
 export const startBatchScan = async (): Promise<ScanJob[]> => {
   const { data } = await api.post("/scans/batch");
   return data;

@@ -1,14 +1,9 @@
 """Per-scan vendor cost tracking.
 
 A `ScanCostTracker` accumulates line items for every paid API call made
-during a scan (Anthropic, Apify, SerpApi, Bright Data Web Unlocker). At
-the end of the scan, the tracker is serialized into ``scan_jobs.cost_usd``
-and ``scan_jobs.cost_breakdown`` (and also nested under
-``pipeline_stats.cost``).
-
-The historical ``screenshotone`` vendor key may still appear in old
-``cost_breakdown`` JSONB rows from scans that ran before Phase 6.5; the
-frontend keeps a label for it but no new code path writes that vendor.
+during a scan (Anthropic, Apify, SerpApi, ScreenshotOne).  At the end of
+the scan, the tracker is serialized into ``scan_jobs.cost_usd`` and
+``scan_jobs.cost_breakdown`` (and also nested under ``pipeline_stats.cost``).
 
 The tracker is exposed via a :class:`contextvars.ContextVar` so any
 service module deep in the call stack can record usage without having
@@ -65,12 +60,10 @@ ANTHROPIC_CACHE_READ_MULTIPLIER = 0.10
 # writing.  Override via SERPAPI_COST_PER_REQUEST_USD env var if needed.
 SERPAPI_DEFAULT_COST_PER_REQUEST_USD = 0.005
 
-# Bright Data Web Unlocker — per *successful* unlock. Pay-as-you-go is
-# $1.50 per 1k results = $0.0015/req. The volume tiers (380k/900k/2M
-# bundles) drop this to ~$0.001 but few orgs will hit those at our scan
-# volumes. Override via BRIGHTDATA_UNLOCKER_COST_PER_REQUEST_USD if you
-# move to a bundled plan or negotiate a custom rate.
-BRIGHTDATA_UNLOCKER_DEFAULT_COST_PER_REQUEST_USD = 0.0015
+# ScreenshotOne — per render.  Pay-as-you-go is ~$0.002/screenshot for
+# 1080p; full-page retina (what we use) is closer to $0.004.  We default
+# to the higher value so estimates are conservative.
+SCREENSHOTONE_DEFAULT_COST_PER_RENDER_USD = 0.004
 
 
 def _pricing_from_env() -> Dict[str, float]:
@@ -79,13 +72,13 @@ def _pricing_from_env() -> Dict[str, float]:
 
     out: Dict[str, float] = {
         "serpapi_per_request": SERPAPI_DEFAULT_COST_PER_REQUEST_USD,
-        "brightdata_unlocker_per_request": BRIGHTDATA_UNLOCKER_DEFAULT_COST_PER_REQUEST_USD,
+        "screenshotone_per_render": SCREENSHOTONE_DEFAULT_COST_PER_RENDER_USD,
     }
     try:
         if v := os.getenv("SERPAPI_COST_PER_REQUEST_USD"):
             out["serpapi_per_request"] = float(v)
-        if v := os.getenv("BRIGHTDATA_UNLOCKER_COST_PER_REQUEST_USD"):
-            out["brightdata_unlocker_per_request"] = float(v)
+        if v := os.getenv("SCREENSHOTONE_COST_PER_RENDER_USD"):
+            out["screenshotone_per_render"] = float(v)
     except ValueError:
         log.warning("Invalid pricing override env var — using defaults")
     return out
@@ -256,31 +249,17 @@ class ScanCostTracker:
         ))
         return cost
 
-    def record_unlocker(
-        self,
-        requests: int = 1,
-        target: Optional[str] = None,
-        succeeded: bool = True,
-    ) -> float:
-        """Record one Bright Data Web Unlocker request.
-
-        Bright Data only bills *successful* unlocks. We pass
-        ``succeeded`` so a 4xx / network error contributes a $0 line
-        item — useful for the operator audit but never charged.
-        """
-        rate = self._pricing["brightdata_unlocker_per_request"] if succeeded else 0.0
-        cost = round(rate * requests, 6)
-        meta: Dict[str, Any] = {"succeeded": bool(succeeded)}
-        if target:
-            meta["target"] = target[:200]
+    def record_screenshotone(self, renders: int = 1, target: Optional[str] = None) -> float:
+        rate = self._pricing["screenshotone_per_render"]
+        cost = round(rate * renders, 6)
         self._items.append(_LineItem(
-            vendor="brightdata_unlocker",
-            op="unlock",
-            units=float(requests),
-            unit="request",
+            vendor="screenshotone",
+            op="capture",
+            units=float(renders),
+            unit="render",
             unit_cost_usd=rate,
             cost_usd=cost,
-            meta=meta,
+            meta={"target": target[:200]} if target else {},
         ))
         return cost
 
@@ -364,21 +343,14 @@ def record_serpapi(requests: int = 1, advertiser_id: Optional[str] = None) -> No
         log.warning("Cost record (serpapi) failed: %s", e)
 
 
-def record_unlocker(
-    requests: int = 1,
-    target: Optional[str] = None,
-    succeeded: bool = True,
-) -> None:
-    """Convenience: record one Bright Data Web Unlocker call on the
-    active tracker (no-op if no tracker is bound).
-    """
+def record_screenshotone(renders: int = 1, target: Optional[str] = None) -> None:
     t = _current.get()
     if t is None:
         return
     try:
-        t.record_unlocker(requests=requests, target=target, succeeded=succeeded)
+        t.record_screenshotone(renders=renders, target=target)
     except Exception as e:
-        log.warning("Cost record (brightdata_unlocker) failed: %s", e)
+        log.warning("Cost record (screenshotone) failed: %s", e)
 
 
 class scan_cost_context:

@@ -187,7 +187,7 @@ class TestRecordHostOutcomes:
                 "rent.cat.com": self._agg(blocked=3, last_block_reason="HTTP 403"),
             })
         assert promotions == [
-            ("rent.cat.com", "playwright_desktop", "playwright_mobile_first", "promoted"),
+            ("rent.cat.com", "playwright_desktop", "playwright_mobile_first"),
         ]
         upserted = table_mock.upsert.call_args[0][0]
         assert upserted["strategy"] == "playwright_mobile_first"
@@ -196,7 +196,7 @@ class TestRecordHostOutcomes:
 
     def test_success_resets_confidence_and_does_not_demote(self):
         mock, table_mock = _patched_supabase_with_existing_row(
-            self._row(strategy="unlocker_only", confidence=4, last_outcome="blocked"),
+            self._row(strategy="screenshotone_only", confidence=4, last_outcome="blocked"),
         )
         with patch("app.services.host_policy_service.supabase", mock):
             from app.services.host_policy_service import record_host_outcomes
@@ -205,7 +205,7 @@ class TestRecordHostOutcomes:
             })
         assert promotions == []
         upserted = table_mock.upsert.call_args[0][0]
-        assert upserted["strategy"] == "unlocker_only"   # not demoted
+        assert upserted["strategy"] == "screenshotone_only"   # not demoted
         assert upserted["confidence"] == 0
         assert upserted["last_outcome"] == "images"
 
@@ -278,7 +278,7 @@ class TestPreflightProbe:
         assert res.waf_vendor is None
         assert res.suggested_strategy == "playwright_desktop"
 
-    def test_403_with_akamai_header_suggests_unlocker_only(self):
+    def test_403_with_akamai_header_suggests_screenshotone_only(self):
         with patch(
             "app.services.host_policy_service.httpx.AsyncClient",
             _fake_async_client(403, {"server": "AkamaiGHost"}),
@@ -287,16 +287,16 @@ class TestPreflightProbe:
             res = _run(preflight_probe("https://rent.cat.com/dealer"))
         assert res.status == 403
         assert res.waf_vendor == "akamai"
-        assert res.suggested_strategy == "unlocker_only"
+        assert res.suggested_strategy == "screenshotone_only"
 
-    def test_429_suggests_playwright_then_unlocker(self):
+    def test_429_suggests_playwright_then_screenshotone(self):
         with patch(
             "app.services.host_policy_service.httpx.AsyncClient",
             _fake_async_client(429, {"server": "nginx"}),
         ):
             from app.services.host_policy_service import preflight_probe
             res = _run(preflight_probe("https://throttled.example.com"))
-        assert res.suggested_strategy == "playwright_then_unlocker"
+        assert res.suggested_strategy == "playwright_then_screenshotone"
 
     def test_connection_error_falls_through_to_safe_default(self):
         with patch(
@@ -325,5 +325,5 @@ class TestPreflightProbe:
             ):
                 res = _run(preflight_probe("https://flaky.example.com"))
         assert res.status is None
-        assert res.suggested_strategy == "playwright_then_unlocker"
+        assert res.suggested_strategy == "playwright_then_screenshotone"
         assert res.error is not None
