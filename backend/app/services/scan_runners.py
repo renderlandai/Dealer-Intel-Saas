@@ -562,13 +562,23 @@ async def _analyze_single_image(
     pipeline_stats: Dict[str, Any],
     match_buffer: Optional[MatchBuffer] = None,
     processed_buffer: Optional[ProcessedImageBuffer] = None,
-) -> Optional[str]:
+) -> Optional[Tuple[str, int]]:
     """Process one image through the AI pipeline and create/update match records.
 
     Mutates *pipeline_stats* in place.
-    Returns the matched asset_id (str) when a match is recorded, else None.
+    Returns ``(matched_asset_id, confidence_score)`` when a match is
+    recorded, else ``None``. Callers use the score to decide whether to
+    enter the page into the hot-page cache (only high-confidence matches
+    should self-perpetuate); both callers happily accept the tuple.
     """
     try:
+        # Surface the upstream extraction method so the AI pipeline
+        # can apply stricter pre-filters to CV-localized crops (which
+        # have already been geometrically pre-selected for asset-
+        # likeness and so need a higher bar at every subsequent stage).
+        meta = image.get("metadata") or {}
+        extraction_method = meta.get("extraction_method")
+
         result, stage = await ai_service.process_discovered_image(
             image["id"],
             image["image_url"],
@@ -578,6 +588,7 @@ async def _analyze_single_image(
             channel=image.get("channel"),
             asset_hashes_cache=asset_hashes,
             asset_embeddings_cache=asset_embeddings,
+            extraction_method=extraction_method,
         )
 
         if stage != "matched":
@@ -585,7 +596,10 @@ async def _analyze_single_image(
 
         matched_asset_id: Optional[str] = None
 
+        matched_confidence: int = 0
+
         if result:
+            matched_confidence = int(result.get("confidence_score") or 0)
             log.info(
                 "Match found for image %s — asset=%s confidence=%s%% type=%s compliance=%s",
                 image["id"], result["asset_id"], result["confidence_score"],
@@ -709,7 +723,9 @@ async def _analyze_single_image(
                 "is_processed": True
             }).eq("id", image["id"]).execute()
 
-        return matched_asset_id
+        if matched_asset_id is None:
+            return None
+        return (matched_asset_id, matched_confidence)
 
     except Exception as e:
         log.error("Error analyzing image %s: %s", image["id"], e, exc_info=True)
@@ -959,7 +975,7 @@ async def _process_one_page(
             if (img.get("metadata") or {}).get("capture_method") != "blocked_evidence"
         ]
 
-        async def _analyze_one(image_row: Dict[str, Any]) -> Optional[str]:
+        async def _analyze_one(image_row: Dict[str, Any]) -> Optional[Tuple[str, int]]:
             async with image_sem:
                 if early_stop_event.is_set():
                     return None
@@ -976,22 +992,43 @@ async def _process_one_page(
             *[_analyze_one(img) for img in candidates],
             return_exceptions=True,
         )
+
+        # Page-cache gating threshold. Pages whose only match is in the
+        # 60–79 borderline band MUST NOT enter the hot-page cache: that
+        # is exactly how a single false-positive scan self-perpetuates
+        # (cache hits replay the page, the matcher re-fires the false
+        # positive, the cache refreshes its `last_hit_at`, repeat
+        # forever). Only matches at strong-or-better feed the cache.
+        cache_threshold = max(
+            settings.strong_match_threshold,
+            settings.partial_match_threshold + 10,
+        )
+
+        page_cache_assets: set = set()
         for r in results:
             if isinstance(r, BaseException):
                 page_pipeline["errors"] += 1
                 continue
             if r:
-                page_matched_assets.add(r)
+                asset_id, conf = r
+                page_matched_assets.add(asset_id)
+                if conf >= cache_threshold:
+                    page_cache_assets.add(asset_id)
 
-        # Fold this page's matches into the global early-stop set.
+        # Fold this page's matches into the global early-stop set
+        # (early-stop uses ALL matches, not just cache-quality ones —
+        # we still want the scan to terminate when every campaign asset
+        # has a match, even if one of those matches was borderline).
         if page_matched_assets:
             async with matched_lock:
                 matched_asset_ids.update(page_matched_assets)
                 if all_asset_ids and matched_asset_ids >= all_asset_ids:
                     early_stop_event.set()
 
+    # Page cache only learns from confidently-matched pages; borderline
+    # ones stay out of the hot list so a regression cannot snowball.
     page_match_tracker: Dict[str, set] = (
-        {page_url: page_matched_assets} if page_matched_assets else {}
+        {page_url: page_cache_assets} if page_cache_assets else {}
     )
 
     return {
@@ -1404,6 +1441,13 @@ async def run_website_scan(
                         .eq("is_processed", False)\
                         .execute()
 
+                    # Same cache-quality threshold as the live-scan
+                    # path — keep borderline matches out of the hot
+                    # page cache so they cannot self-perpetuate.
+                    cache_threshold = max(
+                        _settings.strong_match_threshold,
+                        _settings.partial_match_threshold + 10,
+                    )
                     for image in (page_images.data or []):
                         # Layer 2 (cache phase): same exclusion as the
                         # live-scan loop — full-page evidence stays as
@@ -1411,16 +1455,18 @@ async def run_website_scan(
                         meta = image.get("metadata") or {}
                         if meta.get("capture_method") == "blocked_evidence":
                             continue
-                        asset_id = await _analyze_single_image(
+                        match_tuple = await _analyze_single_image(
                             image, campaign_assets, brand_rules,
                             org_id, str(scan_job_id),
                             asset_hashes, asset_embeddings, {},
                             match_buffer=match_buffer,
                             processed_buffer=processed_buffer,
                         )
-                        if asset_id:
+                        if match_tuple:
+                            asset_id, conf = match_tuple
                             matched_asset_ids.add(asset_id)
-                            page_match_tracker.setdefault(page_url, set()).add(asset_id)
+                            if conf >= cache_threshold:
+                                page_match_tracker.setdefault(page_url, set()).add(asset_id)
 
                     if all_asset_ids and matched_asset_ids >= all_asset_ids:
                         log.info(

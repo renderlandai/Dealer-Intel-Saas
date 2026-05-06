@@ -32,6 +32,17 @@ class Settings(BaseSettings):
     # regardless — this only bounds how long *our* worker waits.
     apify_max_poll_seconds: int = Field(default=2400, description="Max seconds to poll an Apify run before timing out (default 40 min)")
     apify_poll_interval_seconds: int = Field(default=10, description="Seconds between Apify run status polls")
+    # Optional Apify Residential proxy URL passed through to the meta-ad-scraper
+    # actor. Without it the actor returns a heavily limited subset of ads (Meta
+    # rate-limits unauthenticated Ad Library traffic aggressively). Format:
+    #   http://groups-RESIDENTIAL:<APIFY_TOKEN>@proxy.apify.com:8000
+    # Leave empty to skip — the scraper falls back to its built-in proxy
+    # rotation, which is enough for small-volume scans but not for nightly
+    # full-distributor sweeps.
+    apify_meta_proxy_url: str = Field(default="", description="Apify residential proxy URL forwarded to whoareyouanas/meta-ad-scraper (recommended)")
+    # Max parallel actor runs when fanning out across multiple dealer pages.
+    # Each run charges $10/1000 ads — keep this low to bound burst spend.
+    apify_meta_max_parallel_runs: int = Field(default=4, description="Max simultaneous Apify Meta actor runs across dealers")
     
     # Stripe (billing)
     stripe_secret_key: str = ""
@@ -121,9 +132,17 @@ class Settings(BaseSettings):
     
     # Stage 1: Perceptual hash gate — skip images with no hash resemblance to any asset
     hash_prefilter_max_diff: int = Field(default=28, description="Max avg hash diff to pass pre-filter (0-64 scale)")
+    # Strict variant for inputs that already passed an upstream asset-likeness
+    # selector (currently: CV-localized crops from blocked-page screenshots).
+    # Default 16 keeps real renders through (mild compression/resize stays
+    # well under 16 bits across the 4-hash mean) while rejecting the dark
+    # nav-bar / footer-strip crops that the CV path used to mint at scale.
+    hash_prefilter_strict_max_diff: int = Field(default=16, description="Max avg hash diff for CV-localized crops (tighter than the generic gate)")
     
     # Stage 2: CLIP embedding gate — skip images with no semantic similarity to any asset
     clip_similarity_threshold: float = Field(default=0.40, description="Min CLIP cosine similarity to proceed to Claude")
+    # Strict variant — see hash_prefilter_strict_max_diff for rationale.
+    clip_similarity_strict_threshold: float = Field(default=0.55, description="Min CLIP cosine similarity for CV-localized crops")
     clip_model_name: str = Field(default="clip-ViT-B-32", description="SentenceTransformers CLIP model")
     
     # Filter model — use a fast/cheap model for the relevance yes/no check
@@ -146,6 +165,20 @@ class Settings(BaseSettings):
     # evidence and the page is counted as "blocked, captured externally"
     # rather than silently lost.
     screenshotone_fallback_enabled: bool = Field(default=True, description="Use ScreenshotOne to capture pages that Playwright cannot load")
+    # When True, blocked pages whose evidence screenshot was captured by
+    # ScreenshotOne are run through OpenCV template matching and any
+    # detected asset region is cropped out, uploaded as a separate
+    # discovered_image, and fed back into the matcher. This is the
+    # confirmation-bias loop that produced "STRONG MATCH on a navigation
+    # bar" failures: CV pre-selects a region that "looks like" the
+    # asset, then the matcher receives that region and is asked whether
+    # it is the asset it was already pre-selected to look like.
+    #
+    # Disabled by default after the 2026-05-06 incident. Re-enable only
+    # after CV thresholds are validated against held-out fixtures
+    # (eval/) and the operator has manually inspected at least 50
+    # crop-derived matches without finding a false positive.
+    cv_localize_screenshot_crops_enabled: bool = Field(default=False, description="Crop campaign assets out of blocked-page screenshots via CV and re-feed them through the matcher (DANGEROUS — produces confirmation-bias false positives)")
     
     # Page Discovery
     enable_page_discovery: bool = Field(default=True, description="Auto-discover subpages on dealer sites")

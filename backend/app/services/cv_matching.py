@@ -50,7 +50,7 @@ def template_match(
     asset_bytes: bytes,
     scale_range: Tuple[float, float] = (0.10, 1.8),
     scale_steps: int = 50,
-    threshold: float = 0.40,
+    threshold: float = 0.70,
 ) -> List[Dict[str, Any]]:
     """
     Find the asset in the screenshot using multi-scale normalised
@@ -61,6 +61,18 @@ def template_match(
 
     Returns a list of match dicts sorted by confidence (highest first).
     Each dict: {x, y, width, height, confidence, method}.
+
+    Threshold rationale: the previous default of 0.40 was disastrously
+    permissive — TM_CCOEFF_NORMED of 0.40 means "weakly correlated", and
+    at 50 scale steps from 10% to 180% there is almost always *some*
+    sub-region of a web page that lands above 0.40 against any asset.
+    The matcher then cropped that region and fed it back into the AI
+    pipeline, which would happily confirm OpenCV's own guess (the crop
+    was sized like the asset, so Claude's leading "is this it?" prompt
+    over-scored). Industry practice for "real" template matches is
+    ≥ 0.70; we lift to that. Pages that don't have the asset rendered
+    cleanly will simply produce zero crops — preferable to producing
+    junk crops that publish as STRONG MATCH.
     """
     screenshot = _bytes_to_cv(screenshot_bytes)
     asset = _bytes_to_cv(asset_bytes)
@@ -120,8 +132,8 @@ def template_match(
 def feature_match(
     screenshot_bytes: bytes,
     asset_bytes: bytes,
-    min_good_matches: int = 8,
-    ratio_thresh: float = 0.78,
+    min_good_matches: int = 18,
+    ratio_thresh: float = 0.72,
 ) -> List[Dict[str, Any]]:
     """
     Find the asset in the screenshot using ORB keypoint detection
@@ -172,8 +184,16 @@ def feature_match(
         return []
 
     inliers = int(mask.sum()) if mask is not None else 0
-    if inliers < min_good_matches // 2:
-        log.debug("Too few inliers (%d)", inliers)
+    # Require RANSAC inliers to comfortably outnumber the noise floor.
+    # The previous threshold of `min_good_matches // 2` (i.e. 4 inliers
+    # against 8 raw matches) accepted any homography that two text
+    # corners and two button edges could agree on, which is exactly
+    # what produced false-positive bounding boxes on UI chrome. With
+    # min_good_matches lifted to 18, we also lift the inlier floor to
+    # 75% of the matched-pair count so a real homography has to back
+    # most of the keypoints, not a minority.
+    if inliers < max(8, int(min_good_matches * 0.75)):
+        log.debug("Too few inliers (%d, needed %d)", inliers, max(8, int(min_good_matches * 0.75)))
         return []
 
     h, w = asset_gray.shape[:2]
@@ -214,8 +234,8 @@ def feature_match(
 def find_asset_on_page(
     screenshot_bytes: bytes,
     asset_bytes: bytes,
-    template_threshold: float = 0.40,
-    feature_min_matches: int = 8,
+    template_threshold: float = 0.70,
+    feature_min_matches: int = 18,
 ) -> List[Dict[str, Any]]:
     """
     Combined matching: try template matching first (faster, more precise

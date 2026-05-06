@@ -1,23 +1,38 @@
 """
 Apify Meta Ad Library integration for Facebook & Instagram ad scraping.
 
-Uses the nourishing_courier/meta-ads-scraper-pro actor to pull ad creatives
-from Meta's Ad Library via GraphQL interception (more reliable than DOM scraping).
+Backed by the ``whoareyouanas/meta-ad-scraper`` actor. That actor only
+accepts a single search per run (one ``targetUrl``, one ``pageId``, or
+one ``searchQuery``), so we fan out — one actor run per dealer page —
+and merge the results before handing them to the matcher.
 
-Each discovered ad image is inserted as a discovered_image so the existing
-matching pipeline (hash → CLIP → Haiku → Opus) processes it like any other
-discovered image.
+Pipeline overview:
 
-Image URL resolution follows a 3-tier fallback:
-  1. imageUrls from Apify (fastest, but Meta often omits them)
-  2. videoUrls from Apify (sometimes contains thumbnail/poster)
-  3. Playwright visits the Ad Library page and extracts the rendered creative
+    1. ``_resolve_facebook_page_id`` turns each dealer's stored
+       Facebook URL (slug form, e.g. ``facebook.com/somedealer``) into
+       the numeric page ID the actor needs. HTTP-first with a
+       Playwright fallback when Meta serves a logged-out wall.
+    2. ``_run_actor_for_page`` starts one actor run per resolved
+       dealer, polls until it finishes, and pulls the dataset items.
+    3. Each ad is annotated with the source ``page_url`` so the
+       distributor mapping is exact (no fuzzy brand-string matching
+       across multiple dealers running in the same scan).
+    4. Image URL resolution still has a 3-tier fallback:
+         a) ``images: [{"url": ...}]`` from the actor (preferred)
+         b) ``videos: [{"url": ..., "duration": ...}]`` (poster/thumb)
+         c) Playwright visits ``facebook.com/ads/library/?id=<libraryID>``
+            and extracts the rendered creative
+
+Each discovered ad image is inserted as a ``discovered_images`` row so
+the existing matching pipeline (hash → CLIP → Haiku → Opus) processes
+it like any other discovered image.
 """
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -32,22 +47,206 @@ log = logging.getLogger("dealer_intel.apify_meta")
 settings = get_settings()
 
 APIFY_BASE = "https://api.apify.com/v2"
-ACTOR_ID = "nourishing_courier~meta-ads-scraper-pro"
+ACTOR_ID = "whoareyouanas~meta-ad-scraper"
 
-# Apify run statuses
+# Apify run statuses we treat as terminal (the run will not progress
+# further, regardless of whether it succeeded).
 _TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
-# Poll cadence and ceiling are configurable via settings — large multi-dealer
-# Meta Ad Library runs (50+ pages) routinely take 15-30 minutes.
+# Poll cadence and ceiling are configurable via settings — Meta Ad
+# Library runs for high-ad-volume dealers can take 10-15 minutes.
 _POLL_INTERVAL_SEC = settings.apify_poll_interval_seconds
 _MAX_POLL_TIME_SEC = settings.apify_max_poll_seconds
 
-# Playwright fallback settings
+# Playwright fallback settings (shared with the slug→pageId resolver).
 _PW_AD_LIBRARY_TIMEOUT = 20_000  # 20s page load timeout
 _PW_CONCURRENCY = 3  # max parallel browser pages for fallback
 
+# ---------------------------------------------------------------------------
+# Slug → numeric page ID resolution
+# ---------------------------------------------------------------------------
+#
+# The ``whoareyouanas/meta-ad-scraper`` actor accepts only one
+# search per run, identified by ``pageId`` (numeric), ``targetUrl``
+# (already-formed Ad Library URL containing ``view_all_page_id``), or
+# a free-text ``searchQuery``. Our distributor table only stores the
+# slug form (``facebook.com/somedealer``), so we resolve slug → pageId
+# at scan time.
+#
+# The numeric ID is embedded in several places on Facebook's
+# server-rendered HTML:
+#
+#   * ``<meta property="al:android:url" content="fb://page/?id=NUMERIC">``
+#   * ``<meta property="al:ios:url" content="fb://profile/NUMERIC">``
+#   * Inline JSON: ``"pageID":"NUMERIC"`` / ``"entity_id":"NUMERIC"``
+#
+# We try each pattern on the desktop site, then ``m.facebook.com`` (the
+# mobile site is often less aggressive about logged-out gating), and
+# only spin up a Playwright session as a final fallback.
+
+_PAGE_ID_PATTERNS = [
+    re.compile(r'al:android:url"\s*content="fb://page/\?id=(\d+)"'),
+    re.compile(r'al:ios:url"\s*content="fb://profile/(\d+)"'),
+    re.compile(r'"pageID"\s*:\s*"(\d+)"'),
+    re.compile(r'"entity_id"\s*:\s*"(\d+)"'),
+    # Newer Meta surfaces use these keys interchangeably; cover all of
+    # them to keep the resolver robust against minor markup churn.
+    re.compile(r'"page_id"\s*:\s*"(\d+)"'),
+    re.compile(r'"profile_id"\s*:\s*"(\d+)"'),
+]
+
+# Lightweight in-process cache for a single scan run. Resolving the
+# same dealer twice within seconds is wasteful and slightly increases
+# the chance of triggering Meta's bot heuristics. Cleared at process
+# restart; we don't persist to Supabase to keep this change zero-
+# schema-impact (per the input-strategy decision recorded in log.md).
+_PAGE_ID_CACHE: Dict[str, str] = {}
+
+
+async def _http_resolve_page_id(slug: str) -> Optional[str]:
+    """First-pass resolver: a plain GET against facebook.com/<slug> and
+    m.facebook.com/<slug>, scanning the response body for any of
+    ``_PAGE_ID_PATTERNS``.
+
+    Uses a desktop user-agent because Meta returns slightly different
+    markup to "modern" UAs and the mobile UA path occasionally
+    redirects to a barebones logged-out wall with no ID embedded.
+    """
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    candidate_urls = [
+        f"https://www.facebook.com/{slug}",
+        f"https://m.facebook.com/{slug}",
+    ]
+    async with httpx.AsyncClient(
+        timeout=15.0, follow_redirects=True, headers=headers,
+    ) as client:
+        for url in candidate_urls:
+            try:
+                resp = await client.get(url)
+            except Exception as e:
+                log.debug("HTTP page-id probe failed for %s: %s", url, e)
+                continue
+            if resp.status_code >= 400:
+                continue
+            body = resp.text
+            for pattern in _PAGE_ID_PATTERNS:
+                m = pattern.search(body)
+                if m:
+                    return m.group(1)
+    return None
+
+
+async def _playwright_resolve_page_id(slug: str) -> Optional[str]:
+    """Fallback resolver. Reuses the existing Playwright browser pool.
+
+    Many Facebook pages serve a logged-out wall to anonymous HTTP
+    clients but render the underlying page metadata when JS executes.
+    We don't need to interact with anything — once the page has loaded
+    we read ``window.__INITIAL_STATE__`` / meta tags directly.
+    """
+    try:
+        from .extraction_service import _get_browser, _new_page
+    except Exception as e:
+        log.debug("Playwright unavailable for page-id resolution: %s", e)
+        return None
+
+    page = None
+    try:
+        browser = await _get_browser()
+        page = await _new_page(browser, mobile=True)
+        await page.goto(
+            f"https://m.facebook.com/{slug}",
+            wait_until="domcontentloaded",
+            timeout=_PW_AD_LIBRARY_TIMEOUT,
+        )
+        # Brief settle so Meta's client-side hydration drops the page id
+        # into a meta tag or inline script.
+        await asyncio.sleep(2)
+        page_id = await page.evaluate(
+            """() => {
+                const sel = (q) => document.querySelector(q)?.content || null;
+                const m1 = sel('meta[property="al:android:url"]');
+                if (m1) {
+                    const m = m1.match(/id=(\\d+)/);
+                    if (m) return m[1];
+                }
+                const m2 = sel('meta[property="al:ios:url"]');
+                if (m2) {
+                    const m = m2.match(/profile\\/(\\d+)/);
+                    if (m) return m[1];
+                }
+                const html = document.documentElement.outerHTML;
+                const patterns = [
+                    /"pageID"\\s*:\\s*"(\\d+)"/,
+                    /"entity_id"\\s*:\\s*"(\\d+)"/,
+                    /"page_id"\\s*:\\s*"(\\d+)"/,
+                    /"profile_id"\\s*:\\s*"(\\d+)"/,
+                ];
+                for (const p of patterns) {
+                    const m = html.match(p);
+                    if (m) return m[1];
+                }
+                return null;
+            }"""
+        )
+        if page_id and str(page_id).isdigit():
+            return str(page_id)
+    except Exception as e:
+        log.debug("Playwright page-id resolution failed for %s: %s", slug, e)
+    finally:
+        if page is not None:
+            try:
+                await page.context.close()
+            except Exception:
+                pass
+    return None
+
+
+async def _resolve_facebook_page_id(page_url: str) -> Optional[str]:
+    """Resolve a Facebook page URL/slug to its numeric page ID.
+
+    Returns ``None`` if neither the HTTP probe nor Playwright fallback
+    can find one — the caller is expected to skip that dealer with a
+    warning rather than fail the entire scan.
+    """
+    slug = _extract_page_slug(page_url)
+    if not slug:
+        return None
+    if slug in _PAGE_ID_CACHE:
+        return _PAGE_ID_CACHE[slug]
+
+    page_id = await _http_resolve_page_id(slug)
+    if not page_id:
+        log.info(
+            "HTTP page-id probe missed for %s — falling back to Playwright",
+            slug,
+        )
+        page_id = await _playwright_resolve_page_id(slug)
+
+    if page_id:
+        _PAGE_ID_CACHE[slug] = page_id
+        log.info("Resolved %s -> pageId=%s", slug, page_id)
+    else:
+        log.warning(
+            "Could not resolve numeric page ID for %s. The "
+            "whoareyouanas/meta-ad-scraper actor requires a pageId. "
+            "Skipping this dealer for the current scan.", slug,
+        )
+    return page_id
+
+
+# ---------------------------------------------------------------------------
+# URL helpers
+# ---------------------------------------------------------------------------
 
 def _normalize_fb_url(url: str) -> str:
-    """Ensure a Facebook URL is well-formed for the scraper."""
+    """Ensure a Facebook URL is well-formed."""
     url = url.strip().rstrip("/")
     if not url.startswith("http"):
         url = f"https://www.facebook.com/{url}"
@@ -56,31 +255,54 @@ def _normalize_fb_url(url: str) -> str:
 
 def _extract_page_slug(url: str) -> str:
     """Extract the Facebook page slug/ID from a URL for matching purposes."""
-    parsed = urlparse(url)
+    parsed = urlparse(_normalize_fb_url(url))
     path = parsed.path.strip("/").split("/")[0] if parsed.path else ""
     return path.lower()
 
 
+def _ad_library_url_for(library_id: str) -> str:
+    """Construct a permalink Ad Library URL from a libraryID. The new
+    actor doesn't return one directly; we synthesise the canonical
+    form used by Meta itself."""
+    return f"https://www.facebook.com/ads/library/?id={library_id}"
+
+
+# ---------------------------------------------------------------------------
+# Apify run wrappers
+# ---------------------------------------------------------------------------
+
 async def _start_actor_run(
-    page_urls: List[str],
     *,
-    max_ads: int = 200,
-    country: str = "ALL",
-    ad_status: str = "all",
+    page_id: str,
+    country: str = "US",
+    active_status: str = "all",
     media_type: str = "all",
+    sort_mode: str = "start_date",
+    sort_direction: str = "desc",
+    max_concurrency: int = 1,
+    request_timeout_secs: int = 900,
 ) -> dict:
-    """Start an Apify actor run and return the run metadata."""
-    actor_input = {
-        "urls": [{"url": _normalize_fb_url(u)} for u in page_urls],
-        "maxAds": max_ads,
+    """Start a single actor run keyed on ``page_id``.
+
+    The new actor accepts exactly one search per run — see the actor
+    docs at https://apify.com/whoareyouanas/meta-ad-scraper. We sort
+    by ``start_date`` descending so freshest creatives come first;
+    this is the most useful default for scanning live campaigns.
+    """
+    actor_input: Dict[str, Any] = {
+        "pageId": str(page_id),
         "country": country,
-        "adStatus": ad_status,
+        "activeStatus": active_status,
+        "adType": "all",
         "mediaType": media_type,
-        "includePageInsights": False,
-        "includeCreativeDetails": True,
-        "includeSpendData": False,
-        "proxyConfiguration": {"useApifyProxy": True},
+        "isTargetedCountry": False,
+        "sortMode": sort_mode,
+        "sortDirection": sort_direction,
+        "maxConcurrency": max_concurrency,
+        "requestHandlerTimeoutSecs": request_timeout_secs,
     }
+    if settings.apify_meta_proxy_url:
+        actor_input["proxyUrl"] = settings.apify_meta_proxy_url
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
@@ -129,17 +351,18 @@ async def _fetch_dataset_items(dataset_id: str) -> List[Dict[str, Any]]:
         return resp.json()
 
 
+# ---------------------------------------------------------------------------
+# Distributor resolution (per fan-out)
+# ---------------------------------------------------------------------------
+
 def _build_url_to_distributor_map(
     page_urls: List[str],
     distributor_mapping: Dict[str, UUID],
 ) -> Dict[str, UUID]:
-    """
-    Build a slug→distributor_id lookup so we can match Apify results
-    (which return pageName / pageId) back to our distributor records.
-
-    The router passes distributor_mapping keyed by dealer *name* (lowercased).
-    We also index by Facebook URL slug for a secondary match path.
-    """
+    """Build a slug→distributor_id lookup. The router passes
+    ``distributor_mapping`` keyed by lowercased dealer name; we add a
+    secondary index by Facebook URL slug so the per-page fan-out path
+    can resolve via the source URL with zero ambiguity."""
     slug_map: Dict[str, UUID] = {}
     slug_map.update(distributor_mapping)
 
@@ -154,53 +377,75 @@ def _build_url_to_distributor_map(
     return slug_map
 
 
-def _resolve_distributor(
-    ad: Dict[str, Any],
+def _resolve_distributor_from_source(
+    source_page_url: str,
     slug_map: Dict[str, UUID],
 ) -> Optional[UUID]:
-    """Try to resolve which distributor this ad belongs to."""
-    page_name = (ad.get("pageName") or "").lower()
-    page_id = str(ad.get("pageId") or "")
-
-    if page_name in slug_map:
-        return slug_map[page_name]
-
-    for key, dist_id in slug_map.items():
-        if key in page_name or page_name in key:
-            return dist_id
-
-    if page_id and page_id in slug_map:
-        return slug_map[page_id]
-
+    """Each ad now carries the dealer page URL that triggered its
+    actor run, so distributor resolution is just slug-to-id (no fuzzy
+    brand-name matching across multiple dealers in one scan)."""
+    slug = _extract_page_slug(source_page_url)
+    if slug and slug in slug_map:
+        return slug_map[slug]
     return None
 
 
+def _resolve_distributor_by_brand(
+    ad: Dict[str, Any],
+    slug_map: Dict[str, UUID],
+) -> Optional[UUID]:
+    """Fallback: match the ad's ``brand`` string against the dealer
+    name index. Used only if the source-URL path failed (which
+    shouldn't normally happen but is worth defending against in case
+    we ever change how fan-outs are dispatched)."""
+    brand = (ad.get("brand") or "").lower()
+    if not brand:
+        return None
+    if brand in slug_map:
+        return slug_map[brand]
+    for key, dist_id in slug_map.items():
+        if key in brand or brand in key:
+            return dist_id
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Media URL extraction (new actor's shape)
+# ---------------------------------------------------------------------------
+
 def _collect_media_urls(ad: Dict[str, Any]) -> List[str]:
-    """
-    Tier 1+2: collect image URLs from Apify response, falling back to
-    videoUrls if imageUrls is empty.
-    """
+    """Pull http(s) URLs out of an ad item produced by the new actor.
+
+    Schema:
+        images: [{"url": "https://..."}]
+        videos: [{"url": "https://...", "duration": 30}]
+
+    Falls back from images to videos because Meta sometimes serves the
+    poster image only via the video object."""
     urls: List[str] = []
 
-    for img_url in (ad.get("imageUrls") or []):
-        if img_url and img_url.startswith("http"):
-            urls.append(img_url)
+    for img in (ad.get("images") or []):
+        url = (img or {}).get("url") if isinstance(img, dict) else img
+        if isinstance(url, str) and url.startswith("http"):
+            urls.append(url)
 
     if not urls:
-        for vid_url in (ad.get("videoUrls") or []):
-            if vid_url and vid_url.startswith("http"):
-                urls.append(vid_url)
+        for vid in (ad.get("videos") or []):
+            url = (vid or {}).get("url") if isinstance(vid, dict) else vid
+            if isinstance(url, str) and url.startswith("http"):
+                urls.append(url)
 
     return urls
 
 
-async def _extract_image_from_ad_library(ad_library_url: str) -> List[str]:
-    """
-    Tier 3: visit the Meta Ad Library page in Playwright and extract the
-    rendered ad creative image URL(s) from the DOM.
+# ---------------------------------------------------------------------------
+# Playwright tier-3 image extraction (kept as-is — operates on the
+# permalink ad library URL, which is identical for both actors)
+# ---------------------------------------------------------------------------
 
-    The Ad Library is public — no login required.
-    """
+async def _extract_image_from_ad_library(ad_library_url: str) -> List[str]:
+    """Tier 3: visit the Meta Ad Library page in Playwright and extract
+    the rendered ad creative image URL(s) from the DOM."""
     from .extraction_service import _get_browser, _new_page
 
     extracted: List[str] = []
@@ -211,13 +456,10 @@ async def _extract_image_from_ad_library(ad_library_url: str) -> List[str]:
         await page.goto(ad_library_url, wait_until="domcontentloaded", timeout=_PW_AD_LIBRARY_TIMEOUT)
         await asyncio.sleep(4)
 
-        # Meta Ad Library renders creatives inside specific containers.
-        # We look for large images inside the ad card area.
         image_urls = await page.evaluate("""() => {
             const seen = new Set();
             const results = [];
 
-            // Primary: images inside the ad creative container
             const adImages = document.querySelectorAll(
                 'img[src*="scontent"], img[src*="fbcdn"], img[src*="facebook"]'
             );
@@ -231,7 +473,6 @@ async def _extract_image_from_ad_library(ad_library_url: str) -> List[str]:
                 results.push(src);
             }
 
-            // Fallback: any large image on the page
             if (results.length === 0) {
                 for (const img of document.querySelectorAll('img')) {
                     const src = img.currentSrc || img.src;
@@ -269,30 +510,24 @@ async def _extract_image_from_ad_library(ad_library_url: str) -> List[str]:
 async def _resolve_images_for_ads(
     ads: List[Dict[str, Any]],
 ) -> Dict[str, List[str]]:
-    """
-    For every ad that has no imageUrls/videoUrls, use Playwright to visit the
-    Ad Library page and extract the creative. Returns {adId: [url, ...]}.
-
-    Runs up to _PW_CONCURRENCY pages in parallel via a semaphore.
-    """
+    """Resolve image URLs for ads where ``images`` and ``videos`` were
+    both empty. Keyed by ``libraryID`` (the new actor's identifier)."""
     sem = asyncio.Semaphore(_PW_CONCURRENCY)
     results: Dict[str, List[str]] = {}
 
     async def _resolve_one(ad: Dict[str, Any]):
-        ad_id = ad.get("adId", "")
-        ad_url = ad.get("adUrl") or f"https://www.facebook.com/ads/library/?id={ad_id}"
-        if not ad_id:
+        library_id = str(ad.get("libraryID") or "")
+        if not library_id:
             return
+        ad_url = _ad_library_url_for(library_id)
         async with sem:
             urls = await _extract_image_from_ad_library(ad_url)
             if urls:
-                results[ad_id] = urls
+                results[library_id] = urls
 
     needs_fallback = [
         ad for ad in ads
-        if ad.get("type") != "pageInsight"
-        and not _collect_media_urls(ad)
-        and (ad.get("adId") or ad.get("adUrl"))
+        if not _collect_media_urls(ad) and ad.get("libraryID")
     ]
 
     if not needs_fallback:
@@ -308,6 +543,75 @@ async def _resolve_images_for_ads(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Per-page fan-out
+# ---------------------------------------------------------------------------
+
+async def _run_actor_for_page(
+    page_url: str,
+    *,
+    country: str = "US",
+    active_status: str = "all",
+    media_type: str = "all",
+) -> Tuple[str, List[Dict[str, Any]], Optional[float], Optional[str]]:
+    """Run one actor invocation for one dealer page.
+
+    Returns ``(page_url, ads, usage_total_usd, run_id)``. Always
+    returns — actor / network failures degrade to an empty ad list and
+    a logged WARNING rather than raising, so one dealer's outage
+    doesn't fail the whole multi-dealer scan.
+    """
+    page_id = await _resolve_facebook_page_id(page_url)
+    if not page_id:
+        return page_url, [], None, None
+
+    try:
+        run_info = await _start_actor_run(
+            page_id=page_id,
+            country=country,
+            active_status=active_status,
+            media_type=media_type,
+        )
+        run_id = run_info["id"]
+        log.info(
+            "Apify Meta run started for %s (pageId=%s): %s",
+            _extract_page_slug(page_url), page_id, run_id,
+        )
+
+        completed = await _poll_run(run_id)
+    except TimeoutError:
+        log.error("Apify run for %s timed out", page_url)
+        return page_url, [], None, None
+    except Exception as e:
+        log.warning("Apify run for %s failed to start/poll: %s", page_url, e)
+        return page_url, [], None, None
+
+    if completed.get("status") != "SUCCEEDED":
+        log.warning(
+            "Apify run for %s ended with status %s (run_id=%s)",
+            page_url, completed.get("status"), completed.get("id"),
+        )
+        return page_url, [], completed.get("usageTotalUsd"), completed.get("id")
+
+    dataset_id = completed.get("defaultDatasetId")
+    if not dataset_id:
+        log.warning("Run for %s succeeded but no dataset id returned", page_url)
+        return page_url, [], completed.get("usageTotalUsd"), completed.get("id")
+
+    try:
+        ads = await _fetch_dataset_items(dataset_id)
+    except Exception as e:
+        log.warning("Dataset fetch for %s failed: %s", page_url, e)
+        ads = []
+
+    log.info("Apify Meta run for %s returned %d ad(s)", page_url, len(ads))
+    return page_url, ads, completed.get("usageTotalUsd"), completed.get("id")
+
+
+# ---------------------------------------------------------------------------
+# Public entrypoint
+# ---------------------------------------------------------------------------
+
 async def scan_meta_ads(
     page_urls: List[str],
     scan_job_id: UUID,
@@ -316,15 +620,21 @@ async def scan_meta_ads(
     channel: str = "facebook",
     campaign_assets: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
-    """
-    Scan Meta Ad Library via Apify for Facebook/Instagram ad creatives.
+    """Scan Meta Ad Library via the ``whoareyouanas/meta-ad-scraper``
+    actor for Facebook/Instagram ad creatives.
 
-    1. Starts the Apify actor with the supplied Facebook page URLs
-    2. Polls until the run completes
-    3. Resolves image URLs via 3-tier fallback (imageUrls → videoUrls → Playwright)
-    4. Inserts each ad image as a discovered_image for the matching pipeline
+    The signature is unchanged from the previous actor — callers pass a
+    list of dealer Facebook URLs and we fan out internally.
 
-    Returns total number of discovered images inserted.
+    Steps:
+        1. Resolve every page URL to its numeric Facebook pageId.
+        2. Fan out actor runs in parallel (bounded by
+           ``settings.apify_meta_max_parallel_runs``).
+        3. For each ad, pull image URLs (3-tier fallback).
+        4. Insert each image as a ``discovered_images`` row, tagging
+           the source dealer via the page_url that triggered the run.
+
+    Returns the total number of discovered images inserted.
     """
     if not settings.apify_api_key:
         raise ValueError(
@@ -336,146 +646,161 @@ async def scan_meta_ads(
         raise ValueError("No Facebook page URLs provided for Meta Ads scan.")
 
     log.info(
-        "Starting Apify Meta Ads scan (%s) for %d page(s)", channel, len(page_urls)
+        "Starting Apify Meta Ads scan (%s, actor=%s) for %d page(s) "
+        "[fan-out parallelism=%d]",
+        channel, ACTOR_ID, len(page_urls), settings.apify_meta_max_parallel_runs,
     )
-
-    # 1. Start the actor run
-    run_info = await _start_actor_run(page_urls)
-    run_id = run_info["id"]
-    log.info("Apify actor run started: %s", run_id)
 
     supabase.table("scan_jobs").update({
         "status": "running",
         "started_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", str(scan_job_id)).execute()
 
-    # 2. Poll until complete
-    try:
-        completed_run = await _poll_run(run_id)
-    except TimeoutError:
-        log.error("Apify run %s timed out", run_id)
-        supabase.table("scan_jobs").update({
-            "status": "failed",
-            "error_message": f"Apify run timed out after {_MAX_POLL_TIME_SEC}s",
-        }).eq("id", str(scan_job_id)).execute()
-        raise
+    # 1+2: Fan out — bounded parallel actor runs.
+    fan_sem = asyncio.Semaphore(max(1, settings.apify_meta_max_parallel_runs))
 
-    if completed_run["status"] != "SUCCEEDED":
-        error_msg = f"Apify run finished with status: {completed_run['status']}"
-        log.error(error_msg)
-        supabase.table("scan_jobs").update({
-            "status": "failed",
-            "error_message": error_msg,
-        }).eq("id", str(scan_job_id)).execute()
-        raise RuntimeError(error_msg)
+    async def _bounded(page_url: str):
+        async with fan_sem:
+            return await _run_actor_for_page(page_url, active_status="all")
 
-    # 3. Fetch dataset items
-    dataset_id = completed_run.get("defaultDatasetId")
-    if not dataset_id:
-        raise RuntimeError("Apify run succeeded but no dataset ID returned")
+    fan_results = await asyncio.gather(
+        *[_bounded(u) for u in page_urls],
+        return_exceptions=True,
+    )
 
-    ads = await _fetch_dataset_items(dataset_id)
-    log.info("Apify returned %d ad item(s)", len(ads))
+    # Aggregate ads from every fan-out, tagged with their source page.
+    ads_by_source: List[Tuple[str, Dict[str, Any]]] = []
+    total_actor_cost = 0.0
+    successful_runs = 0
+    for result in fan_results:
+        if isinstance(result, BaseException):
+            log.warning("Fan-out task crashed: %s", result)
+            continue
+        page_url, ads, cost_usd, run_id = result
+        if cost_usd is not None:
+            try:
+                total_actor_cost += float(cost_usd)
+            except Exception:
+                pass
+        if run_id:
+            try:
+                from . import cost_tracker
+                cost_tracker.record_apify_run(
+                    actor_or_task=ACTOR_ID,
+                    run_id=run_id,
+                    usage_total_usd=cost_usd,
+                    items_returned=len(ads),
+                )
+            except Exception as cost_err:
+                log.debug("Cost capture skipped (apify meta): %s", cost_err)
+        if ads:
+            successful_runs += 1
+            for ad in ads:
+                ads_by_source.append((page_url, ad))
 
-    try:
-        from . import cost_tracker
-        cost_tracker.record_apify_run(
-            actor_or_task=ACTOR_ID,
-            run_id=run_id,
-            usage_total_usd=completed_run.get("usageTotalUsd"),
-            items_returned=len(ads),
-        )
-    except Exception as cost_err:
-        log.debug("Cost capture skipped (apify meta): %s", cost_err)
+    log.info(
+        "Apify Meta fan-out complete: %d/%d dealers returned ads, "
+        "%d ads total, $%.4f reported cost",
+        successful_runs, len(page_urls), len(ads_by_source), total_actor_cost,
+    )
 
-    # Log raw payload keys for debugging (first ad only)
-    if ads:
-        sample = ads[0]
-        log.info(
-            "Sample ad payload keys: %s | imageUrls=%d, videoUrls=%d",
-            list(sample.keys()),
-            len(sample.get("imageUrls") or []),
-            len(sample.get("videoUrls") or []),
-        )
-        log.debug("Full sample ad payload: %s", json.dumps(sample, default=str)[:2000])
-
-    if not ads:
+    if not ads_by_source:
         supabase.table("scan_jobs").update({
             "status": "completed",
             "completed_at": datetime.now(timezone.utc).isoformat(),
             "total_items": 0,
         }).eq("id", str(scan_job_id)).execute()
-        log.warning("No ads found for the provided pages")
+        log.warning("No ads found for any provided Facebook pages")
         return 0
 
-    # 4. Playwright fallback: resolve images for ads missing URLs
-    pw_resolved = await _resolve_images_for_ads(ads)
+    # Sample payload for debugging the wire format on first ad only.
+    sample = ads_by_source[0][1]
+    log.info(
+        "Sample ad payload keys: %s | images=%d, videos=%d, brand=%s, libraryID=%s",
+        list(sample.keys()),
+        len(sample.get("images") or []),
+        len(sample.get("videos") or []),
+        sample.get("brand"),
+        sample.get("libraryID"),
+    )
+    log.debug("Full sample ad payload: %s", json.dumps(sample, default=str)[:2000])
 
-    # 5. Build lookup for distributor resolution
+    # 3: Resolve images for ads missing imageUrls/videoUrls (Playwright tier).
+    raw_ads = [ad for _, ad in ads_by_source]
+    pw_resolved = await _resolve_images_for_ads(raw_ads)
+
+    # 4: Distributor resolution + insertion.
     slug_map = _build_url_to_distributor_map(page_urls, distributor_mapping)
-
-    # 6. Insert each ad image as a discovered_image
     img_buffer = DiscoveredImageBuffer()
     ads_with_images = 0
     ads_skipped = 0
 
-    for ad in ads:
-        ad_type = ad.get("type", "")
-        if ad_type == "pageInsight":
+    for source_page_url, ad in ads_by_source:
+        library_id = str(ad.get("libraryID") or "")
+        if not library_id:
+            ads_skipped += 1
             continue
 
-        ad_id = ad.get("adId", "")
-        ad_url = ad.get("adUrl", "")
-        page_name = ad.get("pageName", "")
+        ad_url = _ad_library_url_for(library_id)
+        brand = ad.get("brand") or ""
         platforms = ad.get("platforms") or []
-        ad_status = ad.get("status", "")
+        active = ad.get("active")
+        ad_status = "active" if active else ("inactive" if active is False else "")
         start_date = ad.get("startDate")
-        media_type = ad.get("mediaType", "")
+        media_format = ad.get("format") or ""
 
-        # 3-tier image resolution
+        # 3-tier image resolution.
         image_urls = _collect_media_urls(ad)
         extraction_method = "apify_meta"
-
-        if not image_urls and ad_id in pw_resolved:
-            image_urls = pw_resolved[ad_id]
+        if not image_urls and library_id in pw_resolved:
+            image_urls = pw_resolved[library_id]
             extraction_method = "apify_meta+playwright_fallback"
 
         if not image_urls:
             log.warning(
                 "No images resolved for ad %s (%s) — skipping",
-                ad_id, page_name,
+                library_id, brand,
             )
             ads_skipped += 1
             continue
 
         ads_with_images += 1
 
+        # If the actor reports the ad ran ONLY on Instagram, surface
+        # that — keeps the existing `instagram` channel split working.
         ad_channel = channel
-        if "instagram" in platforms and "facebook" not in platforms:
+        platforms_lc = [str(p).lower() for p in platforms]
+        if "instagram" in platforms_lc and "facebook" not in platforms_lc:
             ad_channel = "instagram"
 
-        distributor_id = _resolve_distributor(ad, slug_map)
+        distributor_id = (
+            _resolve_distributor_from_source(source_page_url, slug_map)
+            or _resolve_distributor_by_brand(ad, slug_map)
+        )
 
         for img_url in image_urls:
             img_buffer.add({
                 "scan_job_id": str(scan_job_id),
                 "distributor_id": str(distributor_id) if distributor_id else None,
-                "source_url": ad_url or f"https://www.facebook.com/ads/library/?id={ad_id}",
+                "source_url": ad_url,
                 "image_url": img_url,
                 "source_type": "extracted_image",
                 "channel": ad_channel,
                 "metadata": {
                     "extraction_method": extraction_method,
                     "apify_actor": ACTOR_ID,
-                    "ad_id": ad_id,
-                    "page_name": page_name,
-                    "page_id": str(ad.get("pageId", "")),
+                    "library_id": library_id,
+                    "brand": brand,
                     "ad_status": ad_status,
-                    "media_type": media_type,
+                    "media_format": media_format,
                     "platforms": platforms,
                     "start_date": start_date,
-                    "headline": ad.get("headline", ""),
-                    "ad_text": (ad.get("adText") or "")[:500],
+                    "link_title": ad.get("linkTitle", ""),
+                    "link_url": ad.get("linkUrl", ""),
+                    "cta_text": ad.get("ctaText", ""),
+                    "cta_url": ad.get("ctaUrl", ""),
+                    "body": (ad.get("body") or "")[:500],
+                    "source_page_url": source_page_url,
                 },
             })
 

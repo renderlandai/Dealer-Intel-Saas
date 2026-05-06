@@ -844,9 +844,17 @@ STEP 2 - VERIFY EACH GATE:
   - FAIL if completely different visual design
 
 STEP 3 - VERDICT:
-- is_match: true if GATE_BRAND passes AND GATE_PRODUCT passes AND at least 1 of the remaining 3 gates passes
-- A campaign match requires the right brand AND the right product AND at least some shared campaign elements
-- When truly uncertain (50/50), lean toward true — it is worse to miss a real match than to flag a false one
+- is_match: true ONLY if GATE_BRAND passes AND GATE_PRODUCT passes AND at least 2 of the
+  remaining 3 gates (message / offer / design) ALSO pass — i.e. 4 of 5 gates total.
+- A campaign match requires the right brand AND the right product AND multiple
+  corroborating campaign elements. Brand + product + design alone is NOT enough — those
+  three gates can all be true for a different campaign on the same site (a dealer's
+  unrelated promo banner, a stock product photo, a CV-localized crop of webpage chrome
+  that happens to have the same color palette). Demanding message OR offer to also
+  agree is what distinguishes "the same creative" from "the same dealership".
+- When truly uncertain (50/50), lean toward FALSE. It is worse to publish a STRONG
+  MATCH on a navigation bar than to miss a real match — a missed match shows up on
+  the next scan; a false match erodes operator trust in the system permanently.
 
 Return JSON with:
 - gate_brand: true/false
@@ -855,7 +863,7 @@ Return JSON with:
 - gate_offer: true/false
 - gate_design: true/false
 - gates_passed: count of true gates (0-5)
-- is_match: true if gate_brand AND gate_product AND gates_passed >= 3
+- is_match: true ONLY if gate_brand AND gate_product AND gates_passed >= 4
 - verdict: one-line explanation of your decision"""
 
 
@@ -1274,9 +1282,37 @@ async def verify_borderline_match(
         gate_brand = result.get("gate_brand", False)
         gate_product = result.get("gate_product", False)
 
-        is_match = result.get("is_match", False) and gate_brand and gate_product and gates_passed >= 3
+        # Require 4 of 5 gates to pass (was 3). With only 3 gates the
+        # verifier was rubber-stamping CV-localized crops on the basis of
+        # brand + product + design (all three are easy to fake on a
+        # roughly asset-sized crop of webpage chrome) and publishing a
+        # mechanical 60-point match. Lifting the bar to 4 means the
+        # verifier needs at least one of message / offer to corroborate,
+        # which is exactly the signal that distinguishes "this is the
+        # campaign creative" from "this is some other dealer-branded
+        # rectangle on the same site".
+        is_match = (
+            result.get("is_match", False)
+            and gate_brand
+            and gate_product
+            and gates_passed >= 4
+        )
 
-        verified_score = gates_passed * 20
+        # Compress the gate→score mapping so 4 gates lands in PARTIAL
+        # (65) rather than STRONG (80), and 5 gates lands in STRONG (80)
+        # rather than EXACT (100). The previous gates_passed * 20 curve
+        # mechanically minted 80% confidence the moment Claude said
+        # brand+product+message+design — exactly the failure mode the
+        # operator saw on a `SUPPORT  ABOUT` nav-bar crop. The new curve:
+        #   3 gates -> 50 (just below regular threshold; verifier's
+        #              `is_match` boolean now also requires 4, so 3 is
+        #              effectively rejected — but if a future caller
+        #              relies on verified_score directly we still report
+        #              it honestly).
+        #   4 gates -> 65 (PARTIAL match)
+        #   5 gates -> 80 (STRONG match)
+        _GATE_SCORE_CURVE = {0: 0, 1: 0, 2: 25, 3: 50, 4: 65, 5: 80}
+        verified_score = _GATE_SCORE_CURVE.get(int(gates_passed), 0)
 
         log.debug("Verification complete: gates_passed=%d, is_match=%s", gates_passed, is_match)
         log.debug("Gates: brand=%s, product=%s, message=%s, offer=%s, design=%s", gate_brand, gate_product, result.get('gate_message'), result.get('gate_offer'), result.get('gate_design'))
@@ -1366,6 +1402,7 @@ ZOMBIE AD CHECK:
             is_compliant=result.get("is_compliant", True),
             issues=result.get("issues", []),
             brand_elements=result.get("brand_elements", {}),
+            asset_visible=result.get("asset_visible"),
             zombie_ad=result.get("zombie_ad", False),
             zombie_days=None,
             analysis_summary=result.get("analysis_summary", "")
@@ -1448,7 +1485,36 @@ async def ensemble_match(
     if hash_result.get("is_exact"):
         # Only boost if hash shows near-identical images
         final_score = max(final_score, 85)
-    
+
+    # Hash-veto for non-screenshot comparisons.
+    #
+    # Perceptual hashing is the most truthful signal we compute — it
+    # reflects pixel-level resemblance and cannot hallucinate. When the
+    # visual scorer claims a strong match (≥ 75) but the hash similarity
+    # disagrees by a wide margin (≤ 55), the visual model is almost
+    # certainly hallucinating on a CV-localized crop or a coincidentally
+    # asset-shaped piece of UI chrome (the "STRONG MATCH on a nav bar"
+    # failure mode). Cap the final score at hash + 10 in that case so a
+    # real but compressed render still scores well, but a hallucinated
+    # match cannot publish above the regular_image_match_threshold.
+    #
+    # Skipped for screenshots because the hash path isn't run there —
+    # whole-page hashes against a small banner are meaningless and the
+    # detection path carries its own scoring discipline.
+    if (
+        not is_screenshot
+        and visual_score >= 75
+        and hash_score <= 55
+    ):
+        capped = min(final_score, hash_score + 10)
+        if capped < final_score:
+            log.info(
+                "Hash-veto: visual=%d but hash=%d — capping final %d -> %d "
+                "(visual likely hallucinated; trust the hash)",
+                visual_score, hash_score, final_score, capped,
+            )
+        final_score = capped
+
     # Determine match type based on STRICT thresholds
     if final_score >= settings.exact_match_threshold:
         match_type = "exact"
@@ -1562,6 +1628,7 @@ async def batch_filter_images(image_urls: List[str]) -> List[ImageFilterResult]:
 async def _passes_hash_prefilter(
     image_bytes: bytes,
     asset_hashes_cache: List[Dict[str, Any]],
+    strict: bool = False,
 ) -> bool:
     """
     Stage 1 pre-filter: check if the image has ANY perceptual hash
@@ -1569,12 +1636,23 @@ async def _passes_hash_prefilter(
 
     Returns True if the image should continue to the next stage.
     This is free and instant (~0.5ms per comparison).
+
+    ``strict`` tightens the threshold for inputs that have already been
+    pre-selected for asset-likeness by an upstream step — currently
+    used for ``cv_localized_from_screenshot`` crops, where the loose
+    default would let nearly anything through (the crop has already
+    been geometrically biased to look asset-shaped, so the hash check
+    needs to do more discriminating work, not less).
     """
     img_hashes = await compute_image_hashes(image_bytes)
     if img_hashes is None:
         return True  # can't compute → don't discard
 
-    threshold = settings.hash_prefilter_max_diff
+    threshold = (
+        settings.hash_prefilter_strict_max_diff
+        if strict
+        else settings.hash_prefilter_max_diff
+    )
 
     for asset_h in asset_hashes_cache:
         diffs = [
@@ -1593,6 +1671,7 @@ async def _passes_hash_prefilter(
 async def _passes_clip_prefilter(
     image_bytes: bytes,
     asset_embeddings: list,
+    strict: bool = False,
 ) -> bool:
     """
     Stage 2 pre-filter: check CLIP semantic similarity between the
@@ -1600,6 +1679,11 @@ async def _passes_clip_prefilter(
 
     Returns True if the image should continue to Claude.
     Runs locally on CPU (~20ms per image) in a thread executor.
+
+    ``strict`` lifts the cosine threshold for CV-localized crops, which
+    have already been geometrically pre-selected and so should clear a
+    higher bar than a generic extracted image to justify the Claude
+    spend that follows.
     """
     if not asset_embeddings:
         return True
@@ -1608,10 +1692,16 @@ async def _passes_clip_prefilter(
     if img_emb is None:
         return True
 
+    threshold = (
+        settings.clip_similarity_strict_threshold
+        if strict
+        else settings.clip_similarity_threshold
+    )
+
     best_sim = embedding_service.best_asset_similarity(img_emb, asset_embeddings)
-    passes = best_sim >= settings.clip_similarity_threshold
-    log.debug("CLIP best similarity: %.3f (threshold %.2f) → %s",
-              best_sim, settings.clip_similarity_threshold, "PASS" if passes else "SKIP")
+    passes = best_sim >= threshold
+    log.debug("CLIP best similarity: %.3f (threshold %.2f, strict=%s) → %s",
+              best_sim, threshold, strict, "PASS" if passes else "SKIP")
     return passes
 
 
@@ -1661,6 +1751,7 @@ async def process_discovered_image(
     channel: Optional[str] = None,
     asset_hashes_cache: Optional[List[Dict[str, Any]]] = None,
     asset_embeddings_cache: Optional[list] = None,
+    extraction_method: Optional[str] = None,
 ) -> tuple:
     """
     Full processing pipeline for a discovered image.
@@ -1670,15 +1761,21 @@ async def process_discovered_image(
 
     Stages: "download_failed", "hash_rejected", "clip_rejected",
             "filter_rejected", "below_threshold", "verification_rejected",
-            "matched"
+            "asset_invisible_rejected", "matched"
     """
     log.info("Processing image: %s", image_url[:80])
-    log.debug("Source type: %s", source_type or "not specified")
+    log.debug("Source type: %s, extraction_method: %s", source_type or "not specified", extraction_method or "n/a")
     
     # Determine if this is a screenshot — ONLY trust the explicit source_type flag.
     # URL-based checks matched the Supabase bucket name ("scan-screenshots")
     # and caused every stored image to bypass all pre-filters.
     is_screenshot = source_type == "page_screenshot"
+
+    # CV-localized crops have already been geometrically pre-selected
+    # for asset-likeness by OpenCV template matching, so the local
+    # pre-filters need to do *more* discriminating work, not less. Use
+    # the strict thresholds in that case.
+    is_cv_localized = extraction_method == "cv_localized_from_screenshot"
 
     # --- Stage 1 & 2: local pre-filters (skip for screenshots) ---
     if not is_screenshot:
@@ -1690,16 +1787,22 @@ async def process_discovered_image(
 
         # Stage 1: Hash pre-filter
         if asset_hashes_cache:
-            passes_hash = await _passes_hash_prefilter(image_bytes_for_prefilter, asset_hashes_cache)
+            passes_hash = await _passes_hash_prefilter(
+                image_bytes_for_prefilter, asset_hashes_cache,
+                strict=is_cv_localized,
+            )
             if not passes_hash:
-                log.debug("REJECTED by hash pre-filter (no asset resemblance)")
+                log.debug("REJECTED by hash pre-filter (no asset resemblance, strict=%s)", is_cv_localized)
                 return None, "hash_rejected"
 
         # Stage 2: CLIP embedding pre-filter
         if asset_embeddings_cache:
-            passes_clip = await _passes_clip_prefilter(image_bytes_for_prefilter, asset_embeddings_cache)
+            passes_clip = await _passes_clip_prefilter(
+                image_bytes_for_prefilter, asset_embeddings_cache,
+                strict=is_cv_localized,
+            )
             if not passes_clip:
-                log.debug("REJECTED by CLIP pre-filter (low semantic similarity)")
+                log.debug("REJECTED by CLIP pre-filter (low semantic similarity, strict=%s)", is_cv_localized)
                 return None, "clip_rejected"
     
     # Get adaptive threshold for this source/channel
@@ -1816,7 +1919,33 @@ async def process_discovered_image(
         brand_rules,
         best_match["asset"].get("campaign_end_date")
     )
-    
+
+    # Final safety net: asset_visible gate.
+    #
+    # The compliance prompt explicitly asks Claude to set ``asset_visible:
+    # false`` when the campaign creative is not actually present in the
+    # discovered image. Until now we were reading that flag and ignoring
+    # it, which let a hallucinated visual score publish a STRONG MATCH on
+    # a CV-localized crop of unrelated webpage chrome (nav bars, footer
+    # strips, etc.). If Claude — looking at the same crop the visual
+    # matcher rated highly — says the asset is NOT visible, that is a
+    # higher-signal contradiction than the visual score is worth, and we
+    # discard the match.
+    #
+    # ``asset_visible`` is optional: a None value means the model didn't
+    # populate the field (or the call failed) and we fall through to the
+    # existing publishing path. Only an explicit ``False`` vetoes.
+    if compliance.asset_visible is False:
+        log.info(
+            "Match rejected by asset_visible gate — Claude says creative "
+            "is NOT visible in discovered image (visual score=%d, "
+            "asset=%s, image_id=%s)",
+            calibrated_score,
+            best_match["asset"].get("name", best_match["asset"].get("id")),
+            discovered_image_id,
+        )
+        return None, "asset_invisible_rejected"
+
     match_type = _get_match_type_from_score(calibrated_score)
     
     log.info("Final: %s match, score %d, compliant=%s", match_type, calibrated_score, compliance.is_compliant)
@@ -1838,6 +1967,7 @@ async def process_discovered_image(
             "comparison": best_match["comparison"],
             "compliance": {
                 "is_compliant": compliance.is_compliant,
+                "asset_visible": compliance.asset_visible,
                 "brand_elements": compliance.brand_elements,
                 "zombie_ad": compliance.zombie_ad,
                 "summary": compliance.analysis_summary

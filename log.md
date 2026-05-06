@@ -5574,3 +5574,451 @@ commit).
    feed or an Akamai whitelist for our scanner egress IP. Worth a
    single email before sinking more engineering into bypass tooling.
 
+
+---
+
+## 2026-05-06 — Matcher safety overhaul: STRONG MATCH on a nav bar
+
+### What the operator caught
+
+A scan reviewed today flagged a black "SUPPORT  ABOUT" navigation
+strip as an 80% STRONG MATCH / VIOLATION / MODIFIED against
+`CAT_CC_AVAILABILITY_RA.png` (a busy multi-color scissor-lift
+creative). Pipeline Hash on the bad row was 50–60. The operator
+correctly noted that historically valid matches always show Pipeline
+Hash ≥ 80, and that the rollback to `eb48184` (the 4/29 baseline)
+had not fixed the problem. After investigation: **the bugs were
+present in the eb48184 code itself**; what changed on 4/30 was
+the *mix* of which path images flowed through, not the matcher math.
+
+### Root cause — three structural failures stacked
+
+1. **CV-localize confirmation-bias loop.** When a page returned
+   `OUTCOME_BLOCKED` (Akamai / Cloudflare / timeout — increasingly
+   common after the Phase-6.5 BD swap), the runner captured a full
+   ScreenshotOne page, then called
+   `extraction_service.localize_screenshot_capture` which iterated
+   every campaign asset and asked OpenCV's template matcher to find
+   that asset on the page screenshot. Any region that scored
+   ≥ 0.40 on `TM_CCOEFF_NORMED` (a "weakly correlated" threshold,
+   not "matches") was cropped out, uploaded, and inserted as a fresh
+   `discovered_images` row tagged
+   `extraction_method: cv_localized_from_screenshot`. The AI
+   pipeline then ran `ensemble_match(asset_url, crop_url)` against
+   the *same asset CV had pre-selected*. The crop was sized exactly
+   like the asset, in roughly the right region, and the question
+   asked of Claude was leading. This was confirmation bias by
+   design: CV's guess flowed back through Claude as an answer.
+
+2. **Verifier scoring minted phantom STRONG MATCHES at 80.** The
+   borderline verifier's score formula was literally
+   `verified_score = gates_passed * 20`, so:
+       3 of 5 gates → 60 (PARTIAL)
+       4 of 5 gates → **80 (STRONG)**
+       5 of 5 gates → 100 (EXACT)
+   On a CV-cropped region of webpage chrome, Claude could plausibly
+   set `gate_brand=true` (Cat is on the page somewhere),
+   `gate_product=true` (the crop is asset-shaped), `gate_message=true`
+   ("rent" appears in the page chrome) and `gate_design=true`
+   (similar palette) → 4 gates → mechanical 80%. This is exactly
+   the operator's screenshot.
+
+3. **`asset_visible` final gate was computed but ignored.** The
+   compliance prompt has always asked Claude to set
+   `asset_visible: true/false` — it's the model's chance to say "I
+   don't actually see the creative in this discovered image." That
+   flag was being read off the JSON, but the result was not gated on
+   it. So when Claude correctly said the creative was not present,
+   the system still recorded the match (just labelled it MODIFIED +
+   VIOLATION). The single safety check that could have caught every
+   other gate's hallucination wasn't wired in.
+
+The supporting cast (also fixed):
+
+* `cv_matching.template_match` ran 50 scale steps from 10% to 180%
+  with threshold 0.40. At that threshold something almost always
+  cleared at *some* scale on *any* asset/page combo.
+* `feature_match` accepted 8 ORB keypoints with `min_inliers // 2 =
+  4` RANSAC inliers — text corners and button edges easily clear
+  that bar between unrelated UI rectangles.
+* The hash + CLIP prefilters used loose default thresholds (28 / 64,
+  0.40 cosine) that were calibrated for real `<img>` extractions.
+  Once the input was a CV crop that had already been geometrically
+  pre-selected for asset-likeness, those thresholds did effectively
+  no work.
+* The `ensemble_match` weighting `(visual: 0.5, hash: 0.15,
+  agreement_bonus: 5)` meant a confident-but-hallucinated visual
+  score of 85 paired with an honest hash score of 50 produced a
+  final ~78 — over the regular threshold of 60. Hash got outvoted.
+* Page-hit-cache was self-perpetuating bad matches: any page that
+  scored a "match" (including the borderline 60–79 false positives)
+  was added to `page_hit_cache` and then visited *first* on the next
+  scan, which re-fired the same false positive, which refreshed
+  `last_hit_at`, which kept the page hot.
+* Database state was the other half of the regression. After the
+  rollback, `host_scan_policy` still had many hosts pinned to
+  `screenshotone_only` / `screenshotone_residential` / `unreachable`
+  from the BD-era promotion logic, so nearly every blocked host
+  went straight into the CV-localize path described above.
+
+### The fix — code
+
+Seven file changes; all behind sensible defaults.
+
+**`backend/app/services/ai_service.py`**
+* `process_discovered_image` now respects `compliance.asset_visible`
+  as a final veto. An explicit `False` returns `(None,
+  "asset_invisible_rejected")` and the match is dropped. `None`
+  (model didn't populate the field) falls through — we only veto on
+  evidence, not silence.
+* `analyze_compliance` now plumbs `asset_visible` from the JSON
+  response into `ComplianceCheckResult`.
+* `verify_borderline_match` requires 4-of-5 gates instead of 3 and
+  uses a compressed score curve:
+       0–2 gates → 0–25  (NONE)
+       3 gates  → 50    (below regular threshold, rejected)
+       4 gates  → 65    (PARTIAL match)
+       5 gates  → 80    (STRONG match)
+  Crucially, 4-of-5 no longer mints STRONG MATCH and 5-of-5 no
+  longer mints EXACT. The verifier's prompt was also tightened to
+  match: "is_match: true ONLY if gate_brand AND gate_product AND
+  gates_passed >= 4."
+* `ensemble_match` applies a hash-veto: when `visual_score >= 75`
+  but `hash_score <= 55` (and the input is not a screenshot), the
+  final score is capped at `hash_score + 10`. Perceptual hashing is
+  the most truthful signal we compute and cannot hallucinate; when
+  it disagrees with the visual scorer by a wide margin, the visual
+  is wrong.
+* `_passes_hash_prefilter` and `_passes_clip_prefilter` accept a
+  `strict=True` flag for inputs that have already been geometrically
+  pre-selected (currently CV-localized crops). Strict thresholds:
+  hash diff ≤ 16 (vs 28 default), CLIP cosine ≥ 0.55 (vs 0.40).
+* `process_discovered_image` accepts a new `extraction_method`
+  parameter and routes prefilter strict-mode based on
+  `extraction_method == "cv_localized_from_screenshot"`.
+* New pipeline stage label `asset_invisible_rejected` for the
+  funnel counters.
+
+**`backend/app/services/cv_matching.py`**
+* `template_match` default threshold 0.40 → 0.70.
+* `feature_match` default `min_good_matches` 8 → 18,
+  `ratio_thresh` 0.78 → 0.72, RANSAC inlier floor lifted from
+  `min_good_matches // 2` to `max(8, 0.75 * min_good_matches)`.
+* `find_asset_on_page` defaults updated accordingly. Each change
+  has an in-file rationale paragraph so a future tightening
+  regression has to delete the comment too.
+
+**`backend/app/services/extraction_service.py`**
+* `localize_screenshot_capture` now early-returns when
+  `settings.cv_localize_screenshot_crops_enabled` is False, which is
+  the new default. The full-page evidence row is unaffected — we
+  still capture and store the screenshot. We just stop feeding
+  CV-cropped regions back into the matcher.
+
+**`backend/app/services/scan_runners.py`**
+* `_analyze_single_image` return type changed from `Optional[str]`
+  to `Optional[Tuple[str, int]]` (asset_id, confidence_score). Both
+  callers updated.
+* Page-hit-cache only learns from confidently matched pages —
+  matches below `max(strong_match_threshold, partial_match_threshold
+  + 10)` (i.e. 80 with current config) do NOT enter the cache. Same
+  threshold is enforced on the cache-phase loop. Borderline matches
+  cannot self-perpetuate.
+* Plumbs `metadata.extraction_method` from the discovered_images
+  row into the AI pipeline so strict prefilters fire for CV crops.
+
+**`backend/app/config.py`**
+* New: `cv_localize_screenshot_crops_enabled` (default False).
+* New: `hash_prefilter_strict_max_diff` (default 16).
+* New: `clip_similarity_strict_threshold` (default 0.55).
+
+**`backend/app/models.py`**
+* `ComplianceCheckResult.asset_visible: Optional[bool]` (None
+  default — compatible with every existing caller).
+
+**`supabase/migrations/031_reset_dirty_matcher_state.sql`**
+* Resets every non-`manual_override` row in `host_scan_policy` to
+  `playwright_desktop` / confidence 0 / no last_outcome. The next
+  scan re-probes each host via preflight; legitimately blocked
+  Akamai hosts will end up where they belong without the BD-era
+  promotion baggage.
+* Truncates `page_hit_cache`. Any hot pages recorded during the
+  regression were recorded because the matcher was hallucinating.
+  Re-populates organically from post-fix scans, which now refuse
+  to enter borderline matches into the cache at all.
+
+### The fix — tests
+
+`backend/tests/test_matcher_safety_gates.py` — 10 tests, all pass:
+
+1. CV `find_asset_on_page` rejects a synthetic dark nav-bar crop
+   against a busy multi-color creative (the operator's exact bad
+   case, in code).
+2. The default thresholds on `find_asset_on_page`, `template_match`
+   and `feature_match` are pinned (≥ 0.70, ≥ 18) so a future loosening
+   has to update the test too.
+3. Hash prefilter strict mode rejects a 22-bit-diff hash that the
+   loose default would accept.
+4. CLIP prefilter strict mode rejects a 0.45 cosine that the loose
+   default would accept.
+5. `process_discovered_image` returns `asset_invisible_rejected`
+   when compliance says `asset_visible=False`, even with a 92%
+   visual score and is_match=True from the ensemble.
+6. `process_discovered_image` still publishes when
+   `asset_visible=None` (model silence is not a veto).
+7. Verifier with 3 gates returns `is_match=False`, `verified_score=50`.
+8. Verifier with 4 gates returns `is_match=True`, `verified_score=65`
+   (PARTIAL — the headline regression, no longer STRONG).
+9. Verifier with 5 gates returns `verified_score=80` (STRONG, not EXACT).
+10. `ensemble_match` with visual=85 / hash=50 caps the final at 60
+    (hash + 10), preventing the publish that would have happened at
+    the regular threshold.
+
+### Verification path for the operator
+
+Once the migration runs and the worker is redeployed:
+
+```sql
+-- (1) confirm host_scan_policy is back to a clean default state
+SELECT strategy, COUNT(*) FROM host_scan_policy GROUP BY strategy;
+
+-- (2) confirm page_hit_cache has been reset
+SELECT COUNT(*) FROM page_hit_cache;
+
+-- (3) audit: any *new* matches in the 60-79 band post-deploy?
+SELECT m.confidence_score,
+       m.match_type,
+       di.metadata->>'extraction_method' AS method,
+       m.created_at
+  FROM matches m
+  JOIN discovered_images di ON di.id = m.discovered_image_id
+ WHERE m.created_at >= now()
+   AND m.confidence_score BETWEEN 60 AND 79
+ ORDER BY m.created_at DESC;
+```
+
+(3) should be empty for matches whose `extraction_method` is
+`cv_localized_from_screenshot` — the path is disabled by default
+now and the gates above won't let one through even if it gets
+re-enabled.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `backend/app/models.py` | `ComplianceCheckResult.asset_visible: Optional[bool]` |
+| `backend/app/config.py` | `cv_localize_screenshot_crops_enabled`, `hash_prefilter_strict_max_diff`, `clip_similarity_strict_threshold` |
+| `backend/app/services/ai_service.py` | asset_visible final gate, hash-veto, verifier curve compression + 4-gate requirement, strict prefilter routing, `extraction_method` parameter, new pipeline stage label |
+| `backend/app/services/cv_matching.py` | template threshold 0.40→0.70, ORB min_good_matches 8→18, ratio 0.78→0.72, inlier floor lift |
+| `backend/app/services/extraction_service.py` | `localize_screenshot_capture` gated behind feature flag (default OFF) |
+| `backend/app/services/scan_runners.py` | `_analyze_single_image` returns (asset_id, confidence); page_hit_cache only learns ≥ STRONG matches; plumbs extraction_method |
+| `backend/tests/test_matcher_safety_gates.py` | NEW — 10 regression tests |
+| `supabase/migrations/031_reset_dirty_matcher_state.sql` | NEW — reset host_scan_policy + page_hit_cache |
+| `log.md` | this entry |
+
+### Tests
+
+* `pytest -q` → **157 passed** (147 pre-existing + 10 new).
+* Lints clean across all touched files.
+
+### What is NOT changed
+
+* Nothing about the regular `<img>` extraction path. Pages that
+  Playwright successfully renders behave identically to before — the
+  same prefilters at the same thresholds, the same Opus comparison,
+  the same thresholds. Only borderline matches near 60 are affected
+  by the new asset_visible gate, and only CV-localized inputs see
+  the strict prefilter thresholds.
+* The CV localization code itself is preserved, just feature-flagged
+  off. Re-enable via `CV_LOCALIZE_SCREENSHOT_CROPS_ENABLED=true`
+  after validating against held-out fixtures (eval/) and manually
+  inspecting at least 50 crop-derived matches without finding a
+  false positive. Recommend doing this only after the eval harness
+  has a `borderline_false` fixture for the nav-bar case (next step).
+
+### Follow-ups
+
+1. **Add the operator's screenshot to the eval harness as a
+   `clear_negative` fixture.** Hand-label both images, point the
+   manifest at them, and the CI gate will catch a future loosening
+   regression in seconds. The screenshot we have (Cat scissor-lift
+   creative + dark `SUPPORT  ABOUT` nav bar) is production-grade
+   evidence of the failure mode.
+2. **Surface Pipeline Hash on the `/matches` table view** so the
+   operator can sort by `score - hash_score` desc and find any
+   future hallucinations at a glance without opening each match.
+3. **Persist `pipeline_stats.asset_invisible_rejected` count** in
+   the scan funnel UI alongside `verification_rejected` and
+   `below_threshold` — gives ops visibility into how often the new
+   gate fires.
+4. **Once two clean weeks of post-fix scans are in the bank**,
+   consider lifting the new `cv_localize_screenshot_crops_enabled`
+   default to True for a controlled subset of organisations (those
+   whose primary KPI is recall on Akamai-walled hosts like Cat
+   dealers). Until then, accept the recall hit on blocked pages —
+   the operator was very clear that false positives erode trust
+   faster than missed matches do.
+
+### Commits
+
+(this commit, single PR)
+
+
+---
+
+## 2026-05-06 — Meta Ad Library actor swap: nourishing_courier → whoareyouanas/meta-ad-scraper
+
+### What changed
+
+Operator request: switch the Meta Ad Library scraper from
+`nourishing_courier~meta-ads-scraper-pro` to
+`whoareyouanas~meta-ad-scraper`. This isn't a drop-in swap — the
+input and output schemas are materially different.
+
+### Schema deltas
+
+**Input (per actor run):**
+
+| Old actor | New actor |
+|---|---|
+| `urls: [{url: "fb.com/dealerA"}, {url: "fb.com/dealerB"}, ...]` (bulk array, one run for all dealers) | `pageId: "108047081396228"` OR `targetUrl` OR `searchQuery` — one search per run |
+| `maxAds: 200` | (no equivalent — gated by `requestHandlerTimeoutSecs`) |
+| `country`, `adStatus`, `mediaType` | `country`, `activeStatus`, `mediaType` |
+| `proxyConfiguration: {useApifyProxy: true}` | `proxyUrl: "http://groups-RESIDENTIAL:..."` |
+| `includePageInsights`, `includeCreativeDetails`, `includeSpendData` | (no equivalents — actor always returns the full ad payload) |
+
+The big constraint: the new actor accepts **one search per run**.
+We fan out one actor invocation per dealer Facebook page (parallel,
+bounded by `settings.apify_meta_max_parallel_runs`, default 4).
+
+**Output (per ad):**
+
+| Old field | New field | Notes |
+|---|---|---|
+| `adId` | `libraryID` | Identifier rename. |
+| `adUrl` | (none) | Synthesised: `facebook.com/ads/library/?id=<libraryID>`. |
+| `pageName` | `brand` | Brand string used for fallback distributor matching only. |
+| `pageId` | (none returned per ad) | Source page is now tracked by which fan-out the ad came from. |
+| `imageUrls: ["url1", "url2"]` | `images: [{"url": "url1"}, {"url": "url2"}]` | Object-array shape; `_collect_media_urls` rewritten. |
+| `videoUrls: [...]` | `videos: [{"url": ..., "duration": 30}]` | Same. |
+| `status: "active"` | `active: true` | Boolean instead of string; mapped back to "active"/"inactive" for the metadata payload. |
+| `startDate: "2025-01-15T..."` (ISO) | `startDate: "1/15/2025"` (US format) | Stored verbatim — no downstream callers parse it. |
+| `headline`, `adText` | `linkTitle`, `body` | Renamed in metadata. Body truncated to 500 chars as before. |
+| `mediaType` | `format` (image / video / carousel) | Renamed. |
+| `type: "pageInsight"` filter | (none — actor doesn't return pageInsight rows) | Filter removed. |
+| New: `linkUrl`, `linkDescription`, `ctaText`, `ctaUrl`, `brandLogo`, `totalPlatforms`, `similarAdCount`, `multipleVersions` | Captured into metadata where useful (`link_url`, `cta_text`, `cta_url`). |
+
+### The slug → pageId problem
+
+Our `distributors` table only stores Facebook URLs in slug form
+(`facebook.com/somedealer`). The new actor demands a numeric
+`pageId`. We resolve at scan time, no schema change:
+
+1. **HTTP probe** — `GET https://www.facebook.com/<slug>` (and
+   `m.facebook.com/<slug>`) with a desktop UA, then regex the
+   numeric ID out of:
+       `<meta property="al:android:url" content="fb://page/?id=NUM">`
+       `<meta property="al:ios:url" content="fb://profile/NUM">`
+       `"pageID":"NUM"`, `"entity_id":"NUM"`, `"page_id":"NUM"`,
+       `"profile_id":"NUM"` (script JSON, multiple key variants
+       to absorb minor markup churn).
+2. **Playwright fallback** — for pages where the HTTP probe hits a
+   logged-out wall, we open the page in our existing browser pool,
+   read the same meta tags / inline JSON after JS hydration, and
+   pull the ID. ~1s overhead per fallback.
+3. **In-process cache** — `_PAGE_ID_CACHE` keyed on slug avoids
+   re-resolving the same dealer twice within a single scan.
+
+If both layers fail, that dealer is skipped with a WARNING and the
+rest of the scan continues. No per-dealer outage can fail the full
+multi-dealer run.
+
+### Files touched
+
+| File | Change |
+|---|---|
+| `backend/app/services/apify_meta_service.py` | **Full rewrite**: new ACTOR_ID, slug→pageId resolver (HTTP + Playwright), per-page fan-out (`_run_actor_for_page`), parallel orchestration in `scan_meta_ads`, all output-field remapping, libraryID-keyed Playwright tier-3 fallback. Public `scan_meta_ads(page_urls, scan_job_id, distributor_mapping, *, channel, campaign_assets)` signature unchanged so all callers + tests keep working. |
+| `backend/app/config.py` | New `apify_meta_proxy_url` (optional residential proxy URL forwarded to the actor) and `apify_meta_max_parallel_runs` (default 4 — bounds burst spend at $10/1000 ads × N parallel). |
+| `log.md` | this entry |
+
+### Distributor resolution improved
+
+Old path: brute-force fuzzy-match `pageName` → dealer name. With
+multiple dealers in one run that occasionally mis-attributed an ad
+when two dealer names were prefixes of each other.
+
+New path: each ad carries its source `page_url` (the URL that
+triggered the actor run that produced it), so distributor lookup is
+exact slug-to-id. Brand-name fallback is still wired in for
+defensive completeness but should never fire under the new
+fan-out model.
+
+### Cost considerations
+
+Pricing model changes from the old actor's compute-units billing
+to a flat **$10 per 1,000 ads**. Each `_run_actor_for_page`
+invocation reports `usageTotalUsd` and is recorded via
+`cost_tracker.record_apify_run` exactly as before.
+
+`apify_meta_max_parallel_runs=4` caps simultaneous actor runs so
+the worst-case burst on a 50-dealer scan is 4 concurrent runs, not
+50. Runs serialise after the first 4 finish.
+
+For high-volume nightly scans, set `APIFY_META_PROXY_URL` to your
+Apify residential proxy. Without it the actor returns a heavily
+sampled subset of ads — fine for spot checks, not fine for
+compliance scanning.
+
+### Backwards compatibility
+
+* Public `scan_meta_ads` signature: unchanged. All callers
+  (`scan_runners.run_facebook_scan`, `tests/test_scan_runners_dispatch.py`
+  mocks) keep working without modification.
+* `metadata.apify_actor` field: now `"whoareyouanas~meta-ad-scraper"`
+  on new rows. Older rows retain `"nourishing_courier~meta-ads-scraper-pro"`.
+  The frontend doesn't render this field, so no UI change needed.
+* `metadata.ad_id` → `metadata.library_id`. Anything that queries
+  `discovered_images.metadata->>'ad_id'` will need updating to read
+  `library_id` for new rows. (Audit: nothing in the current
+  `backend/` does this; if anyone has external dashboards keyed on
+  it, they'll see a column rename.)
+
+### Tests
+
+* `pytest -q` → **157 passed** (no regressions).
+* The `test_scan_runners_dispatch` tests just mock `scan_meta_ads`
+  with the same kwargs — they still pass without changes.
+* No actor-level integration test was added because Apify costs
+  $10/1000 ads to exercise; the unit-level fan-out logic is
+  exercised at the dispatcher level via the existing mocks. A live
+  smoke test against one known-good dealer is the right next step
+  before turning this on for nightly scans.
+
+### Required environment changes (operator action)
+
+1. Verify `APIFY_API_KEY` is still valid — same key works for the
+   new actor.
+2. Optional but strongly recommended for nightly compliance scans:
+   set `APIFY_META_PROXY_URL` to your Apify Residential proxy URL.
+   Format: `http://groups-RESIDENTIAL:<APIFY_TOKEN>@proxy.apify.com:8000`.
+3. Optional: tune `APIFY_META_MAX_PARALLEL_RUNS` (default 4).
+   Increase carefully — each run is independently billed.
+
+### Smoke test recommendation
+
+Run a one-off scan against a single high-volume dealer (e.g.
+Caterpillar's official US page) and confirm:
+
+1. The slug resolver finds a numeric pageId.
+2. The actor run completes within `apify_max_poll_seconds`
+   (default 40 min).
+3. `discovered_images.metadata->>'apify_actor'` reads
+   `whoareyouanas~meta-ad-scraper` for new rows.
+4. `discovered_images.metadata->>'library_id'` is populated and
+   numeric.
+5. At least some images flow through Tier 1 (`apify_meta` extraction
+   method) without needing the Playwright fallback.
+
+If Tier 1 returns zero images for a dealer with active ads, that's
+the signal to set `APIFY_META_PROXY_URL`.
+

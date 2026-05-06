@@ -301,6 +301,13 @@ class ComplianceCheckResult(BaseModel):
     is_compliant: bool
     issues: List[Dict[str, Any]]
     brand_elements: Dict[str, bool]
+    # Top-level asset_visible flag from the compliance prompt. The prompt
+    # has always asked for this, but the model previously dropped it,
+    # which removed the only safety check that could catch a junk
+    # CV-localized crop after Claude's visual matcher hallucinated a
+    # high score. Treat None as "unknown" — only an explicit False
+    # vetoes the match in process_discovered_image.
+    asset_visible: Optional[bool] = None
     zombie_ad: bool = False
     zombie_days: Optional[int] = None
     analysis_summary: str

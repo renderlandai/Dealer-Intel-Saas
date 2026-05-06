@@ -637,7 +637,19 @@ async def localize_screenshot_capture(
 
     Best-effort: a download failure or a localization failure logs at
     WARNING and returns 0. The full-page evidence row is unaffected.
+
+    Gated behind ``settings.cv_localize_screenshot_crops_enabled`` —
+    OFF by default after the 2026-05-06 confirmation-bias incident. See
+    that flag's docstring in config.py for the rationale and the
+    re-enable checklist.
     """
+    if not getattr(settings, "cv_localize_screenshot_crops_enabled", False):
+        log.debug(
+            "CV localize-from-screenshot disabled by config — "
+            "skipping crop generation for %s",
+            evidence_url[:80] if evidence_url else "(no url)",
+        )
+        return 0
     if not campaign_assets:
         return 0
     if not evidence_url:
