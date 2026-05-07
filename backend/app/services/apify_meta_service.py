@@ -115,28 +115,173 @@ _OG_URL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Lightweight in-process cache for a single scan run. Resolving the
+# og:title extraction. Facebook stamps the page's display name on every
+# server-rendered page; we capture it during the same render that does
+# the og:url identity check, then feed it as the search query for the
+# meta-ad-scraper actor's keyword-search URL form. This is the path
+# that side-steps the Ad-Library-vs-profile-graph namespace mismatch
+# (see migration 034 for the full diagnosis).
+_OG_TITLE_PATTERN = re.compile(
+    r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"',
+    re.IGNORECASE,
+)
+
+# Lightweight in-process caches for a single scan run. Resolving the
 # same dealer twice within seconds is wasteful and slightly increases
 # the chance of triggering Meta's bot heuristics. Cleared at process
-# restart; we don't persist to Supabase to keep this change zero-
-# schema-impact (per the input-strategy decision recorded in log.md).
+# restart; persisted equivalents live on the distributors row
+# (``facebook_page_id`` per migration 032, ``facebook_page_name`` per
+# migration 034).
 _PAGE_ID_CACHE: Dict[str, str] = {}
+_PAGE_NAME_CACHE: Dict[str, str] = {}
 
 
-async def _http_resolve_page_id(slug: str) -> Optional[str]:
+# Pattern used to strip a trailing " | <Location>" or " - <Location>"
+# from an og:title. Facebook formats business-page titles as
+# "<Page Name> | <City State>" or "<Page Name> - <Tagline> | <City>".
+# We want just "<Page Name>" / "<Page Name> - <Tagline>" for the search
+# query — including the city makes the keyword search miss when the
+# advertiser is searched for at the country level (which is how Ad
+# Library scopes our scans).
+_TITLE_LOCATION_SUFFIX = re.compile(
+    r"\s*\|\s*[^|]+$",  # everything from the LAST " | " onward
+)
+
+
+def _extract_og_title(html: str) -> Optional[str]:
+    """Return the value of ``<meta property="og:title">`` if present.
+
+    HTML-decoded for the few entities Facebook actually emits in
+    titles (``&#xb7;`` and ``&amp;`` are the common ones). Returns
+    ``None`` for any input where the meta tag isn't present (login
+    walls, interstitials, etc.).
+    """
+    m = _OG_TITLE_PATTERN.search(html)
+    if not m:
+        return None
+    raw = m.group(1)
+    return (
+        raw.replace("&amp;", "&")
+        .replace("&#xb7;", "·")
+        .replace("&quot;", '"')
+        .replace("&#39;", "'")
+        .strip()
+    )
+
+
+def _clean_page_name(title: str) -> str:
+    """Strip the trailing location suffix Facebook appends to og:title.
+
+    Examples:
+        "Yancey Rents - The Cat Rental Store | Austell GA"
+            → "Yancey Rents - The Cat Rental Store"
+        "Carolina Cat | Charlotte, NC"
+            → "Carolina Cat"
+        "Holt CAT"
+            → "Holt CAT"  (no change — no suffix to strip)
+
+    The dash-separated pattern ("Name - Tagline") is left intact
+    because the dash is part of the page's display name, not a
+    location separator. Facebook only appends the city in the form
+    " | …" so that's the only suffix we strip.
+    """
+    if not title:
+        return ""
+    cleaned = _TITLE_LOCATION_SUFFIX.sub("", title).strip()
+    # Defensive: if the strip would have eaten everything, fall back
+    # to the raw title rather than an empty string.
+    return cleaned or title.strip()
+
+
+# Characters dropped before fuzzy-comparing a dealer's expected name
+# against the actor's reported pageName for post-filter purposes.
+# Spaces and most punctuation differ across renderings of the same
+# brand (e.g. "YanceyRents" slug vs. "Yancey Rents - The Cat Rental
+# Store" og:title); normalising to lowercase alphanumerics before
+# substring comparison keeps the filter robust without resorting to
+# heavyweight fuzzy-string libraries.
+_NAME_NORMALIZE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_for_match(value: str) -> str:
+    """Lowercase + alphanumeric-only, for cross-rendering name comparison."""
+    if not value:
+        return ""
+    return _NAME_NORMALIZE.sub("", value.lower())
+
+
+def _name_matches_dealer(
+    actor_page_name: Optional[str],
+    expected_name: Optional[str],
+    expected_slug: Optional[str],
+) -> bool:
+    """Return True if the actor's reported ``pageName`` plausibly
+    belongs to the dealer we asked about.
+
+    Used as a post-filter on actor results when we ran in keyword-
+    search mode — the keyword query can return ads from any advertiser
+    whose name contains the search string (e.g. searching "Yancey
+    Rents" can also return an unrelated "Yancey Rentals LLC" ad).
+    Because the actor returns ``pageName`` on every ad, we drop ads
+    whose page name doesn't match either the expected display name
+    or the slug.
+
+    Match rule (any one is sufficient):
+        1. Normalised expected_name is a substring of normalised
+           actor_page_name (or vice versa).
+        2. Normalised expected_slug is a substring of normalised
+           actor_page_name.
+        3. Both inputs are missing/empty (no filter possible — fail
+           open so we don't drop every ad on a metadata gap).
+
+    Matching is case- and punctuation-insensitive; strings are
+    normalised to lowercase alphanumerics first. This handles the
+    common variations: "Yancey Rents" vs. "yanceyrents" vs.
+    "Yancey Rents - The Cat Rental Store".
+    """
+    if not actor_page_name:
+        return False
+
+    actor_norm = _normalize_for_match(actor_page_name)
+    if not actor_norm:
+        return False
+
+    expected_name_norm = _normalize_for_match(expected_name or "")
+    expected_slug_norm = _normalize_for_match(expected_slug or "")
+
+    if not expected_name_norm and not expected_slug_norm:
+        return True  # no signal to filter on; fail open
+
+    if expected_name_norm and (
+        expected_name_norm in actor_norm or actor_norm in expected_name_norm
+    ):
+        return True
+    if expected_slug_norm and expected_slug_norm in actor_norm:
+        return True
+    return False
+
+
+async def _http_resolve_page_meta(
+    slug: str,
+) -> Tuple[Optional[str], Optional[str]]:
     """Free first-pass resolver: a plain GET against facebook.com/<slug>
-    and m.facebook.com/<slug>, scanning the response body for any of
-    ``_PAGE_ID_PATTERNS``.
+    and m.facebook.com/<slug>, returning ``(page_id, page_name)``.
 
-    Cheap and fast when it works. Increasingly doesn't, because Meta
-    walls anonymous traffic — see the 2026-05-06 22:00 UTC log entry.
-    Kept as the first tier because (a) cache-warm dealers shouldn't
-    need an Apify call to re-resolve, and (b) any slug that DOES leak
-    its ID anonymously costs us nothing.
+    Either or both can be ``None``. The page_id (numeric, page-keyed)
+    comes from ``_PAGE_ID_PATTERNS``; the page_name (display-string)
+    comes from ``og:title`` with the location suffix stripped.
+
+    Why both in one call? Because Meta walls anonymous traffic
+    (see 2026-05-06 22:00 UTC log entry) and the page_id misses on
+    most modern dealer pages — but ``og:title`` is rendered into the
+    same logged-out shell and is essentially never blocked. Capturing
+    it for free here lets the keyword-search actor URL form work
+    without falling through to Playwright.
 
     Uses a desktop user-agent because Meta returns slightly different
     markup to "modern" UAs and the mobile UA path occasionally
-    redirects to a barebones logged-out wall with no ID embedded.
+    redirects to a barebones logged-out wall with no metadata
+    embedded.
     """
     headers = {
         "User-Agent": (
@@ -150,6 +295,8 @@ async def _http_resolve_page_id(slug: str) -> Optional[str]:
         f"https://www.facebook.com/{slug}",
         f"https://m.facebook.com/{slug}",
     ]
+    found_id: Optional[str] = None
+    found_name: Optional[str] = None
     async with httpx.AsyncClient(
         timeout=15.0, follow_redirects=True, headers=headers,
     ) as client:
@@ -157,16 +304,40 @@ async def _http_resolve_page_id(slug: str) -> Optional[str]:
             try:
                 resp = await client.get(url)
             except Exception as e:
-                log.debug("HTTP page-id probe failed for %s: %s", url, e)
+                log.debug("HTTP page-meta probe failed for %s: %s", url, e)
                 continue
             if resp.status_code >= 400:
                 continue
             body = resp.text
-            for pattern in _PAGE_ID_PATTERNS:
-                m = pattern.search(body)
-                if m:
-                    return m.group(1)
-    return None
+
+            # Identity check first — make sure the body we got back
+            # actually corresponds to the slug we asked for. The
+            # logged-out wall sometimes serves an interstitial whose
+            # og:url points elsewhere.
+            if not _is_authentic_page_render(body, str(resp.url), slug):
+                continue
+
+            if found_id is None:
+                for pattern in _PAGE_ID_PATTERNS:
+                    m = pattern.search(body)
+                    if m:
+                        candidate = m.group(1)
+                        if (
+                            candidate
+                            and candidate.isdigit()
+                            and int(candidate) > 0
+                        ):
+                            found_id = candidate
+                            break
+
+            if found_name is None:
+                title = _extract_og_title(body)
+                if title:
+                    found_name = _clean_page_name(title)
+
+            if found_id and found_name:
+                break
+    return found_id, found_name
 
 
 def _extract_id_from_url(url: str) -> Optional[str]:
@@ -247,17 +418,26 @@ def _is_authentic_page_render(
     return final_slug == expected
 
 
-async def _playwright_resolve_one(url: str) -> Optional[str]:
-    """Resolve a single dealer URL to its numeric Facebook page ID by
-    rendering the page in headless Chromium, verifying the rendered
-    DOM is actually the dealer's page, then extracting the numeric
-    ID from page-keyed deep-link metadata.
+async def _playwright_resolve_one(
+    url: str,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve a single dealer URL to ``(page_id, page_name)`` by
+    rendering the page in headless Chromium and extracting metadata
+    from the verified DOM.
+
+    Either or both return values can be ``None`` — name resolution
+    succeeds independently of ID resolution because they come from
+    different meta tags (``og:title`` vs. the deep-link / inline-JSON
+    page-keyed regexes). For Ad Library searching we now actually
+    prefer the name (see migration 034 for why), so a (None, "Yancey
+    Rents - …") return is fully usable downstream.
 
     Strategy:
 
       1. Fast-path: if the URL already encodes a numeric ID
          (``profile.php?id=`` or ``facebook.com/<digits>``), return
-         it without opening a browser.
+         that ID directly with no name (the actor URL builder will
+         fall back to the slug as the search query).
       2. Try ``m.facebook.com/<slug>`` with the mobile UA, then
          ``www.facebook.com/<slug>`` with the desktop UA. For each:
            a) Render and wait for ``domcontentloaded`` + short settle.
@@ -266,31 +446,34 @@ async def _playwright_resolve_one(url: str) -> Optional[str]:
               == ``/<input slug>``. If neither matches, skip this
               candidate — Facebook served us something other than
               the dealer's page (login wall, redirect, etc.) and
-              any numeric IDs in the DOM are about something else.
-           c) Run page-keyed regexes (only) against the verified
-              DOM. Return the first numeric match.
+              any metadata in the DOM is about something else.
+           c) Run page-keyed regexes for the numeric ID and grab
+              ``og:title`` for the name. Return as soon as we have
+              a name (the ID is best-effort — many of our dealers
+              are profile-backed business accounts where Ad Library
+              doesn't accept the slug-canonical numeric anyway, so
+              the name is the load-bearing signal).
       3. If both candidates fail identity verification, return
-         ``None`` — caller logs a per-dealer skip warning.
+         ``(None, None)`` — caller logs a per-dealer skip warning.
 
-    The identity check is the difference between "drop in pageId" vs
-    "drop in random user/session ID". Without it, the resolver was
-    picking up viewer/visitor IDs from logged-out walls and feeding
-    them to the meta-ad-scraper, which then loaded an Ad Library
-    page where the transparency block read ``ID: undefined`` and
-    returned 0 ads. See log.md 2026-05-07 entry for the full debug
-    trace.
+    The identity check is the difference between "drop in correct
+    metadata" vs. "drop in metadata from a login wall". Without it,
+    earlier resolvers picked up viewer/session IDs from logged-out
+    walls and fed them to the meta-ad-scraper, which then loaded an
+    Ad Library page where the transparency block read
+    ``ID: undefined`` and returned 0 ads. See log.md 2026-05-07
+    entries for the full debug trace.
 
-    Returns the numeric ID or ``None``. Network / browser errors are
-    swallowed at debug level so a single bad dealer doesn't crash
-    the whole batch resolver.
+    Network / browser errors are swallowed at debug level so a
+    single bad dealer doesn't crash the whole batch resolver.
     """
     direct = _extract_id_from_url(url)
     if direct:
-        return direct
+        return direct, None
 
     slug = _extract_page_slug(url)
     if not slug:
-        return None
+        return None, None
 
     # Mobile first (less aggressive logged-out wall), desktop second.
     candidates: List[Tuple[str, bool]] = [
@@ -304,7 +487,10 @@ async def _playwright_resolve_one(url: str) -> Optional[str]:
         browser = await _get_browser()
     except Exception as e:
         log.warning("Playwright resolver could not get browser: %s", e)
-        return None
+        return None, None
+
+    found_id: Optional[str] = None
+    found_name: Optional[str] = None
 
     for candidate_url, mobile in candidates:
         page = None
@@ -331,22 +517,32 @@ async def _playwright_resolve_one(url: str) -> Optional[str]:
                 )
                 continue
 
-            for pattern in _PAGE_ID_PATTERNS:
-                m = pattern.search(content)
-                if m:
-                    pid = m.group(1)
-                    if pid and pid.isdigit() and int(pid) > 0:
-                        log.debug(
-                            "Playwright resolver got pageId=%s for "
-                            "%s via %s (verified)",
-                            pid, slug, candidate_url,
-                        )
-                        return pid
+            if found_id is None:
+                for pattern in _PAGE_ID_PATTERNS:
+                    m = pattern.search(content)
+                    if m:
+                        pid = m.group(1)
+                        if pid and pid.isdigit() and int(pid) > 0:
+                            found_id = pid
+                            break
+
+            if found_name is None:
+                title = _extract_og_title(content)
+                if title:
+                    found_name = _clean_page_name(title)
+
+            if found_name:
+                log.debug(
+                    "Playwright resolver got pageName=%r (pageId=%r) "
+                    "for %s via %s (verified)",
+                    found_name, found_id, slug, candidate_url,
+                )
+                return found_id, found_name
 
             log.debug(
                 "Playwright resolver: %s rendered authentic page "
-                "for slug=%r but no page-keyed pageId pattern "
-                "matched; trying next candidate",
+                "for slug=%r but extracted no og:title; trying "
+                "next candidate",
                 candidate_url, slug,
             )
         except Exception as e:
@@ -361,101 +557,121 @@ async def _playwright_resolve_one(url: str) -> Optional[str]:
                 except Exception:
                     pass
 
-    return None
+    return found_id, found_name
 
 
 async def _playwright_resolve_page_ids(
     page_urls: List[str],
-) -> Dict[str, str]:
+) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Tier-4 resolver via headless Chromium.
 
     Replaces the previous ``apify/facebook-pages-scraper`` dependency,
     which required a separate Apify rental and consistently 400'd in
     production (see log.md 2026-05-06 22:23 UTC). Playwright is in-
-    process, free, and gives us the same numeric pageId by extracting
-    it from the JS-rendered DOM rather than asking a third-party
-    actor to do it for us.
+    process, free, and gives us page metadata by extracting it from
+    the JS-rendered DOM rather than asking a third-party actor to do
+    it for us.
+
+    Returns a ``(id_map, name_map)`` tuple. Either map can be empty;
+    they are not symmetric because name resolution succeeds for many
+    profile-backed business accounts where ID resolution doesn't
+    (the Ad-Library namespace mismatch — see migration 034). For
+    keyword-search Ad Library URLs the name map is the important
+    output; the id map is kept as a best-effort cache for any future
+    code path that still needs the numeric.
 
     Concurrency is bounded by ``_PW_CONCURRENCY`` so we don't open
     50 browser contexts in parallel and trip Meta's bot heuristics.
-    Each successful resolution gets persisted back to
-    ``distributors.facebook_page_id`` by the caller, so this path is
-    only exercised once per dealer-lifetime — every subsequent scan
-    hits Tier 2 (DB) and returns instantly.
-
-    Returns ``{page_url: pageId}`` for every URL we could resolve.
-    URLs that failed every candidate are simply absent from the
-    output dict (the caller is responsible for the per-dealer skip
-    warning).
+    Each successful resolution gets persisted back to the
+    distributors row by the caller, so this path is only exercised
+    once per dealer-lifetime — every subsequent scan hits Tier 2
+    (DB) and returns instantly.
     """
     if not page_urls:
-        return {}
+        return {}, {}
 
     sem = asyncio.Semaphore(_PW_CONCURRENCY)
-    out: Dict[str, str] = {}
+    id_out: Dict[str, str] = {}
+    name_out: Dict[str, str] = {}
 
     async def _bounded(url: str):
         async with sem:
             try:
-                pid = await _playwright_resolve_one(url)
+                pid, pname = await _playwright_resolve_one(url)
             except Exception as e:
                 log.debug(
                     "Playwright resolver crashed on %s: %s", url, e,
                 )
                 return
             if pid:
-                out[url] = pid
+                id_out[url] = pid
+            if pname:
+                name_out[url] = pname
 
     await asyncio.gather(
         *[_bounded(u) for u in page_urls], return_exceptions=True,
     )
 
     log.info(
-        "Playwright resolver returned pageIds for %d/%d dealer(s)",
-        len(out), len(page_urls),
+        "Playwright resolver returned metadata for %d/%d dealer(s) "
+        "(pageIds=%d, pageNames=%d)",
+        max(len(id_out), len(name_out)), len(page_urls),
+        len(id_out), len(name_out),
     )
-    return out
+    return id_out, name_out
 
 
 async def _resolve_facebook_page_ids_batch(
     page_urls: List[str],
     distributor_mapping: Optional[Dict[str, UUID]] = None,
-) -> Dict[str, str]:
+) -> Tuple[Dict[str, str], Dict[str, str]]:
     """Tiered resolver — the public entrypoint used by ``scan_meta_ads``.
 
-    Resolves a batch of dealer URLs to their numeric Facebook page IDs
-    in this priority order:
+    Returns ``(id_map, name_map)`` for the batch. Either map can be
+    sparse; they're not symmetric. The actor URL builder downstream
+    prefers the name map (keyword-search Ad Library URL) and falls
+    back to the slug only if both are empty for a given dealer.
 
-        1. In-process cache (``_PAGE_ID_CACHE``).
-        2. Persisted ``distributors.facebook_page_id`` column (set by
-           a previous successful scan). This is the steady-state path
-           and the reason the migration in 032 exists.
-        3. Anonymous HTTP probe (free; mostly fails post-2026 because
-           Facebook serves a JS-only shell to logged-out httpx).
+    Resolution priority (each tier looks up both ID and name):
+
+        1. In-process caches (``_PAGE_ID_CACHE``, ``_PAGE_NAME_CACHE``).
+        2. Persisted ``distributors.facebook_page_id`` and
+           ``distributors.facebook_page_name`` columns (set by a
+           previous successful scan — see migrations 032 + 034).
+        3. Anonymous HTTP probe of facebook.com/<slug> + m.facebook.com/<slug>
+           (returns whichever metadata is in the logged-out HTML —
+           usually og:title, sometimes also a page-keyed numeric ID).
         4. Headless Playwright render of the same page — the JS
-           executes and the numeric ID becomes visible in meta tags
-           and inline JSON. Free, in-process, no Apify dependency.
+           executes and any deferred metadata becomes visible.
 
-    Successful resolutions from tiers 3+4 are written back to the
-    distributors row (best-effort) so future scans don't re-resolve.
-
-    Returns ``{page_url: pageId}``. URLs that couldn't be resolved by
-    any tier are simply absent from the result; the caller is expected
-    to log a per-dealer skip warning and continue.
+    Tier-3+4 successes are written back to the distributors row
+    (best-effort) so future scans don't re-resolve. URLs for which
+    BOTH outputs miss after all four tiers are absent from both
+    return maps; caller logs a per-dealer skip warning.
     """
     if not page_urls:
-        return {}
+        return {}, {}
     distributor_mapping = distributor_mapping or {}
-    result: Dict[str, str] = {}
+    id_result: Dict[str, str] = {}
+    name_result: Dict[str, str] = {}
 
-    # Tier 1: in-process cache.
+    # Tier 1: in-process caches.
     for url in page_urls:
         slug = _extract_page_slug(url)
-        if slug and slug in _PAGE_ID_CACHE:
-            result[url] = _PAGE_ID_CACHE[slug]
+        if not slug:
+            continue
+        if slug in _PAGE_ID_CACHE:
+            id_result[url] = _PAGE_ID_CACHE[slug]
+        if slug in _PAGE_NAME_CACHE:
+            name_result[url] = _PAGE_NAME_CACHE[slug]
 
-    # Tier 2: persisted column on distributors. Single batched select.
-    pending = [u for u in page_urls if u not in result]
+    def _is_resolved(u: str) -> bool:
+        # A dealer is considered resolved as long as we have *either*
+        # a name or an ID — the actor URL builder needs only one.
+        return u in name_result or u in id_result
+
+    # Tier 2: persisted columns on distributors. Single batched select.
+    pending = [u for u in page_urls if not _is_resolved(u)]
     if pending:
         slug_to_dist = _build_url_to_distributor_map(pending, distributor_mapping)
         dist_ids = list({
@@ -467,112 +683,146 @@ async def _resolve_facebook_page_ids_batch(
             try:
                 resp = (
                     supabase.table("distributors")
-                    .select("id, facebook_page_id")
+                    .select("id, facebook_page_id, facebook_page_name")
                     .in_("id", [str(i) for i in dist_ids])
                     .execute()
                 )
                 dist_id_to_page_id: Dict[str, str] = {}
+                dist_id_to_page_name: Dict[str, str] = {}
                 for row in (resp.data or []):
                     pid = row.get("facebook_page_id")
                     if pid and str(pid).isdigit() and int(str(pid)) > 0:
                         dist_id_to_page_id[str(row["id"])] = str(pid)
+                    pname = row.get("facebook_page_name")
+                    if pname and isinstance(pname, str) and pname.strip():
+                        dist_id_to_page_name[str(row["id"])] = pname.strip()
 
                 for url in pending:
                     slug = _extract_page_slug(url)
-                    dist_id = slug_to_dist.get(slug)
-                    if dist_id and str(dist_id) in dist_id_to_page_id:
-                        result[url] = dist_id_to_page_id[str(dist_id)]
+                    dist_id = slug_to_dist.get(slug) if slug else None
+                    if not dist_id:
+                        continue
+                    dist_key = str(dist_id)
+                    if dist_key in dist_id_to_page_id and url not in id_result:
+                        id_result[url] = dist_id_to_page_id[dist_key]
                         if slug:
-                            _PAGE_ID_CACHE[slug] = result[url]
+                            _PAGE_ID_CACHE[slug] = id_result[url]
+                    if dist_key in dist_id_to_page_name and url not in name_result:
+                        name_result[url] = dist_id_to_page_name[dist_key]
+                        if slug:
+                            _PAGE_NAME_CACHE[slug] = name_result[url]
             except Exception as e:
-                # Migration 032 may not have applied yet; degrade
-                # gracefully to the live-resolution path.
+                # Migration 032 / 034 may not have applied yet;
+                # degrade gracefully to the live-resolution path.
                 log.debug(
-                    "DB lookup of distributors.facebook_page_id "
-                    "failed (migration 032 may be pending): %s", e,
+                    "DB lookup of distributors.facebook_page_id / "
+                    "facebook_page_name failed (migrations 032/034 "
+                    "may be pending): %s", e,
                 )
 
-    # Tier 3: anonymous HTTP probe.
-    pending = [u for u in page_urls if u not in result]
+    # Tier 3: anonymous HTTP probe (now also captures og:title).
+    pending = [u for u in page_urls if not _is_resolved(u)]
     http_resolved_urls: set = set()
     if pending:
         for url in pending:
             slug = _extract_page_slug(url)
             if not slug:
                 continue
-            pid = await _http_resolve_page_id(slug)
-            if pid:
-                result[url] = pid
-                http_resolved_urls.add(url)
+            pid, pname = await _http_resolve_page_meta(slug)
+            wrote_anything = False
+            if pid and url not in id_result:
+                id_result[url] = pid
                 _PAGE_ID_CACHE[slug] = pid
+                wrote_anything = True
+            if pname and url not in name_result:
+                name_result[url] = pname
+                _PAGE_NAME_CACHE[slug] = pname
+                wrote_anything = True
+            if wrote_anything:
+                http_resolved_urls.add(url)
 
     # Tier 4: headless Playwright render. Free, in-process, no Apify
-    # dependency. Replaces the previously-used apify/facebook-pages-
-    # scraper which kept 400'ing in production (see log.md
-    # 2026-05-06 22:23 UTC entry).
-    needs_pw = [u for u in page_urls if u not in result]
-    pw_resolved: Dict[str, str] = {}
+    # dependency.
+    needs_pw = [u for u in page_urls if not _is_resolved(u)]
+    pw_id_resolved: Dict[str, str] = {}
+    pw_name_resolved: Dict[str, str] = {}
     if needs_pw:
         log.info(
             "Tier-4 (Playwright render) resolving %d dealer(s) the "
             "anonymous HTTP probe could not crack", len(needs_pw),
         )
-        pw_resolved = await _playwright_resolve_page_ids(needs_pw)
-        for url, pid in pw_resolved.items():
-            result[url] = pid
-            slug = _extract_page_slug(url)
-            if slug:
-                _PAGE_ID_CACHE[slug] = pid
+        pw_id_resolved, pw_name_resolved = await _playwright_resolve_page_ids(
+            needs_pw,
+        )
+        for url, pid in pw_id_resolved.items():
+            if url not in id_result:
+                id_result[url] = pid
+                slug = _extract_page_slug(url)
+                if slug:
+                    _PAGE_ID_CACHE[slug] = pid
+        for url, pname in pw_name_resolved.items():
+            if url not in name_result:
+                name_result[url] = pname
+                slug = _extract_page_slug(url)
+                if slug:
+                    _PAGE_NAME_CACHE[slug] = pname
+
+    pw_resolved_urls = set(pw_id_resolved.keys()) | set(pw_name_resolved.keys())
 
     # Tally the four tier outcomes for the operator log line below.
-    # We compute this BEFORE the persistence write-back so the
-    # numbers reflect where each URL was actually resolved (vs. where
-    # we re-stored it).
-    cache_or_db_hits = len(result) - len(http_resolved_urls) - len(pw_resolved)
-    missed = [u for u in page_urls if u not in result]
+    resolved_urls = set(id_result.keys()) | set(name_result.keys())
+    cache_or_db_hits = len(resolved_urls - http_resolved_urls - pw_resolved_urls)
+    missed = [u for u in page_urls if u not in resolved_urls]
 
     # Persist Tier 3 + Tier 4 results back to the DB so the next scan
     # finds them at Tier 2 and pays no resolver cost. Best-effort —
-    # missing column / RLS blocks just log at debug.
-    fresh_writes = http_resolved_urls | set(pw_resolved.keys())
+    # missing columns / RLS blocks just log at debug.
+    fresh_writes = http_resolved_urls | pw_resolved_urls
     if distributor_mapping and fresh_writes:
         slug_to_dist_full = _build_url_to_distributor_map(
             page_urls, distributor_mapping,
         )
         now = datetime.now(timezone.utc).isoformat()
         for url in fresh_writes:
-            pid = result.get(url)
             slug = _extract_page_slug(url)
             dist_id = slug_to_dist_full.get(slug) if slug else None
-            if not (pid and dist_id):
+            if not dist_id:
+                continue
+            update_payload: Dict[str, Any] = {}
+            if url in id_result:
+                update_payload["facebook_page_id"] = id_result[url]
+                update_payload["facebook_page_id_resolved_at"] = now
+            if url in name_result:
+                update_payload["facebook_page_name"] = name_result[url]
+            if not update_payload:
                 continue
             try:
-                supabase.table("distributors").update({
-                    "facebook_page_id": pid,
-                    "facebook_page_id_resolved_at": now,
-                }).eq("id", str(dist_id)).execute()
+                supabase.table("distributors").update(update_payload).eq(
+                    "id", str(dist_id),
+                ).execute()
             except Exception as e:
                 log.debug(
-                    "Could not persist facebook_page_id for %s: %s "
-                    "(migration 032 pending?)", slug, e,
+                    "Could not persist facebook_page_* for %s: %s "
+                    "(migrations 032/034 pending?)", slug, e,
                 )
 
     log.info(
-        "Facebook page-id resolution: %d/%d dealers resolved "
+        "Facebook page metadata resolution: %d/%d dealers resolved "
         "(cache+DB hit %d, HTTP probe added %d, Playwright added %d, "
-        "%d missed)",
-        len(result), len(page_urls),
-        cache_or_db_hits, len(http_resolved_urls), len(pw_resolved),
+        "%d missed) — id_map=%d, name_map=%d",
+        len(resolved_urls), len(page_urls),
+        cache_or_db_hits, len(http_resolved_urls), len(pw_resolved_urls),
         len(missed),
+        len(id_result), len(name_result),
     )
     for url in missed:
         log.warning(
-            "Could not resolve numeric page ID for %s. The "
-            "whoareyouanas/meta-ad-scraper actor requires a pageId. "
-            "Skipping this dealer for the current scan.",
+            "Could not resolve any Facebook page metadata for %s. "
+            "Skipping this dealer for the current scan (no name "
+            "and no pageId — Facebook served us nothing usable).",
             _extract_page_slug(url) or url,
         )
-    return result
+    return id_result, name_result
 
 
 # ---------------------------------------------------------------------------
@@ -607,39 +857,48 @@ def _ad_library_url_for(library_id: str) -> str:
 
 async def _start_actor_run(
     *,
-    page_id: str,
+    search_query: str,
     country: str = "US",
     active_status: str = "all",
     max_concurrency: int = 1,
     request_timeout_secs: int = 900,
 ) -> dict:
-    """Start a single actor run for a single dealer page ID.
+    """Start a single actor run for a single dealer.
 
-    Uses the actor's ``targetUrl`` input mode (Option A in the README)
-    rather than the parameters mode (Option B). When given individual
-    parameters, the actor's URL builder adds five extra query params
-    to the Ad Library URL — ``search_type=page``,
-    ``is_targeted_country=false``, ``media_type=all``, and the two
-    ``sort_data[…]`` keys — none of which appear in the actor's
-    documented working URL example. In production (2026-05-07) that
-    over-decorated URL caused Facebook to render a stripped layout
-    where the actor logged
-    ``WARNING: No ad cards detected on initial load - page may be blocked``
-    and returned 0 ads, even for advertisers with confirmed active
-    ads. Hand-building the URL to match the README example exactly
-    side-steps the actor's URL-builder entirely.
+    Uses Ad Library's keyword-search URL form
+    (``q=<search_query>&search_type=keyword_unordered``) rather than
+    the page-ID form (``view_all_page_id=NNN``). Two reasons:
 
-    The defensive ``page_id == "0"`` guard a few lines below in
-    ``_run_actor_for_page`` makes sure we never feed a literal "0"
-    (a residue from yesterday's loose-regex resolver writing actor
-    session IDs to the cache) to this function.
+      1. **Namespace mismatch on profile-backed accounts.** Many of
+         our dealers (Yancey Rents, Carolina CAT, Altorfer, …) have
+         Facebook accounts whose slug-canonical numeric ID lives in
+         the *profile* graph namespace, not the *advertiser*
+         namespace Ad Library uses. Pasting the profile ID into a
+         ``view_all_page_id=`` URL returns "no ads match your search
+         criteria" even when the dealer has confirmed active ads —
+         verified 2026-05-07 against multiple dealers.
+
+      2. **Same actor, no input-builder gotchas.** The actor's
+         parameters-mode URL builder adds extra query params that
+         break Ad Library's rendering (see 2026-05-07 morning log
+         entry for the prior failure). The ``targetUrl`` mode lets
+         us hand-build the URL with exactly the params we want.
+
+    Keyword search returns ads from any advertiser whose page name
+    contains the query string, so callers MUST post-filter results
+    by ``pageName`` to drop name-collision noise. ``_run_actor_for_page``
+    handles that filter using ``_name_matches_dealer``.
     """
+    from urllib.parse import quote
+
     target_url = (
         "https://www.facebook.com/ads/library/"
         f"?active_status={active_status}"
         f"&ad_type=all"
         f"&country={country}"
-        f"&view_all_page_id={page_id}"
+        f"&q={quote(search_query)}"
+        f"&search_type=keyword_unordered"
+        f"&media_type=all"
     )
     actor_input: Dict[str, Any] = {
         "targetUrl": target_url,
@@ -894,41 +1153,54 @@ async def _resolve_images_for_ads(
 
 async def _run_actor_for_page(
     page_url: str,
-    page_id: str,
+    page_name: Optional[str],
     *,
     country: str = "US",
     active_status: str = "all",
 ) -> Tuple[str, List[Dict[str, Any]], Optional[float], Optional[str]]:
-    """Run one actor invocation for one dealer page, given a
-    pre-resolved numeric ``page_id``.
+    """Run one actor invocation for one dealer using keyword search.
+
+    The search query is the page's display name (preferred) or its
+    URL slug (fallback). Slug fallback is decent because Facebook
+    tokenises camelCase names ("YanceyRents" → "yancey rents"), and
+    the post-filter step drops keyword-collision noise either way.
 
     Returns ``(page_url, ads, usage_total_usd, run_id)``. Always
-    returns — actor / network failures degrade to an empty ad list and
-    a logged WARNING rather than raising, so one dealer's outage
+    returns — actor / network failures degrade to an empty ad list
+    and a logged WARNING rather than raising, so one dealer's outage
     doesn't fail the whole multi-dealer scan.
+
+    Post-filter: actor results are dropped when the ad's
+    ``pageName`` doesn't plausibly match the dealer (see
+    ``_name_matches_dealer``). This is necessary because keyword
+    search can return ads from any advertiser whose name contains
+    the query — e.g. searching ``Yancey Rents`` could also return
+    a ``Yancey Rentals LLC`` ad. Without this filter we'd attribute
+    foreign-advertiser ads to our dealer.
     """
-    # Reject empties AND the literal string "0" (a sentinel value the
-    # earlier loose-regex resolver could write into the cache when it
-    # latched onto a session ID rather than a real page ID). Also
-    # reject any non-positive integer for the same reason — a real
-    # Facebook page ID is always a positive integer.
-    if not page_id or not page_id.isdigit() or int(page_id) <= 0:
+    slug = _extract_page_slug(page_url)
+    # Build the search query. Prefer the resolved display name (e.g.
+    # "Yancey Rents - The Cat Rental Store"); fall back to the slug
+    # if name resolution missed for this dealer (e.g. all four
+    # resolver tiers were blocked).
+    search_query = (page_name or "").strip() or slug
+    if not search_query:
         log.warning(
-            "Refusing to run actor for %s: invalid pageId=%r",
-            page_url, page_id,
+            "Refusing to run actor for %s: no search query "
+            "(no page_name and no slug)", page_url,
         )
         return page_url, [], None, None
 
     try:
         run_info = await _start_actor_run(
-            page_id=page_id,
+            search_query=search_query,
             country=country,
             active_status=active_status,
         )
         run_id = run_info["id"]
         log.info(
-            "Apify Meta run started for %s (pageId=%s): %s",
-            _extract_page_slug(page_url), page_id, run_id,
+            "Apify Meta run started for %s (q=%r, name=%r): %s",
+            slug, search_query, page_name, run_id,
         )
 
         completed = await _poll_run(run_id)
@@ -957,8 +1229,37 @@ async def _run_actor_for_page(
         log.warning("Dataset fetch for %s failed: %s", page_url, e)
         ads = []
 
-    log.info("Apify Meta run for %s returned %d ad(s)", page_url, len(ads))
-    return page_url, ads, completed.get("usageTotalUsd"), completed.get("id")
+    # Post-filter: drop keyword-collision noise. We compare the
+    # actor's reported pageName against the dealer's resolved name
+    # AND slug — either has to match for the ad to count as ours.
+    raw_count = len(ads)
+    filtered_ads: List[Dict[str, Any]] = []
+    dropped_examples: List[str] = []
+    for ad in ads:
+        actor_name = ad.get("pageName") or ad.get("pageNameKnown") or ""
+        if _name_matches_dealer(actor_name, page_name, slug):
+            filtered_ads.append(ad)
+        else:
+            if len(dropped_examples) < 3:
+                dropped_examples.append(str(actor_name))
+    if raw_count != len(filtered_ads):
+        log.info(
+            "Apify Meta run for %s: dropped %d/%d collision-noise "
+            "ad(s) by pageName filter (examples=%r), kept %d",
+            page_url, raw_count - len(filtered_ads), raw_count,
+            dropped_examples, len(filtered_ads),
+        )
+
+    log.info(
+        "Apify Meta run for %s returned %d ad(s) (raw=%d)",
+        page_url, len(filtered_ads), raw_count,
+    )
+    return (
+        page_url,
+        filtered_ads,
+        completed.get("usageTotalUsd"),
+        completed.get("id"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1012,18 +1313,33 @@ async def scan_meta_ads(
         "started_at": datetime.now(timezone.utc).isoformat(),
     }).eq("id", str(scan_job_id)).execute()
 
-    # 1: Resolve every dealer URL to a numeric Facebook pageId in
-    # one batch. Tier 1 (cache) and Tier 2 (DB column) are free; only
-    # genuinely new dealers fall through to the Playwright tier (also
-    # free, just slower). After the first scan populates the
-    # distributors.facebook_page_id column for each dealer, every
-    # subsequent scan resolves entirely from tier 2 in <50ms total.
-    page_id_map = await _resolve_facebook_page_ids_batch(
+    # 1: Resolve every dealer URL to its Facebook page metadata
+    # (numeric pageId where available, display name where available)
+    # in one batch. Tier 1 (cache) and Tier 2 (DB columns) are free;
+    # only genuinely new dealers fall through to the Playwright tier
+    # (also free, just slower). After the first scan populates the
+    # distributors.facebook_page_{id,name} columns for each dealer,
+    # every subsequent scan resolves entirely from tier 2 in <50ms.
+    #
+    # The actor URL builder downstream prefers the page name (Ad
+    # Library keyword search) — see migration 034 and the
+    # 2026-05-07 (late afternoon) log entry for why ID-based search
+    # was abandoned.
+    page_id_map, page_name_map = await _resolve_facebook_page_ids_batch(
         page_urls, distributor_mapping,
     )
-    if not page_id_map:
+    # We can scan a dealer as long as we have *something* — name OR
+    # id — because _run_actor_for_page falls back to the slug when
+    # name is missing. The only way a dealer is truly unscannable is
+    # if BOTH maps miss AND the slug is empty, which means we have
+    # no information at all about how to query for them.
+    scannable_urls = [
+        u for u in page_urls
+        if u in page_name_map or u in page_id_map or _extract_page_slug(u)
+    ]
+    if not scannable_urls:
         log.warning(
-            "No Facebook page IDs could be resolved for any of the %d "
+            "No usable Facebook page metadata for any of the %d "
             "supplied dealer URLs — meta scan cannot proceed",
             len(page_urls),
         )
@@ -1034,17 +1350,19 @@ async def scan_meta_ads(
         }).eq("id", str(scan_job_id)).execute()
         return 0
 
-    # 2: Fan out — bounded parallel actor runs over RESOLVED dealers.
+    # 2: Fan out — bounded parallel actor runs over scannable dealers.
     fan_sem = asyncio.Semaphore(max(1, settings.apify_meta_max_parallel_runs))
 
-    async def _bounded(page_url: str, page_id: str):
+    async def _bounded(page_url: str):
         async with fan_sem:
             return await _run_actor_for_page(
-                page_url, page_id, active_status="all",
+                page_url,
+                page_name_map.get(page_url),
+                active_status="all",
             )
 
     fan_results = await asyncio.gather(
-        *[_bounded(url, pid) for url, pid in page_id_map.items()],
+        *[_bounded(url) for url in scannable_urls],
         return_exceptions=True,
     )
 

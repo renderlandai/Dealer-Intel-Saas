@@ -7069,3 +7069,225 @@ changing the input shape.
   `4/5 dealers resolved (cache+DB hit 4 …)` log line — cosmetic
   bug, low impact.
 
+---
+
+## 2026-05-07 (evening) — Profile-backed accounts: actor input switched from `view_all_page_id` to keyword-search
+
+### Symptom
+
+After the afternoon `targetUrl` fix landed in `c16958c`, the actor
+input shape was now correct (no extra params, "Ad cards detected
+successfully" in actor logs) — but every dealer scanned still
+returned `0 ads`, including Yancey Rents which an alternate
+scraper had just successfully scraped 4 active ads from.
+
+### Root cause (verified against live HTML)
+
+Operator pasted the actor's URL (`view_all_page_id=100049526015228`)
+into a logged-out browser tab — Ad Library returned "no ads match
+your search criteria". Same dealer, same query, same URL the actor
+fed to Facebook, no ads.
+
+Looked at the page metadata Facebook itself emits for this
+dealer at `m.facebook.com/YanceyRents/`:
+
+```html
+<meta property="al:android:url" content="fb://profile/100049526015228" />
+<meta property="al:ios:url"     content="fb://profile/100049526015228" />
+<meta property="og:type"        content="video.other" />
+```
+
+Notice the deep-link scheme: **`fb://profile/...`**, not
+`fb://page/?id=...`. Yancey Rents' Facebook account is a
+**profile-backed business account**, not a legacy Page in the
+social graph. That's a real distinction inside Meta:
+
+* The slug-canonical numeric `100049526015228` is the **profile
+  graph ID**.
+* Ad Library's `view_all_page_id` parameter expects an
+  **advertiser ID**, which for these profile-backed accounts is
+  a **different number entirely** (lives in the
+  ads/business-account namespace, not exposed to logged-out
+  viewers).
+
+Our resolver pulled `100049526015228` correctly — that *is* the
+right slug-canonical ID for the page — but it's the wrong
+namespace for Ad Library. Hence "no ads match your search
+criteria" no matter how many active ads the dealer is actually
+running.
+
+This pattern affects more than just Yancey: Carolina CAT
+(`100052996545287`) and Altorfer Caterpillar (`100063857258799`)
+both have the same `100xxx` 15-digit shape, both are profile-
+backed, both were silently failing the same way for the same
+reason.
+
+Confirmation that no resolver fix could rescue this approach:
+grepped the logged-out mobile HTML for **anything** that would
+let us discover the right advertiser ID without auth —
+`view_all_page_id=`, `pageID`, `page_transparency`,
+`business_account_id`, an `ads/library/` link of any kind. **None
+exist** in the logged-out shell for profile-backed accounts.
+Facebook only renders the Page Transparency block (which contains
+the real Ad Library link with the correct advertiser ID) to
+logged-in viewers.
+
+### Fix: switch actor input from page-ID mode to name-search mode
+
+Ad Library's keyword-search URL form
+(`?q=<page+name>&search_type=keyword_unordered`) works for **all**
+account types — both legacy Pages and profile-backed accounts —
+because Facebook indexes Ad Library by advertiser display name,
+not by graph node ID. The display name is exposed via
+`og:title` on every page render (logged-out included), so it's
+trivially extractable.
+
+Tradeoff: keyword search returns ads from any advertiser whose
+name contains the query string, so a search for `Yancey Rents`
+might also return an unrelated `Yancey Rentals LLC` ad. Solved
+by post-filtering the actor's results on `pageName`.
+
+### Code changes
+
+`backend/app/services/apify_meta_service.py`
+
+* **New `_OG_TITLE_PATTERN` + `_extract_og_title(html)`** — pulls
+  the value of `<meta property="og:title">` and decodes the few
+  HTML entities Facebook actually emits (`&amp;`, `&#xb7;`,
+  `&quot;`, `&#39;`). No external HTML parser dependency.
+* **New `_clean_page_name(title)`** — strips the trailing
+  ` | <Location>` suffix Facebook appends to og:title for
+  business pages (e.g.
+  `Yancey Rents - The Cat Rental Store | Austell GA` →
+  `Yancey Rents - The Cat Rental Store`). Country-level Ad
+  Library scoping makes the city suffix actively harmful in
+  the search query.
+* **New `_normalize_for_match(value)` + `_name_matches_dealer(actor_page_name, expected_name, expected_slug)`**
+  — case- and punctuation-insensitive substring match used to
+  drop keyword-collision noise from actor results. Match rule:
+  normalised expected_name is a substring of normalised
+  actor_page_name (or vice versa), OR normalised slug is a
+  substring of normalised actor_page_name. Fail-closed if no
+  expected signal → drop the ad. Fail-open if both signals are
+  missing (no filter possible).
+* **`_PAGE_NAME_CACHE: Dict[str, str]`** — companion to the
+  existing `_PAGE_ID_CACHE`. In-process scratch cache for the
+  resolver.
+* **`_http_resolve_page_id` → `_http_resolve_page_meta`**:
+  renamed; now returns `(page_id, page_name)` from the same
+  request. Either or both can be `None`. Now also runs the
+  identity check (`_is_authentic_page_render`) before extracting
+  metadata, fixing a latent bug where the HTTP probe would
+  happily emit metadata from a logged-out wall when it should
+  have skipped.
+* **`_playwright_resolve_one(url)` returns `(page_id, page_name)`**
+  instead of just the ID. Returns as soon as it has either
+  signal from a verified-authentic render; the name is the
+  load-bearing output now since most dealers will fall back to
+  keyword search.
+* **`_playwright_resolve_page_ids(urls)` returns `(id_map, name_map)`**
+  — same shape as the single-URL resolver, just batched.
+* **`_resolve_facebook_page_ids_batch(...)` returns `(id_map, name_map)`**
+  — caller (`scan_meta_ads`) destructures both. All four resolver
+  tiers now look up both ID and name; resolutions are persisted
+  to **both** DB columns. Tier 2 (DB cache) reads both columns
+  too — so dealers cached from a previous scan don't need to
+  re-resolve.
+* **`_start_actor_run(*, search_query, ...)`** — replaces
+  `page_id` with `search_query`. Builds a keyword-search Ad
+  Library URL with `q=<query>&search_type=keyword_unordered`.
+  No `view_all_page_id`. `urllib.parse.quote` for percent-
+  encoding so spaces and dashes in display names go in clean.
+* **`_run_actor_for_page(page_url, page_name, ...)`** — takes
+  the resolved display name (or `None` if unresolved) instead
+  of the numeric ID. Falls back to the URL slug as the search
+  query when name is `None` (Facebook tokenises camelCase, so
+  `q=YanceyRents` will still find ads — imperfect but workable
+  fallback). Drops ads whose `pageName` doesn't match the
+  dealer per `_name_matches_dealer`. Logs how many were dropped
+  with examples for operator visibility.
+* **`scan_meta_ads(...)`** — destructures `(id_map, name_map)`
+  from the resolver, plumbs name through the fan-out, treats
+  any dealer with ID OR name OR slug as scannable.
+
+`supabase/migrations/034_distributor_facebook_page_name.sql`
+
+* New idempotent migration adds `distributors.facebook_page_name`
+  (text). Documents the column with `COMMENT ON COLUMN`. Reloads
+  PostgREST schema. Safe to re-run.
+
+### What does NOT change
+
+* Same Apify actor (`whoareyouanas/meta-ad-scraper`), same
+  rental, same proxy.
+* Same per-run pricing (still ~$0.04 per actor run).
+* Same fan-out parallelism (`apify_meta_max_parallel_runs`).
+* Public `scan_meta_ads(page_urls, scan_job_id, distributor_mapping, ...)`
+  signature unchanged — every caller and existing test continues
+  to work without modification (verified: all 12 tests in
+  `test_scan_runners_dispatch.py` pass).
+
+### Why I'm confident this fixes it
+
+* The other scraper's screenshot (operator-supplied) shows
+  `pageId: null` for all 3 Yancey Rents ads it returned, and
+  one keyword-collision ad from `1Hood Media` (`pageId: 1`).
+  That's the exact behaviour expected from a name-based Ad
+  Library search **without** post-filtering — confirming
+  (a) name-based search finds the ads we're missing, and
+  (b) we will need to drop the `1Hood Media` row in our
+  pipeline, which is what `_name_matches_dealer` does.
+* Smoke-tested the new URL builder against
+  `Yancey Rents - The Cat Rental Store` and verified the
+  emitted `targetUrl` contains exactly:
+  `?active_status=all&ad_type=all&country=US`
+  `&q=Yancey%20Rents%20-%20The%20Cat%20Rental%20Store`
+  `&search_type=keyword_unordered&media_type=all` — and zero
+  forbidden params (`view_all_page_id`, `is_targeted_country`,
+  `sort_data`).
+* Smoke-tested `_clean_page_name` and `_name_matches_dealer`
+  for all relevant fixtures (Yancey suffix-stripping, slug-
+  matching, collision rejection, fail-open behaviour).
+
+### Operator action required
+
+1. **Apply migration 034** in Supabase SQL editor (idempotent;
+   safe even if `facebook_page_name` already exists somehow).
+2. **Apply migration 033** if not already applied — it nulls
+   any poisoned `facebook_page_id` values from yesterday's
+   bad-resolver session that won't be useful with the new
+   keyword-search code path either.
+3. **(Optional, immediate unblock)** Manually populate
+   `distributors.facebook_page_name` for the high-priority
+   dealers from their Facebook page titles. After the next
+   scan, this column auto-populates from the resolver, so this
+   is a one-time accelerator only.
+
+### Verification plan
+
+1. Trigger a single-dealer scan (Yancey Rents).
+2. Apify run logs should now show:
+   `Starting scraper with https://www.facebook.com/ads/library/?...&q=Yancey+Rents+...&search_type=keyword_unordered`
+   (no `view_all_page_id`).
+3. Worker log should show the new line:
+   `Apify Meta run started for yanceyrents (q='Yancey Rents - …', name='…'): <run_id>`.
+4. Actor should return ≥ 3 ads (the 3 Yancey Rents ads, before
+   filter). Worker post-filter drops collision noise like
+   `1Hood Media`. Final count should match the alternate
+   scraper's count (3 if filter is strict, 4 if lenient).
+5. Run the multi-dealer scan that's been all-zero. Expect
+   non-zero counts for any dealer running ads.
+
+### Follow-ups still open
+
+* **Issue 2 (API token rotation + header migration)** — still
+  pending. The remaining Apify calls
+  (`_start_actor_run`, `_poll_run`, `_fetch_dataset_items`)
+  still pass the token as a `?token=` query param.
+* **`view_all_page_id` mode** — kept available via the
+  `facebook_page_id` column and resolver tiers, but **not
+  used** by the actor URL builder anymore. If Meta restores
+  the namespace alignment in the future, switching back is
+  a one-line change in `_run_actor_for_page` to prefer ID
+  over name. For now, name-search is unconditional.
+
