@@ -7431,3 +7431,194 @@ finally produced a non-empty dataset, exposing the next bug down.
   ``scan_meta_ads`` and asserts ``discovered_images`` rows
   appear. Open follow-up.
 
+---
+
+## 2026-05-07 (early evening) — Post-filter fail-closed on empty pageName
+
+### Symptom
+
+Scan ran on the field-name-fixed code (commit ``163aea0`` deployed
+and confirmed live in worker logs). Resolver, actor, and
+post-filter all logged. End state:
+
+```
+Apify Meta run for https://www.facebook.com/YanceyRents/:
+  dropped 6/6 collision-noise ad(s) by pageName filter
+  (examples=['', '', '']), kept 0
+Apify Meta run for https://www.facebook.com/YanceyRents/
+  returned 0 ad(s) (raw=6)
+Apify Meta fan-out complete: 0/1 dealers returned ads, 0 ads total
+No ads found for any provided Facebook pages
+[Dealer Intel] Scan complete — all clear
+```
+
+The actor returned 6 valid Yancey Rents ads, the previous fix
+made the field-extraction layer correct (``imageUrls``, ``adId``)
+— and the post-filter then dropped all 6 of them.
+``examples=['', '', '']`` is the smoking gun: the actor populated
+no ``pageName`` on any ad this run, our strict per-ad filter
+rejected each empty string as collision noise, and we ended up
+with the same misleading "100% compliance" email as the field-
+name failure mode.
+
+### Root cause
+
+Two latent flaws in ``_run_actor_for_page``'s post-filter
+(introduced in commit ``320e2c4`` when keyword-search mode was
+added):
+
+1. **Single-field name lookup.** Code read
+   ``ad.get("pageName") or ad.get("pageNameKnown") or ""``.
+   The ``whoareyouanas/meta-ad-scraper`` actor inconsistently
+   populates which advertiser-name field it surfaces — depending
+   on the Ad Library layout Facebook serves at request time, we
+   see ``pageName`` populated, ``brand`` populated, or all empty.
+   Earlier dataset-viewer screenshots showed both ``pageName``
+   AND ``brand`` populated; the post-filter only checked
+   ``pageName``.
+
+2. **Fail-closed on uniformly-empty metadata.** When
+   ``actor_name == ""``, ``_name_matches_dealer`` returns
+   ``False``, dropping the ad. That's correct behaviour PER-AD
+   when SOME ads have names and one stragglers doesn't (the
+   straggler is the suspicious one). But when EVERY ad in the
+   run has empty names, the filter has zero signal to act on
+   and dropping every ad is strictly worse than keeping every
+   ad — the matcher safety overhaul (2026-05-06) will correctly
+   score truly-foreign ads as "no match" anyway, while
+   false-negative drops produce the misleading "100% compliance"
+   email that masks real ad activity.
+
+### Fix
+
+`backend/app/services/apify_meta_service.py`
+
+* **Promoted the name-lookup chain to a module-level helper
+  ``_ad_advertiser_name(ad)``** — single source of truth used
+  by both the post-filter and the run-wide fail-open detector.
+  Returns ``ad["pageName"] or ad["pageNameKnown"] or ad["brand"]
+  or ""``. The widening to include ``brand`` is what handles
+  the "different layout, different field populated" actor flake.
+
+* **Added run-wide fail-open in the post-filter.** Before the
+  per-ad loop:
+
+  ```python
+  ads_with_any_name = sum(
+      1 for a in ads if _ad_advertiser_name(a).strip()
+  )
+  if raw_count > 0 and ads_with_any_name == 0:
+      log.warning(
+          "Apify Meta run for %s: actor returned %d ad(s) but "
+          "populated no advertiser-name metadata on any of them; "
+          "skipping pageName post-filter (fail-open) — every ad "
+          "will flow downstream and the matcher will reject any "
+          "that are truly foreign", page_url, raw_count,
+      )
+      filtered_ads = list(ads)
+  else:
+      # ... existing strict per-ad filter ...
+  ```
+
+* **Per-ad filter still strict when at least one ad has a name.**
+  The ``1Hood Media`` collision-noise case from yesterday's
+  alternate-scraper screenshot still gets dropped correctly
+  under the strict path. Nothing weakened here — only the
+  uniformly-empty edge case is now handled.
+
+`backend/tests/test_apify_meta_post_filter.py` (new file)
+
+* 19 regression tests across three classes:
+  - ``TestAdAdvertiserName`` — pageName / pageNameKnown / brand
+    fallback chain + empty handling.
+  - ``TestNameMatchesDealerStrict`` — exact match, slug-only
+    match, substring symmetry, punctuation insensitivity,
+    collision rejection, empty-actor-name rejection (per-ad
+    strict path is preserved).
+  - ``TestNameMatchesDealerFailOpen`` — no-expected-signal
+    fail-open, double-empty edge.
+  - ``TestRunWideFailOpenAdsCount`` — exercises the
+    ``ads_with_any_name`` count on realistic batches:
+    all-empty (the 17:53 production payload shape), mixed,
+    all-populated, and whitespace-only.
+* Tests target module-level seams (no Apify HTTP mocking).
+  Run-wide fail-open is verified through the count helper that
+  ``_run_actor_for_page`` uses, plus the per-ad filter is
+  verified independently.
+
+### What does NOT change
+
+* No DB migration.
+* No public API surface change.
+* No actor / proxy / pricing change.
+* Per-ad strictness preserved when names ARE present —
+  collision noise still drops.
+* ``scan_meta_ads`` signature unchanged.
+* All 12 pre-existing tests still pass; 19 new tests added; 31
+  pass total.
+
+### Why this lock-in matters
+
+The end-state symptom — "0 images analyzed → 100% compliance
+email" — is now the third independent failure mode in 24 hours
+to produce that exact verdict. Each one was a different bug at a
+different pipeline stage:
+
+| Stage | Bug | Fix commit |
+|---|---|---|
+| Resolver | namespace mismatch on profile-backed accounts | ``320e2c4`` |
+| Image extraction | actor field names ``imageUrls``/``adId`` not ``images``/``libraryID`` | ``163aea0`` |
+| **Post-filter** | **fail-closed on empty pageName** | **this commit** |
+
+The post-filter regression test suite locks in the run-wide
+fail-open behaviour so the *next* time the actor flakes its
+name extraction we don't lose another scan to silent
+"100% compliance".
+
+### Verification plan
+
+1. Wait for DigitalOcean redeploy.
+2. Trigger the same single-dealer Yancey Rents scan.
+3. Worker log should show one of two paths:
+
+   **Path A (actor populated names this run):**
+   ```
+   Apify Meta run for https://www.facebook.com/YanceyRents/
+     returned 6 ad(s) (raw=6)
+   ```
+
+   **Path B (actor flaked on names this run):**
+   ```
+   actor returned 6 ad(s) but populated no advertiser-name metadata
+     on any of them; skipping pageName post-filter (fail-open)
+   Apify Meta run for https://www.facebook.com/YanceyRents/
+     returned 6 ad(s) (raw=6)
+   ```
+
+4. Either way, the existing image-extraction layer (already
+   correct from ``163aea0``) reads ``imageUrls``/``adId`` and
+   inserts ~20 rows into ``discovered_images``.
+5. Auto-analyse runs the matcher pipeline over those rows.
+6. Email shows real numbers (Images Analyzed = 20-ish, Matches
+   / Violations driven by whether any of those ads actually
+   reuse campaign assets).
+
+### Follow-ups still open
+
+* **Issue 2 (API token rotation + header migration)** — still
+  pending.
+* **Schema-drift integration test** — open follow-up. Would
+  have caught the field-name bug from ``163aea0``; would have
+  also caught this post-filter bug if the test fixture had
+  included an "empty pageName" case. Worth writing a saved-
+  payload-replay test that runs ``scan_meta_ads`` against
+  three captured production payloads (one with names, one
+  without, one with mixed) and asserts non-zero
+  ``discovered_images`` row count for each.
+* **Per-ad fallback to ad text / linkUrl host matching** — if
+  the actor flakes name extraction AND we want stricter
+  per-ad filtering (no fail-open), we can match the dealer's
+  domain against ``ad["linkUrl"]`` host. Defer until we have
+  evidence the matcher's post-discovery scoring is leaving
+  through too many foreign ads.
+

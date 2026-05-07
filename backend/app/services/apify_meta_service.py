@@ -211,6 +211,32 @@ def _normalize_for_match(value: str) -> str:
     return _NAME_NORMALIZE.sub("", value.lower())
 
 
+def _ad_advertiser_name(ad: Dict[str, Any]) -> str:
+    """Best-effort advertiser-name lookup across the actor's known
+    field-name variants.
+
+    The ``whoareyouanas/meta-ad-scraper`` actor inconsistently
+    populates which advertiser-name field it emits per ad — the
+    extractor depends on which Ad Library layout Facebook serves
+    at request time, and we've observed in production:
+
+      * ``pageName`` populated, others empty
+      * ``brand`` populated, ``pageName`` empty
+      * all three empty (full extraction failure for the run)
+
+    Returning the first non-empty hit (or ``""``) lets the
+    post-filter make a per-ad decision on whatever signal the actor
+    happened to surface this run, and lets the run-wide fail-open
+    detection count "ads with any name signal" reliably.
+    """
+    return (
+        ad.get("pageName")
+        or ad.get("pageNameKnown")
+        or ad.get("brand")
+        or ""
+    )
+
+
 def _name_matches_dealer(
     actor_page_name: Optional[str],
     expected_name: Optional[str],
@@ -1258,26 +1284,66 @@ async def _run_actor_for_page(
         log.warning("Dataset fetch for %s failed: %s", page_url, e)
         ads = []
 
-    # Post-filter: drop keyword-collision noise. We compare the
-    # actor's reported pageName against the dealer's resolved name
-    # AND slug — either has to match for the ad to count as ours.
+    # Post-filter: drop keyword-collision noise. We compare each ad's
+    # advertiser-name field against the dealer's resolved name AND
+    # slug — either has to match for the ad to count as ours.
+    #
+    # Resilience design (added 2026-05-07 after the actor was observed
+    # returning 6 valid Yancey Rents ads with EMPTY pageName for every
+    # row, which caused the prior strict-only filter to drop all 6
+    # and emit "0 images analyzed → 100% compliance"):
+    #
+    #   1. **Widened name lookup.** The actor inconsistently populates
+    #      pageName / pageNameKnown / brand across runs (different Ad
+    #      Library layouts at request time produce different selector
+    #      hits). Try all three before giving up on a given ad.
+    #
+    #   2. **Run-wide fail-open.** If the actor returned ads but
+    #      populated NO advertiser-name field on ANY of them, the
+    #      filter has zero signal to act on. Dropping every ad is
+    #      strictly worse than keeping every ad in this case — the
+    #      matcher safety overhaul (2026-05-06) will correctly score
+    #      any genuinely-foreign ads as "no match" anyway, while
+    #      false-negative drops produce the misleading
+    #      "100% compliance" email.
+    #
+    #   3. **Per-ad strictness preserved when the actor IS providing
+    #      names.** If at least one ad has a populated name, we run
+    #      the per-ad filter on every ad — this is the path that
+    #      drops the 1Hood Media collision row from yesterday's
+    #      transcript while keeping the 3 Yancey rows.
     raw_count = len(ads)
-    filtered_ads: List[Dict[str, Any]] = []
-    dropped_examples: List[str] = []
-    for ad in ads:
-        actor_name = ad.get("pageName") or ad.get("pageNameKnown") or ""
-        if _name_matches_dealer(actor_name, page_name, slug):
-            filtered_ads.append(ad)
-        else:
-            if len(dropped_examples) < 3:
-                dropped_examples.append(str(actor_name))
-    if raw_count != len(filtered_ads):
-        log.info(
-            "Apify Meta run for %s: dropped %d/%d collision-noise "
-            "ad(s) by pageName filter (examples=%r), kept %d",
-            page_url, raw_count - len(filtered_ads), raw_count,
-            dropped_examples, len(filtered_ads),
+    ads_with_any_name = sum(
+        1 for a in ads if _ad_advertiser_name(a).strip()
+    )
+
+    if raw_count > 0 and ads_with_any_name == 0:
+        log.warning(
+            "Apify Meta run for %s: actor returned %d ad(s) but "
+            "populated no advertiser-name metadata on any of them; "
+            "skipping pageName post-filter (fail-open) — every ad "
+            "will flow downstream and the matcher will reject any "
+            "that are truly foreign",
+            page_url, raw_count,
         )
+        filtered_ads: List[Dict[str, Any]] = list(ads)
+    else:
+        filtered_ads = []
+        dropped_examples: List[str] = []
+        for ad in ads:
+            actor_name = _ad_advertiser_name(ad)
+            if _name_matches_dealer(actor_name, page_name, slug):
+                filtered_ads.append(ad)
+            else:
+                if len(dropped_examples) < 3:
+                    dropped_examples.append(str(actor_name))
+        if raw_count != len(filtered_ads):
+            log.info(
+                "Apify Meta run for %s: dropped %d/%d collision-noise "
+                "ad(s) by pageName filter (examples=%r), kept %d",
+                page_url, raw_count - len(filtered_ads), raw_count,
+                dropped_examples, len(filtered_ads),
+            )
 
     log.info(
         "Apify Meta run for %s returned %d ad(s) (raw=%d)",
