@@ -186,10 +186,10 @@ def _extract_id_from_url(url: str) -> Optional[str]:
     qs = parse_qs(parsed.query)
     if "id" in qs and qs["id"]:
         candidate = qs["id"][0]
-        if candidate.isdigit():
+        if candidate.isdigit() and int(candidate) > 0:
             return candidate
     slug = parsed.path.strip("/").split("/")[0] if parsed.path else ""
-    if slug.isdigit():
+    if slug.isdigit() and int(slug) > 0:
         return slug
     return None
 
@@ -335,7 +335,7 @@ async def _playwright_resolve_one(url: str) -> Optional[str]:
                 m = pattern.search(content)
                 if m:
                     pid = m.group(1)
-                    if pid and pid.isdigit():
+                    if pid and pid.isdigit() and int(pid) > 0:
                         log.debug(
                             "Playwright resolver got pageId=%s for "
                             "%s via %s (verified)",
@@ -474,7 +474,7 @@ async def _resolve_facebook_page_ids_batch(
                 dist_id_to_page_id: Dict[str, str] = {}
                 for row in (resp.data or []):
                     pid = row.get("facebook_page_id")
-                    if pid and str(pid).isdigit():
+                    if pid and str(pid).isdigit() and int(str(pid)) > 0:
                         dist_id_to_page_id[str(row["id"])] = str(pid)
 
                 for url in pending:
@@ -610,28 +610,39 @@ async def _start_actor_run(
     page_id: str,
     country: str = "US",
     active_status: str = "all",
-    media_type: str = "all",
-    sort_mode: str = "start_date",
-    sort_direction: str = "desc",
     max_concurrency: int = 1,
     request_timeout_secs: int = 900,
 ) -> dict:
-    """Start a single actor run keyed on ``page_id``.
+    """Start a single actor run for a single dealer page ID.
 
-    The new actor accepts exactly one search per run — see the actor
-    docs at https://apify.com/whoareyouanas/meta-ad-scraper. We sort
-    by ``start_date`` descending so freshest creatives come first;
-    this is the most useful default for scanning live campaigns.
+    Uses the actor's ``targetUrl`` input mode (Option A in the README)
+    rather than the parameters mode (Option B). When given individual
+    parameters, the actor's URL builder adds five extra query params
+    to the Ad Library URL — ``search_type=page``,
+    ``is_targeted_country=false``, ``media_type=all``, and the two
+    ``sort_data[…]`` keys — none of which appear in the actor's
+    documented working URL example. In production (2026-05-07) that
+    over-decorated URL caused Facebook to render a stripped layout
+    where the actor logged
+    ``WARNING: No ad cards detected on initial load - page may be blocked``
+    and returned 0 ads, even for advertisers with confirmed active
+    ads. Hand-building the URL to match the README example exactly
+    side-steps the actor's URL-builder entirely.
+
+    The defensive ``page_id == "0"`` guard a few lines below in
+    ``_run_actor_for_page`` makes sure we never feed a literal "0"
+    (a residue from yesterday's loose-regex resolver writing actor
+    session IDs to the cache) to this function.
     """
+    target_url = (
+        "https://www.facebook.com/ads/library/"
+        f"?active_status={active_status}"
+        f"&ad_type=all"
+        f"&country={country}"
+        f"&view_all_page_id={page_id}"
+    )
     actor_input: Dict[str, Any] = {
-        "pageId": str(page_id),
-        "country": country,
-        "activeStatus": active_status,
-        "adType": "all",
-        "mediaType": media_type,
-        "isTargetedCountry": False,
-        "sortMode": sort_mode,
-        "sortDirection": sort_direction,
+        "targetUrl": target_url,
         "maxConcurrency": max_concurrency,
         "requestHandlerTimeoutSecs": request_timeout_secs,
     }
@@ -887,7 +898,6 @@ async def _run_actor_for_page(
     *,
     country: str = "US",
     active_status: str = "all",
-    media_type: str = "all",
 ) -> Tuple[str, List[Dict[str, Any]], Optional[float], Optional[str]]:
     """Run one actor invocation for one dealer page, given a
     pre-resolved numeric ``page_id``.
@@ -897,7 +907,16 @@ async def _run_actor_for_page(
     a logged WARNING rather than raising, so one dealer's outage
     doesn't fail the whole multi-dealer scan.
     """
-    if not page_id:
+    # Reject empties AND the literal string "0" (a sentinel value the
+    # earlier loose-regex resolver could write into the cache when it
+    # latched onto a session ID rather than a real page ID). Also
+    # reject any non-positive integer for the same reason — a real
+    # Facebook page ID is always a positive integer.
+    if not page_id or not page_id.isdigit() or int(page_id) <= 0:
+        log.warning(
+            "Refusing to run actor for %s: invalid pageId=%r",
+            page_url, page_id,
+        )
         return page_url, [], None, None
 
     try:
@@ -905,7 +924,6 @@ async def _run_actor_for_page(
             page_id=page_id,
             country=country,
             active_status=active_status,
-            media_type=media_type,
         )
         run_id = run_info["id"]
         log.info(

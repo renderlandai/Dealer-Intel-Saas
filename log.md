@@ -6889,3 +6889,183 @@ unchanged except:
   Supabase SQL editor flow.
 * All other issues unchanged.
 
+---
+
+## 2026-05-07 (late afternoon) — Hotfix: actor returning 0 ads even for advertisers with active campaigns (`targetUrl` mode)
+
+### Symptom
+
+Operator ran a 5-dealer scan over `carolinacat`, `altorfercaterpillar`,
+`yancey.bros.co`, and `yanceyrents`. The Tier-4 Playwright resolver
+fixed earlier today now resolves the right numeric page IDs (the
+identity check works — verified manually: visiting
+`https://www.facebook.com/100052996545287` does land on the Carolina
+CAT page). The actor *runs successfully*, returns HTTP 200, exits
+clean — but reports `0 ad(s)` for every dealer:
+
+```
+Apify Meta run for https://www.facebook.com/carolinacat returned 0 ad(s)
+Apify Meta run for https://www.facebook.com/AltorferCaterpillar/ returned 0 ad(s)
+Apify Meta run for https://www.facebook.com/yancey.bros.co/ returned 0 ad(s)
+Apify Meta run for https://www.facebook.com/YanceyRents returned 0 ad(s)
+Apify Meta fan-out complete: 0/5 dealers returned ads, 0 ads total
+```
+
+Operator independently ran one of the same dealers
+(`yanceyrents`) through a different Meta Ad Library scraper and got
+4 active ads back. The `whoareyouanas/meta-ad-scraper` actor is
+returning 0 even though ads demonstrably exist.
+
+### Root cause
+
+The actor's logs revealed exactly what was happening on the inside:
+
+```
+Built URL from parameters
+Starting scraper with https://www.facebook.com/ads/library/?country=US
+&active_status=all&ad_type=all&media_type=all&is_targeted_country=false
+&view_all_page_id=100052996545287&search_type=page
+&sort_data%5Bmode%5D=start_date&sort_data%5Bdirection%5D=desc
+...
+[BROWSER LOG]: Scroll iteration 20, ads found: 0, stall count: 21
+[BROWSER LOG]: Breaking due to stall count: 31
+Page evaluation completed, found 0 ads
+No ads found for ...
+```
+
+The actor accepts two input modes:
+
+* **Option A — `targetUrl`**: paste a complete Ad Library URL.
+* **Option B — parameters** (`pageId`, `country`, `mediaType`,
+  `sortMode`, etc.): the actor *internally builds* the URL.
+
+We were on Option B. The actor's URL builder was decorating the URL
+with five extra query parameters that *do not appear in the actor's
+own README example*:
+
+* `media_type=all`
+* `is_targeted_country=false`
+* `search_type=page`        ← prime suspect
+* `sort_data[mode]=start_date`
+* `sort_data[direction]=desc`
+
+Facebook's Ad Library treats this combination differently from the
+canonical URL — it served up a stripped layout with no scrollable
+container of ad cards, so the scraper looped 31 times, found
+nothing, and gave up cleanly. The actor logs even include the
+diagnostic message:
+
+> `WARNING: No ad cards detected on initial load - page may be blocked`
+
+So Facebook *did* serve a 200 OK, but the body was the wrong layout
+for the scraper to work with. From the actor's perspective the run
+was fine; from our perspective every advertiser looks dark.
+
+### Fix
+
+`backend/app/services/apify_meta_service.py`
+
+**Switched `_start_actor_run` from parameters mode to
+`targetUrl` mode.** Hand-build the URL with the *minimal* parameter
+set used in the actor's documented working example:
+
+```
+https://www.facebook.com/ads/library/
+  ?active_status=all
+  &ad_type=all
+  &country=US
+  &view_all_page_id=<numericPageId>
+```
+
+The Apify input now contains only:
+
+```python
+{
+    "targetUrl": "<the URL above>",
+    "maxConcurrency": 1,
+    "requestHandlerTimeoutSecs": 900,
+    # plus proxyUrl when configured
+}
+```
+
+That side-steps the actor's URL builder entirely and produces an
+HTTP request indistinguishable from copy-pasting the dealer's Ad
+Library link into a browser tab — which we already manually
+verified works.
+
+Removed the now-dead actor-input fields: `pageId`, `country`,
+`activeStatus`, `adType`, `mediaType`, `isTargetedCountry`,
+`sortMode`, `sortDirection`. They were the cause of the regression.
+
+Removed `media_type` from `_start_actor_run`'s and
+`_run_actor_for_page`'s signatures — both are now just
+`(page_url, page_id, *, country='US', active_status='all')`.
+
+### Defensive guards added in the same edit
+
+While reading the call graph I noticed three latent traps from
+yesterday's bad-resolver session that could re-bite us if a stray
+`facebook_page_id = '0'` ever sneaks back into the cache (e.g.
+from an operator typo or a stale row predating migration 033):
+
+1. `_extract_id_from_url(url)` now requires `int(candidate) > 0`,
+   not just `.isdigit()`. `'0'.isdigit() == True` was the trap.
+2. `_playwright_resolve_one` applies the same `int(pid) > 0` check
+   before accepting a regex match.
+3. `_resolve_facebook_page_ids_batch` (Tier 2 DB read) applies the
+   same check before populating the cache from `distributors.facebook_page_id`.
+4. `_run_actor_for_page` now refuses to even start a run when
+   `page_id` is empty, non-numeric, or `<= 0`, and emits a
+   `WARNING` instead. This is the last-line-of-defence guard the
+   earlier session noted as a follow-up — fixed here.
+
+None of these require a migration; they're purely defensive
+narrowing of validators that previously trusted `.isdigit()` alone.
+
+### Why this is the right fix and not the wrong one
+
+* **Matches the actor's own documented happy path** — the README's
+  worked example URL has exactly the four params we're now
+  emitting and nothing else.
+* **Reproduces the operator's manual test** — pasting a
+  hand-built `view_all_page_id=…` URL into a browser shows the ads
+  the actor was missing.
+* **Lower input surface = fewer ways for the actor to misbehave**.
+  Every parameter we pass is one more knob the actor can mistune.
+  Going to a single URL string removes that whole class of bugs.
+* **No new external dependencies, no schema changes, no
+  Playwright work.** Pure input-shape change to an existing
+  pipeline.
+
+### Cost impact
+
+Zero. Same actor, same per-run pricing, same proxy. We're just
+changing the input shape.
+
+### Verification plan
+
+1. Deploy. (`git push` after this entry.)
+2. Operator triggers a single-dealer scan with `yanceyrents`
+   (numeric ID `100064776547095` — already cached) — expect ≥ 1
+   ad in the Apify dataset, given the alternate scraper found 4.
+3. Operator triggers the full multi-dealer scan that's been
+   returning all-zero — expect ad counts on the dealers known to
+   be running campaigns.
+4. If a dealer truly has no ads (legitimately dark advertiser),
+   actor will still return `0` and worker still emits the
+   `Apify Meta run … returned 0 ad(s)` line — that's no longer a
+   bug, that's correct behavior.
+
+### Follow-ups still open
+
+* **Issue 2 (API token rotation + header migration)** — still
+  pending. The remaining Apify calls (`_start_actor_run`,
+  `_poll_run`, `_fetch_dataset_items`) still pass the token as a
+  `?token=` query param and will leak it in error logs the same
+  way. Worth a follow-up to migrate to `Authorization: Bearer`.
+* **Issue 3 (Migration 033 application)** — operator-confirmed
+  applied earlier today. No further action.
+* **Off-by-one resolution accounting** in the
+  `4/5 dealers resolved (cache+DB hit 4 …)` log line — cosmetic
+  bug, low impact.
+
