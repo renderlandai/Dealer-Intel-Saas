@@ -81,36 +81,39 @@ _PW_CONCURRENCY = 3  # max parallel browser pages for fallback
 # slug form (``facebook.com/somedealer``), so we resolve slug → pageId
 # at scan time.
 #
-# The numeric ID is embedded in several places on Facebook's
-# server-rendered HTML:
+# Only patterns that are PAGE-typed by Facebook itself are kept.
+# Looser patterns (``"actorID"``, ``"entity_id"``, ``"page_id"``,
+# ``"profile_id"``, ``/profile.php?id=...``) were tried in the
+# 2026-05-07 morning deploy and produced false positives — they
+# match user IDs, viewer session IDs, and unrelated entities embedded
+# in Facebook's logged-out shell. Verified in production by feeding
+# a resolved 15-digit ID to the meta-ad-scraper, which surfaced an
+# Ad Library page where the transparency block read literally
+# ``ID: undefined`` (Meta's signal that the supplied
+# ``view_all_page_id`` is not a Page entity in their graph).
 #
-#   * ``<meta property="al:android:url" content="fb://page/?id=NUMERIC">``
-#   * ``<meta property="al:ios:url" content="fb://profile/NUMERIC">``
-#   * ``<link rel="alternate" href="android-app://com.facebook.katana/fb/page/?id=NUMERIC">``
-#   * Inline JSON: ``"pageID":"NUMERIC"``, ``"entity_id":"NUMERIC"``,
-#     ``"page_id":"NUMERIC"``, ``"actorID":"NUMERIC"``
-#
-# We try each pattern on the unauthenticated httpx probe first
-# (cheapest and works on a small number of dealers), then fall
-# through to a headless Playwright render of the same URL — the
-# rendered DOM contains the numeric ID in those meta tags and inline
-# JSON even when the markup served to anonymous httpx is a JS-only
-# shell. Mobile (``m.facebook.com``) is tried before desktop because
-# its logged-out wall historically exposes more metadata.
+# These four patterns are documented page deep-link / page-keyed
+# JSON fields. If none of them match, we treat the dealer as
+# unresolvable (skip-with-warning) rather than fall through to a
+# guess, which is the failure mode that produced the bad cache.
 
 _PAGE_ID_PATTERNS = [
     re.compile(r'al:android:url"\s*content="fb://page/\?id=(\d+)"'),
-    re.compile(r'al:ios:url"\s*content="fb://profile/(\d+)"'),
     re.compile(r'android-app://com\.facebook\.katana/fb/page/\?id=(\d+)'),
     re.compile(r'"pageID"\s*:\s*"(\d+)"'),
-    re.compile(r'"entity_id"\s*:\s*"(\d+)"'),
-    # Newer Meta surfaces use these keys interchangeably; cover all of
-    # them to keep the resolver robust against minor markup churn.
-    re.compile(r'"page_id"\s*:\s*"(\d+)"'),
-    re.compile(r'"profile_id"\s*:\s*"(\d+)"'),
-    re.compile(r'"actorID"\s*:\s*"(\d+)"'),
-    re.compile(r'/profile\.php\?id=(\d+)'),
+    re.compile(r'al:ios:url"\s*content="fb://profile/(\d+)"'),
 ]
+
+# og:url canonical extraction. Facebook stamps this on every
+# server-rendered page with the page's CANONICAL vanity slug, so it
+# acts as ground truth for "what page did Playwright actually load".
+# We use it to verify the rendered DOM corresponds to the dealer
+# slug we asked for (not a login redirect, a logged-out wall pointing
+# at /people, an interstitial, or an entirely different page).
+_OG_URL_PATTERN = re.compile(
+    r'<meta[^>]+property="og:url"[^>]+content="https?://[^/]*facebook\.com/([^/?"#]+)',
+    re.IGNORECASE,
+)
 
 # Lightweight in-process cache for a single scan run. Resolving the
 # same dealer twice within seconds is wasteful and slightly increases
@@ -191,33 +194,95 @@ def _extract_id_from_url(url: str) -> Optional[str]:
     return None
 
 
+def _extract_canonical_slug(html: str) -> Optional[str]:
+    """Pull the canonical slug out of the rendered DOM's ``og:url``
+    meta tag. Returns ``None`` if no ``og:url`` is present (logged-
+    out shell, login redirect, error page, etc.).
+
+    Lower-cased to make slug comparison case-insensitive — Facebook
+    canonicalises ``AltorferCAT`` to ``altorfercat`` (and back to the
+    operator-specified casing only on display), so matching has to
+    be insensitive to round-trip safely.
+    """
+    m = _OG_URL_PATTERN.search(html)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def _is_authentic_page_render(
+    html: str, final_url: str, expected_slug: str,
+) -> bool:
+    """Identity check: does the rendered DOM actually correspond to
+    the dealer page we asked Playwright to load?
+
+    Two signals, either of which is sufficient:
+
+      1. ``og:url`` canonical slug matches ``expected_slug``.
+      2. Final post-redirect URL path starts with ``/<expected_slug>``.
+
+    Both signals missing or mismatching → fail closed (return
+    ``False``); the caller skips this candidate, tries the next, or
+    falls through to a per-dealer skip warning. Better to skip a
+    dealer for one scan than to poison ``distributors.facebook_page_id``
+    with a wrong ID that gets treated as authoritative forever.
+
+    Without this check, the page-id regex iteration could match
+    against a logged-out wall (login page, /people directory, error
+    page) which contains assorted numeric IDs unrelated to the
+    intended dealer — that's exactly the false-positive class the
+    2026-05-07 morning deploy produced.
+    """
+    expected = expected_slug.lower()
+
+    canonical = _extract_canonical_slug(html)
+    if canonical is not None:
+        return canonical == expected
+
+    # No og:url found — fall back to the post-redirect URL path.
+    final_path = urlparse(final_url).path.strip("/")
+    final_slug = (
+        final_path.split("/")[0].lower() if final_path else ""
+    )
+    return final_slug == expected
+
+
 async def _playwright_resolve_one(url: str) -> Optional[str]:
     """Resolve a single dealer URL to its numeric Facebook page ID by
-    rendering the page in headless Chromium and scraping the JS-
-    rendered DOM.
+    rendering the page in headless Chromium, verifying the rendered
+    DOM is actually the dealer's page, then extracting the numeric
+    ID from page-keyed deep-link metadata.
 
     Strategy:
 
       1. Fast-path: if the URL already encodes a numeric ID
          (``profile.php?id=`` or ``facebook.com/<digits>``), return
          it without opening a browser.
-      2. Try ``m.facebook.com/<slug>`` with the mobile UA. The
-         mobile site historically exposes more metadata to logged-
-         out clients than the desktop www site.
-      3. Fall back to ``www.facebook.com/<slug>`` with the desktop
-         UA if mobile yielded nothing.
+      2. Try ``m.facebook.com/<slug>`` with the mobile UA, then
+         ``www.facebook.com/<slug>`` with the desktop UA. For each:
+           a) Render and wait for ``domcontentloaded`` + short settle.
+           b) **Identity check**: confirm ``og:url`` canonical
+              slug == input slug, OR final post-redirect URL path
+              == ``/<input slug>``. If neither matches, skip this
+              candidate — Facebook served us something other than
+              the dealer's page (login wall, redirect, etc.) and
+              any numeric IDs in the DOM are about something else.
+           c) Run page-keyed regexes (only) against the verified
+              DOM. Return the first numeric match.
+      3. If both candidates fail identity verification, return
+         ``None`` — caller logs a per-dealer skip warning.
 
-    For each candidate URL we wait for ``domcontentloaded`` plus a
-    short settle, then ``page.content()`` and run every regex in
-    ``_PAGE_ID_PATTERNS`` against the rendered HTML. The numeric ID
-    appears in at least one of those patterns even when the page
-    visibly displays a logged-out wall — Meta still ships the
-    ``al:android:url`` and ``al:ios:url`` deep-link metadata for
-    indexing, and that's usually enough.
+    The identity check is the difference between "drop in pageId" vs
+    "drop in random user/session ID". Without it, the resolver was
+    picking up viewer/visitor IDs from logged-out walls and feeding
+    them to the meta-ad-scraper, which then loaded an Ad Library
+    page where the transparency block read ``ID: undefined`` and
+    returned 0 ads. See log.md 2026-05-07 entry for the full debug
+    trace.
 
-    Returns the numeric ID or ``None`` if every candidate failed.
-    Network / browser errors are swallowed (logged at debug) so a
-    single bad dealer doesn't crash the whole batch resolver.
+    Returns the numeric ID or ``None``. Network / browser errors are
+    swallowed at debug level so a single bad dealer doesn't crash
+    the whole batch resolver.
     """
     direct = _extract_id_from_url(url)
     if direct:
@@ -250,21 +315,40 @@ async def _playwright_resolve_one(url: str) -> Optional[str]:
                 wait_until="domcontentloaded",
                 timeout=20_000,
             )
-            # Brief settle so deferred meta tags / inline JSON are present
-            # in the DOM before we scrape it.
+            # Brief settle so deferred meta tags / inline JSON are
+            # present in the DOM before we scrape it.
             await asyncio.sleep(2)
 
             content = await page.content()
+            final_url = page.url or ""
+
+            if not _is_authentic_page_render(content, final_url, slug):
+                log.debug(
+                    "Playwright resolver: %s did not render an "
+                    "authentic page for slug=%r (og:url canonical "
+                    "and final URL both miss); skipping candidate",
+                    candidate_url, slug,
+                )
+                continue
+
             for pattern in _PAGE_ID_PATTERNS:
                 m = pattern.search(content)
                 if m:
                     pid = m.group(1)
                     if pid and pid.isdigit():
                         log.debug(
-                            "Playwright resolver got pageId=%s for %s via %s",
+                            "Playwright resolver got pageId=%s for "
+                            "%s via %s (verified)",
                             pid, slug, candidate_url,
                         )
                         return pid
+
+            log.debug(
+                "Playwright resolver: %s rendered authentic page "
+                "for slug=%r but no page-keyed pageId pattern "
+                "matched; trying next candidate",
+                candidate_url, slug,
+            )
         except Exception as e:
             log.debug(
                 "Playwright resolver failed on %s: %s",

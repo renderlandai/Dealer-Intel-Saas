@@ -6675,3 +6675,217 @@ unchanged except:
   confirmation.
 * All other issues (3-8) unchanged.
 
+
+---
+
+## 2026-05-07 (afternoon) — Hotfix: Playwright resolver was returning user IDs, not page IDs
+
+### What broke
+
+First Meta scan after the morning's tier-4 swap (commit `61727ee`)
+ran end-to-end. The whoareyouanas/meta-ad-scraper actor logs were
+clean — proxy authenticated, page loaded 200 OK, scrape ran for 54s
+— but the dataset came back with **0 ads**. Operator opened the
+exact Ad Library URL the actor used:
+
+```
+https://www.facebook.com/ads/library/?country=US&active_status=all
+&ad_type=all&view_all_page_id=100052996545287&search_type=page
+```
+
+Meta's "Page transparency" block on that URL read literally:
+
+```
+Pages and accounts
+ID: undefined
+
+Page history
+Merged with 0 other Pages
+Page name changed 0 times
+```
+
+That's Meta's signal that `view_all_page_id=100052996545287` does
+not correspond to any Page entity in their graph. The morning's
+Playwright resolver had returned a 15-digit numeric ID, the
+meta-ad-scraper had dutifully fed it to the Ad Library, and the
+Ad Library had returned an empty page because the ID wasn't a Page.
+
+Almost certainly happened to most or all 43 dealers, not just the
+one operator manually verified. Bad IDs are now sitting in
+`distributors.facebook_page_id` (assuming migration 032 applied)
+and would be treated as authoritative on every future scan.
+
+### Why it broke
+
+The morning's resolver shipped 9 regex patterns. Four were page-
+specific:
+
+```
+al:android:url"  content="fb://page/?id=NUMERIC"   ← page deep link
+android-app://com.facebook.katana/fb/page/?id=NUMERIC ← page deep link
+"pageID":"NUMERIC"                                 ← page-keyed JSON
+al:ios:url"      content="fb://profile/NUMERIC"    ← page-keyed iOS
+```
+
+Five were polysemous — they match user IDs, viewer IDs, and unrelated
+entities depending on context:
+
+```
+"entity_id":"NUMERIC"      ← can be page, user, group, anything
+"page_id":"NUMERIC"        ← misleadingly named; often viewer/user
+"profile_id":"NUMERIC"     ← typically the logged-out viewer
+"actorID":"NUMERIC"        ← the active "actor" rendering the page,
+                              often the viewer's session
+/profile.php?id=NUMERIC    ← personal profile permalink, not a page
+```
+
+Iteration is in priority order, but `re.search` searches the full
+document. When Facebook served the resolver a logged-out shell
+(common in 2026 — anonymous Playwright triggers the wall), the
+page-specific patterns missed entirely (no `al:android:url` deep-
+link metadata in the shell), and iteration fell through to the loose
+patterns. Those patterns matched numeric IDs that were embedded in
+the shell's chrome — almost certainly the viewer's session ID — and
+the resolver returned that.
+
+The 15-digit prefix `100052…` is consistent with Facebook's modern
+user-ID assignment range (post-2021), which is what made this
+debuggable post-hoc.
+
+### What ships in this hotfix
+
+`backend/app/services/apify_meta_service.py`
+
+* **Drop the 5 loose patterns.** `_PAGE_ID_PATTERNS` is now exactly:
+  ```python
+  _PAGE_ID_PATTERNS = [
+      re.compile(r'al:android:url"\s*content="fb://page/\?id=(\d+)"'),
+      re.compile(r'android-app://com\.facebook\.katana/fb/page/\?id=(\d+)'),
+      re.compile(r'"pageID"\s*:\s*"(\d+)"'),
+      re.compile(r'al:ios:url"\s*content="fb://profile/(\d+)"'),
+  ]
+  ```
+  Four patterns, all page-typed by Facebook itself. If none match,
+  the resolver returns None — no fallback to a guess.
+
+* **Add og:url canonical-slug extraction.** New `_OG_URL_PATTERN`
+  + `_extract_canonical_slug(html)`. The og:url meta tag is stamped
+  by Facebook on every server-rendered page with the canonical
+  vanity slug, so it acts as ground truth for "what page did
+  Playwright actually load".
+
+* **Add `_is_authentic_page_render(html, final_url, expected_slug)`.**
+  Returns True iff EITHER:
+    1. og:url canonical slug == expected slug (lower-cased), OR
+    2. final post-redirect URL path starts with /<expected slug>
+
+  Both signals missing or mismatching → return False. Caller skips
+  this candidate and tries the next, or falls through to a per-
+  dealer skip warning. Better to skip a dealer for one scan than
+  to poison the cache.
+
+* **Wire identity check into `_playwright_resolve_one`.** For each
+  candidate URL (mobile then desktop), the new flow is:
+    1. Render + settle.
+    2. **Identity check**: if `_is_authentic_page_render` returns
+       False, skip this candidate. Log at debug.
+    3. Run page-specific regexes against the verified DOM. Return
+       first numeric match.
+    4. If no pattern matched but identity passed: log at debug
+       ("rendered authentic page but no page-keyed pageId pattern
+       matched"), try next candidate.
+
+  Unit-tested 6 cases of the identity check function in isolation;
+  all pass. The actual Playwright render path is integration-only
+  (requires a live browser + network) and was verified to import
+  cleanly.
+
+`supabase/migrations/033_clear_poisoned_facebook_page_ids.sql`
+
+* `UPDATE distributors SET facebook_page_id = NULL,
+   facebook_page_id_resolved_at = NULL WHERE facebook_page_id IS NOT NULL;`
+* Wrapped in a `DO $$` block that checks `information_schema.columns`
+  first — no-op if migration 032 hasn't been applied yet (column
+  doesn't exist), no-op if column is already all-null. Safe to
+  re-run.
+* `RAISE NOTICE` reports how many rows were cleared.
+* `NOTIFY pgrst, 'reload schema'` so PostgREST picks up state.
+
+### Cost
+
+Same as morning's deploy: $0 per resolution, $0 per scan. No new
+actor rentals, no new env vars. Just the two file changes above and
+the cache-flush migration.
+
+### Verification
+
+Local smoke-test:
+
+```
+$ python3 -c "from app.services.apify_meta_service import \
+    _PAGE_ID_PATTERNS, _is_authentic_page_render, ..."
+imports OK
+page_id patterns: 4
+
+OK   [authentic og:url match]                expected=True  got=True
+OK   [authentic og:url, different case]      expected=True  got=True
+OK   [imposter og:url (login)]               expected=False got=False
+OK   [no og:url, final URL matches]          expected=True  got=True
+OK   [no og:url, final URL on /login]        expected=False got=False
+OK   [no og:url, no final URL]               expected=False got=False
+```
+
+`pytest -q` → **149 passed + 8 pre-existing async-plugin failures**.
+Same count as morning. No regressions.
+
+### Operator action required after deploy
+
+1. Apply migration 033 in Supabase SQL editor (idempotent; safe to
+   re-run; auto-skips if 032 wasn't applied first):
+   ```sql
+   -- contents of supabase/migrations/033_clear_poisoned_facebook_page_ids.sql
+   ```
+2. (If 032 hasn't been applied) Apply 032 first.
+3. Trigger a Meta scan. Worker logs should show:
+   ```
+   Tier-4 (Playwright render) resolving N dealer(s) ...
+   Playwright resolver returned pageIds for X/N dealer(s)
+   ```
+   Where X may be lower than N this time — dealers whose pages
+   refuse to render cleanly to anonymous Playwright will skip-
+   with-warning rather than poison the cache.
+4. Spot-check Apify console: actor runs that fire should now
+   consistently return non-zero ad counts. The "ID: undefined"
+   transparency-block signature should not reappear.
+
+### What this changes about steady-state behaviour
+
+* **First post-fix scan**: every dealer re-resolves via Playwright,
+  but only those whose render passes the identity check produce a
+  pageId. Skip rate may be 30-50% on the first scan if Facebook is
+  walling anonymous Playwright on those slugs.
+* **Subsequent scans**: dealers that resolved successfully hit
+  Tier 2 (DB cache) and resolve in <50ms. Dealers that didn't
+  resolve fall through to Playwright again every scan. They're a
+  bounded operational nuisance, not a correctness problem.
+* **Manual override path**: operators can populate
+  `distributors.facebook_page_id` directly in Supabase for any
+  dealer the resolver can't crack — paste the numeric ID from the
+  dealer's Ad Library "Page transparency" block while logged in.
+  Resolver will see the populated row and use it (Tier 2) without
+  any Playwright work.
+
+### Follow-ups still open
+
+The 2026-05-06 evening session-summary follow-up list above is
+unchanged except:
+
+* **Issue 1 (Apify pages-scraper 400)** — closed (morning).
+* **Tier-4 false positives via loose regex** — closed (this fix).
+* **Issue 2 (API token rotation + header migration)** — still
+  pending. Same diagnosis as yesterday.
+* **Issue 3 (Migration 032 application)** — still pending operator
+  confirmation. **Migration 033 ALSO needs applying** — same
+  Supabase SQL editor flow.
+* All other issues unchanged.
+
