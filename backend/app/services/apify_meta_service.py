@@ -27,10 +27,11 @@ Pipeline overview:
        distributor mapping is exact (no fuzzy brand-string matching
        across multiple dealers running in the same scan).
     4. Image URL resolution has a 3-tier fallback:
-         a) ``images: [{"url": ...}]`` from the actor (preferred)
-         b) ``videos: [{"url": ..., "duration": ...}]`` (poster/thumb)
-         c) Playwright visits ``facebook.com/ads/library/?id=<libraryID>``
-            and extracts the rendered creative
+         a) ``imageUrls: [{"url": ...}]`` from the actor (preferred)
+         b) ``videoUrls: [{"url": ..., "duration": ...}]`` (poster/thumb)
+         c) Playwright visits the ad's ``adUrl`` (or a synthesised
+            ``facebook.com/ads/library/?id=<adId>``) and extracts the
+            rendered creative
 
 Each discovered ad image is inserted as a ``discovered_images`` row so
 the existing matching pipeline (hash → CLIP → Haiku → Opus) processes
@@ -1018,28 +1019,53 @@ def _resolve_distributor_by_brand(
 # ---------------------------------------------------------------------------
 
 def _collect_media_urls(ad: Dict[str, Any]) -> List[str]:
-    """Pull http(s) URLs out of an ad item produced by the new actor.
+    """Pull http(s) URLs out of an ad item produced by the actor.
 
-    Schema:
-        images: [{"url": "https://..."}]
-        videos: [{"url": "https://...", "duration": 30}]
+    Live actor schema (verified 2026-05-07 against ``whoareyouanas/
+    meta-ad-scraper`` runs that returned non-zero ad counts):
+
+        imageUrls: [{"url": "https://..."}]
+        videoUrls: [{"url": "https://...", "duration": 30}]
+
+    Earlier code in this module read ``ad["images"]`` / ``ad["videos"]``,
+    matching the field names in the actor's README — but the runtime
+    output uses the ``Urls`` suffixed names. The mismatch caused every
+    ad to be classified as "no images" and skipped, producing 0
+    ``discovered_images`` rows even on scans where the actor returned
+    rich datasets. See log.md 2026-05-07 (late afternoon) for the
+    full bug-trace.
+
+    Inner shape is unchanged — still ``[{"url": "..."}]`` objects, so
+    the inner loop logic is preserved. Defensive against the value
+    being a bare string in case the actor's serialiser ever changes
+    its mind (mirrors the original tolerance).
 
     Falls back from images to videos because Meta sometimes serves the
     poster image only via the video object."""
     urls: List[str] = []
 
-    for img in (ad.get("images") or []):
+    for img in (ad.get("imageUrls") or ad.get("images") or []):
         url = (img or {}).get("url") if isinstance(img, dict) else img
         if isinstance(url, str) and url.startswith("http"):
             urls.append(url)
 
     if not urls:
-        for vid in (ad.get("videos") or []):
+        for vid in (ad.get("videoUrls") or ad.get("videos") or []):
             url = (vid or {}).get("url") if isinstance(vid, dict) else vid
             if isinstance(url, str) and url.startswith("http"):
                 urls.append(url)
 
     return urls
+
+
+def _ad_id(ad: Dict[str, Any]) -> str:
+    """Return the ad's library identifier in a canonical string form.
+
+    The actor emits this as ``adId`` at runtime (verified 2026-05-07);
+    earlier code read ``libraryID``. We try both for resilience to
+    future actor schema drift.
+    """
+    return str(ad.get("adId") or ad.get("libraryID") or "")
 
 
 # ---------------------------------------------------------------------------
@@ -1114,16 +1140,19 @@ async def _extract_image_from_ad_library(ad_library_url: str) -> List[str]:
 async def _resolve_images_for_ads(
     ads: List[Dict[str, Any]],
 ) -> Dict[str, List[str]]:
-    """Resolve image URLs for ads where ``images`` and ``videos`` were
-    both empty. Keyed by ``libraryID`` (the new actor's identifier)."""
+    """Resolve image URLs for ads where ``imageUrls`` and ``videoUrls``
+    were both empty. Keyed by the ad library identifier (``adId`` at
+    runtime, fallback to ``libraryID`` for forward/backward compat)."""
     sem = asyncio.Semaphore(_PW_CONCURRENCY)
     results: Dict[str, List[str]] = {}
 
     async def _resolve_one(ad: Dict[str, Any]):
-        library_id = str(ad.get("libraryID") or "")
+        library_id = _ad_id(ad)
         if not library_id:
             return
-        ad_url = _ad_library_url_for(library_id)
+        # Prefer the actor's directly-emitted Ad Library URL; fall
+        # back to synthesising one from the library_id if absent.
+        ad_url = ad.get("adUrl") or _ad_library_url_for(library_id)
         async with sem:
             urls = await _extract_image_from_ad_library(ad_url)
             if urls:
@@ -1131,7 +1160,7 @@ async def _resolve_images_for_ads(
 
     needs_fallback = [
         ad for ad in ads
-        if not _collect_media_urls(ad) and ad.get("libraryID")
+        if not _collect_media_urls(ad) and _ad_id(ad)
     ]
 
     if not needs_fallback:
@@ -1414,12 +1443,13 @@ async def scan_meta_ads(
     # Sample payload for debugging the wire format on first ad only.
     sample = ads_by_source[0][1]
     log.info(
-        "Sample ad payload keys: %s | images=%d, videos=%d, brand=%s, libraryID=%s",
+        "Sample ad payload keys: %s | imageUrls=%d, videoUrls=%d, "
+        "pageName=%s, adId=%s",
         list(sample.keys()),
-        len(sample.get("images") or []),
-        len(sample.get("videos") or []),
-        sample.get("brand"),
-        sample.get("libraryID"),
+        len(sample.get("imageUrls") or sample.get("images") or []),
+        len(sample.get("videoUrls") or sample.get("videos") or []),
+        sample.get("pageName") or sample.get("brand"),
+        _ad_id(sample),
     )
     log.debug("Full sample ad payload: %s", json.dumps(sample, default=str)[:2000])
 
@@ -1434,13 +1464,16 @@ async def scan_meta_ads(
     ads_skipped = 0
 
     for source_page_url, ad in ads_by_source:
-        library_id = str(ad.get("libraryID") or "")
+        library_id = _ad_id(ad)
         if not library_id:
             ads_skipped += 1
             continue
 
-        ad_url = _ad_library_url_for(library_id)
-        brand = ad.get("brand") or ""
+        # Prefer the actor's directly-emitted ad URL when present
+        # (matches the Ad Library permalink the actor itself logs);
+        # fall back to synthesising it from library_id otherwise.
+        ad_url = ad.get("adUrl") or _ad_library_url_for(library_id)
+        brand = ad.get("pageName") or ad.get("brand") or ""
         platforms = ad.get("platforms") or []
         active = ad.get("active")
         ad_status = "active" if active else ("inactive" if active is False else "")

@@ -7291,3 +7291,143 @@ by post-filtering the actor's results on `pageName`.
   a one-line change in `_run_actor_for_page` to prefer ID
   over name. For now, name-search is unconditional.
 
+---
+
+## 2026-05-07 (late afternoon — three-bug week, third fix) — Field-name remap: `imageUrls`/`videoUrls`/`adId`
+
+### Symptom
+
+After the morning + afternoon fixes landed, the actor finally
+returned a real, non-empty dataset:
+
+* 6 ads total across 5 dealers (Yancey Rents × 4, Altorfer × 1,
+  Milton Rents × 1)
+* Post-filter dropped 0 collision-noise rows (all 6 belong to
+  scanned dealers — verified against the Apify dataset viewer
+  by the operator)
+* Apify dataset shows ``imageUrls`` populated for every ad with
+  arrays of ``{"url": "https://scontent-ord5-…fbcdn.net/…"}``
+  shapes
+
+But the worker reported:
+
+```
+Apify Meta Ads scan complete: 0 images from 0 ads (6 skipped, 0 …)
+[Dealer Intel] Scan complete — all clear
+0 images analyzed, 0 matches, 100.0% compliance
+```
+
+Email went out to the operator + Slack channel + Salesforce as
+"100% compliant — all clear" — a misleading verdict, since the
+matcher pipeline never saw a single image.
+
+### Root cause
+
+Field-name mismatch in three places, left over from the
+2026-05-06 actor swap. The original code was written against the
+``whoareyouanas/meta-ad-scraper`` README schema, which describes
+fields as ``images``, ``videos``, ``libraryID``. The runtime
+output uses different names — confirmed by the operator's
+screenshots of the Apify dataset viewer:
+
+| Code read              | Actor actually returns | Where                                |
+|------------------------|------------------------|--------------------------------------|
+| ``ad["images"]``       | ``ad["imageUrls"]``    | ``_collect_media_urls``              |
+| ``ad["videos"]``       | ``ad["videoUrls"]``    | ``_collect_media_urls``              |
+| ``ad["libraryID"]``    | ``ad["adId"]``         | ``_resolve_images_for_ads`` ×2, ``scan_meta_ads`` line 1437 |
+| (synthesised URL)      | ``ad["adUrl"]``        | ``scan_meta_ads`` line 1442          |
+
+Inner shape of ``imageUrls`` is unchanged from what the README
+described — still ``[{"url": "https://…"}]`` — so once the outer
+key is corrected, the existing per-element parsing works.
+
+Why the bug went undetected: the previous three failure modes
+(no pageIds; over-decorated URL; namespace mismatch on
+``view_all_page_id``) all produced **0 ads** at the actor layer,
+so the field-extraction layer downstream never had any data to
+chew on. This morning's switch to keyword-search Ad Library URLs
+finally produced a non-empty dataset, exposing the next bug down.
+
+### Code changes
+
+`backend/app/services/apify_meta_service.py`
+
+* **`_collect_media_urls(ad)`** — now reads ``imageUrls`` /
+  ``videoUrls`` (with ``images`` / ``videos`` as a defensive
+  legacy fallback in case the actor ever changes its mind).
+  Inner-loop logic preserved.
+* **New ``_ad_id(ad)`` helper** — canonicalises the ad's library
+  identifier from ``adId`` (preferred) → ``libraryID``
+  (fallback) → empty string. Single source of truth used by
+  every site that previously read ``ad["libraryID"]`` directly.
+* **`_resolve_images_for_ads`** — uses ``_ad_id`` for both the
+  filter and the cache key. Also prefers the actor's directly-
+  emitted ``ad["adUrl"]`` over a synthesised
+  ``ads/library/?id=<adId>`` URL when present, so the
+  Playwright fallback hits exactly the link the actor itself
+  published.
+* **`scan_meta_ads` main loop** — ``library_id = _ad_id(ad)``,
+  ``ad_url = ad.get("adUrl") or _ad_library_url_for(library_id)``,
+  ``brand = ad.get("pageName") or ad.get("brand") or ""`` (now
+  also tries ``pageName`` first, since that's the runtime field
+  the actor emits).
+* **Sample-payload log line** updated to reflect the new key
+  set so the in-prod debug output matches reality.
+* **Module docstring** schema description updated.
+
+### What does NOT change
+
+* Same actor, same input shape, same proxy, same pricing.
+* Public ``scan_meta_ads`` signature unchanged.
+* No DB migration needed.
+* No matcher / verifier changes.
+* All 12 tests in ``test_scan_runners_dispatch.py`` still pass.
+
+### Smoke tests run before commit
+
+* ``_collect_media_urls`` against the live runtime shape
+  (``imageUrls`` populated, ``videoUrls`` empty) → returns
+  the URLs.
+* ``_collect_media_urls`` against the legacy shape (``images``
+  populated) → still works.
+* Video fallback (``imageUrls`` empty, ``videoUrls`` populated)
+  → returns the video URL (used as poster/thumb downstream).
+* Bare-string tolerance (``imageUrls: ["https://…"]`` instead
+  of ``[{"url": "https://…"}]``) → returns the URL.
+* Non-http filter (``data:`` URI mixed with valid URL) → drops
+  the data URI, keeps the http URL.
+* ``_ad_id`` against new + legacy + empty.
+
+### Verification plan
+
+1. Wait for DigitalOcean redeploy.
+2. Trigger a multi-dealer scan over the same set
+   (Yancey Rents, Altorfer, Milton Rents, Carolina CAT,
+   Foley Caterpillar).
+3. Worker log should now contain:
+   * ``Sample ad payload keys: […] | imageUrls=N, videoUrls=M, pageName='…', adId='…'``
+   * ``Apify Meta Ads scan complete: <total> images from <ads> ads (<skipped> skipped, <pw> resolved via Playwright)``
+4. Email should report a non-zero ``Images Analyzed`` count
+   (~20 across the test set, given each ad has 2-4 images per
+   the dataset screenshot).
+5. The matcher pipeline runs over those images. If any of them
+   actually use a campaign asset, the email's ``Matches`` /
+   ``Violations`` counts go non-zero — the safety overhaul
+   from 2026-05-06 means false-positive rate should be
+   essentially nil.
+6. ``ads_skipped`` in the log should be ≈ 0 — the only legit
+   reason to skip an ad now is a missing ``adId`` AND empty
+   ``imageUrls``/``videoUrls`` (vanishingly rare).
+
+### Follow-ups still open
+
+* **Issue 2 (API token rotation + header migration)** — still
+  pending. Running this many fixes through the meta-ad-scraper
+  pipeline keeps re-exercising the codepath that puts the
+  token in URL query params; worth fixing soon.
+* **Schema-drift integration test** — would have caught this
+  bug. Worth wiring up an Apify-mocked end-to-end test that
+  feeds a known-good live payload (e.g. saved snapshot) into
+  ``scan_meta_ads`` and asserts ``discovered_images`` rows
+  appear. Open follow-up.
+
