@@ -1,12 +1,28 @@
 """
 Apify Meta Ad Library integration for Facebook & Instagram ad scraping.
 
-Backed by the ``whoareyouanas/meta-ad-scraper`` actor. That actor only
-accepts a single search per run (one ``targetUrl``, one ``pageId``, or
-one ``searchQuery``), so we fan out — one actor run per dealer page —
-and merge the results before handing them to the matcher.
+Two actor paths, selected at scan time via ``settings.apify_meta_actor_id``:
 
-Pipeline overview:
+  * ``whoareyouanas~meta-ad-scraper`` (default — original production path):
+    accepts a single search per run (one ``targetUrl``, one ``pageId``, or
+    one ``searchQuery``), so we fan out — one actor run per dealer page.
+    Requires a slug→numeric-pageId resolver (the four-tier dance below)
+    because the actor's input shape demands it. Pricing: $10/1000 ads.
+
+  * ``curious_coder~facebook-ads-library-scraper`` (feature-flagged 2026-05-07
+    after the cost / recall problems with the above became apparent):
+    accepts a bulk ``urls: [{url}, {url}, …]`` array of dealer Facebook
+    page URLs DIRECTLY, scrapes them in one run, and reports each ad
+    with its own ``pageID`` / ``pageName``. Pricing: $0.75/1000 ads
+    (~13× cheaper at the rate card). No slug resolver required — the
+    page-URL → ad-list mapping is the actor's whole job.
+
+The public ``scan_meta_ads`` entrypoint dispatches to the right path
+based on the configured actor id; both paths feed the same downstream
+``discovered_images`` insert so the matcher pipeline sees identical
+shapes regardless of which actor produced the ads.
+
+Pipeline overview (whoareyouanas path):
 
     1. ``_resolve_facebook_page_ids_batch`` turns each dealer's stored
        Facebook URL (slug form, e.g. ``facebook.com/somedealer``) into
@@ -33,6 +49,22 @@ Pipeline overview:
             ``facebook.com/ads/library/?id=<adId>``) and extracts the
             rendered creative
 
+Pipeline overview (curious_coder path):
+
+    1. ``_curious_coder_run_bulk`` fires ONE actor invocation with the
+       full list of dealer Facebook URLs as input. No resolver. No
+       fan-out. The actor returns a flat array of ads spanning every
+       input URL.
+    2. ``_curious_coder_normalize`` remaps each raw ad into the same
+       canonical shape the whoareyouanas downstream loop already
+       expects (``adId``, ``imageUrls: [{url}]``, ``pageName``, etc.).
+    3. ``_curious_coder_attribute_ads`` maps each canonical ad to one
+       of the input page URLs by ``pageID`` / ``pageName`` matching,
+       producing the same ``[(source_page_url, ad), …]`` list shape
+       as the whoareyouanas fan-out.
+    4. Same downstream insert path — image URL fallback, distributor
+       resolution, and ``discovered_images`` writes are shared.
+
 Each discovered ad image is inserted as a ``discovered_images`` row so
 the existing matching pipeline (hash → CLIP → Haiku → Opus) processes
 it like any other discovered image.
@@ -57,7 +89,46 @@ log = logging.getLogger("dealer_intel.apify_meta")
 settings = get_settings()
 
 APIFY_BASE = "https://api.apify.com/v2"
-ACTOR_ID = "whoareyouanas~meta-ad-scraper"
+
+# Default (= "current production") actor. The original swap from
+# nourishing_courier landed on this one (see log.md 2026-05-06 entry).
+WHOAREYOUANAS_ACTOR_ID = "whoareyouanas~meta-ad-scraper"
+
+# Alternative actor — bulk URL input, ~13× cheaper at the rate card,
+# no slug→pageId resolver required. Wired 2026-05-07 (Ask-mode review)
+# behind ``settings.apify_meta_actor_id`` so an A/B trial can run
+# without ripping out the whoareyouanas code path. See log.md entry
+# of the same date for the full cost / reliability comparison.
+CURIOUS_CODER_ACTOR_ID = "curious_coder~facebook-ads-library-scraper"
+
+# ``ACTOR_ID`` is kept as a module-level alias for the active actor so
+# legacy log lines and metadata fields ("apify_actor": ACTOR_ID) keep
+# working; the dispatcher in ``scan_meta_ads`` reads
+# ``settings.apify_meta_actor_id`` directly when it needs to branch.
+ACTOR_ID = WHOAREYOUANAS_ACTOR_ID
+
+
+def _active_actor_id() -> str:
+    """Return the actor slug currently configured for this process.
+
+    Read fresh on every call so test fixtures that monkey-patch the
+    cached settings instance see the override immediately. (Also
+    defensive against future code that reloads ``Settings``.)
+    """
+    return getattr(settings, "apify_meta_actor_id", "") or WHOAREYOUANAS_ACTOR_ID
+
+
+def _is_curious_coder_active() -> bool:
+    """Convenience predicate for the dispatcher.
+
+    Tolerates both the canonical Apify slug form
+    (``curious_coder~facebook-ads-library-scraper``) and the
+    publication form (``curious_coder/facebook-ads-library-scraper``)
+    so an operator copy/pasting from the Apify UI doesn't get a silent
+    no-op fallback to the whoareyouanas path.
+    """
+    raw = _active_actor_id().strip().lower()
+    return raw.replace("/", "~") == CURIOUS_CODER_ACTOR_ID
 
 # Apify run statuses we treat as terminal (the run will not progress
 # further, regardless of whether it succeeded).
@@ -1358,6 +1429,663 @@ async def _run_actor_for_page(
 
 
 # ---------------------------------------------------------------------------
+# curious_coder/facebook-ads-library-scraper path
+# ---------------------------------------------------------------------------
+#
+# This actor accepts dealer Facebook URLs DIRECTLY in a single bulk
+# run (``urls: [{url}, …]``) and returns a flat dataset of ads, each
+# ad carrying its own ``pageID`` / ``pageName`` so we can attribute
+# back to the source dealer. None of the slug→pageId resolution code
+# above is needed for this path.
+#
+# Output shape (verified against the actor's published README + the
+# field table; the actor has been live since 2024 with consistent
+# field names). Defensive multi-key reads below in case Apify ships
+# a future schema bump:
+#
+#   {
+#     "adArchiveID": "1234567890",     # primary identifier
+#     "adID": "...",                   # sometimes present
+#     "pageID": "108047...",
+#     "pageName": "Yancey Rents",
+#     "isActive": true,
+#     "startDate": 1705320000,         # unix seconds
+#     "endDate": null,
+#     "publisherPlatform": ["FACEBOOK", "INSTAGRAM"],
+#     "snapshot": {
+#       "body": {"text": "..."} | "...",
+#       "title": "...",
+#       "link_url": "https://...",
+#       "cta_text": "Shop Now",
+#       "cta_type": "SHOP_NOW",
+#       "images": [
+#         {"original_image_url": "...", "resized_image_url": "..."}
+#       ],
+#       "videos": [
+#         {"video_hd_url": "...", "video_sd_url": "...",
+#          "video_preview_image_url": "..."}
+#       ],
+#       "cards": [
+#         {"image_url": "...", "video_hd_url": "...", "title": "...",
+#          "body": "...", "link_url": "..."}
+#       ]
+#     },
+#     "currency": "USD",
+#     "spend": {"lower_bound": 1000, "upper_bound": 5000}
+#   }
+#
+# We normalise this to the same canonical ad shape the whoareyouanas
+# downstream loop already consumes — primarily ``adId``,
+# ``imageUrls: [{"url"}]``, ``pageName``, ``brand``, ``active``,
+# ``platforms``, ``adUrl`` — so the rest of ``scan_meta_ads`` doesn't
+# need to know which actor produced the data.
+
+def _curious_coder_first(ad: Dict[str, Any], *keys: str) -> Optional[Any]:
+    """Return the first non-empty value in ``ad`` for any of ``keys``.
+
+    Used so each field-name alias the curious_coder actor has shipped
+    historically (``pageID`` vs ``pageId``, ``adArchiveID`` vs ``adID``)
+    is tolerated in one place. Empty strings count as missing —
+    matches the broader downstream contract that "" means absent.
+    """
+    for k in keys:
+        v = ad.get(k)
+        if v is not None and v != "":
+            return v
+    return None
+
+
+def _curious_coder_unix_to_iso(value: Any) -> str:
+    """Normalise a curious_coder date field to an ISO-8601 string.
+
+    The actor emits start/end dates as unix seconds (occasionally
+    milliseconds for newer ads). We don't parse this downstream — it
+    flows verbatim into ``discovered_images.metadata.start_date`` —
+    so a string conversion is enough. Returns "" for any input we
+    can't make sense of, matching the whoareyouanas-side contract
+    where ``startDate`` is a free-form string.
+    """
+    if value is None or value == "":
+        return ""
+    try:
+        ts = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    # Treat very-large numbers as milliseconds (post-Y2038 unix
+    # seconds wouldn't reasonably show up here).
+    if ts > 10_000_000_000:
+        ts = ts / 1000.0
+    try:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+    except (OSError, ValueError, OverflowError):
+        return str(value)
+
+
+def _curious_coder_collect_creative_urls(
+    snapshot: Dict[str, Any],
+) -> Tuple[List[str], List[str], str]:
+    """Pull image/video URLs out of a curious_coder ``snapshot`` block.
+
+    Returns ``(image_urls, video_urls, format)`` where ``format`` is
+    one of ``"image"``, ``"video"``, ``"carousel"``, or ``""``. The
+    format string matches what the downstream code expects for the
+    ``media_format`` metadata field.
+
+    Field-name preferences (most preferred first):
+      images:  ``original_image_url`` → ``resized_image_url``
+      videos:  ``video_hd_url`` → ``video_sd_url`` → ``video_preview_image_url``
+
+    Carousel cards (``snapshot.cards``) are flattened into the same
+    image / video lists; ``format`` is set to ``"carousel"`` whenever
+    cards are present so the downstream metadata accurately reflects
+    the ad type.
+    """
+    if not isinstance(snapshot, dict):
+        return [], [], ""
+
+    images: List[str] = []
+    videos: List[str] = []
+
+    for img in (snapshot.get("images") or []):
+        if not isinstance(img, dict):
+            continue
+        url = (
+            img.get("original_image_url")
+            or img.get("resized_image_url")
+            or img.get("url")
+        )
+        if isinstance(url, str) and url.startswith("http"):
+            images.append(url)
+
+    for vid in (snapshot.get("videos") or []):
+        if not isinstance(vid, dict):
+            continue
+        url = (
+            vid.get("video_hd_url")
+            or vid.get("video_sd_url")
+            or vid.get("video_preview_image_url")
+            or vid.get("url")
+        )
+        if isinstance(url, str) and url.startswith("http"):
+            videos.append(url)
+
+    cards = snapshot.get("cards") or []
+    has_cards = False
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        has_cards = True
+        cimg = card.get("original_image_url") or card.get("image_url")
+        if isinstance(cimg, str) and cimg.startswith("http"):
+            images.append(cimg)
+        cvid = (
+            card.get("video_hd_url")
+            or card.get("video_sd_url")
+            or card.get("video_preview_image_url")
+        )
+        if isinstance(cvid, str) and cvid.startswith("http"):
+            videos.append(cvid)
+
+    if has_cards:
+        media_format = "carousel"
+    elif videos and not images:
+        media_format = "video"
+    elif images:
+        media_format = "image"
+    else:
+        media_format = ""
+
+    return images, videos, media_format
+
+
+def _curious_coder_normalize(ad: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a raw curious_coder ad object → canonical ad shape.
+
+    The canonical shape mirrors what the whoareyouanas path produces
+    after its own internal mapping, so the downstream insertion loop
+    in ``scan_meta_ads`` works uniformly across both actors:
+
+        adId            : str
+        pageName        : str
+        brand           : str   (alias of pageName, kept for the
+                                 _resolve_distributor_by_brand fallback)
+        pageID          : str   (numeric — needed for attribution)
+        active          : bool
+        startDate       : str   (ISO-8601 if we can parse, else verbatim)
+        platforms       : list[str]  (normalised lowercase)
+        format          : str   ("image" / "video" / "carousel" / "")
+        imageUrls       : list[{"url": str}]
+        videoUrls       : list[{"url": str}]
+        body            : str
+        linkTitle       : str
+        linkUrl         : str
+        ctaText         : str
+        ctaUrl          : str
+        adUrl           : str   (Ad Library permalink — synthesised
+                                 from adArchiveID since curious_coder
+                                 doesn't return one directly)
+        _curious_coder  : True  (origin marker for metadata + tests)
+
+    Snapshot-shape details handled defensively: ``snapshot.body`` can
+    be either a string (older builds) or ``{"text": "..."}`` (current).
+    Both work.
+    """
+    snapshot = ad.get("snapshot") if isinstance(ad.get("snapshot"), dict) else {}
+
+    image_urls, video_urls, media_format = (
+        _curious_coder_collect_creative_urls(snapshot)
+    )
+
+    body_field = snapshot.get("body") if snapshot else None
+    if isinstance(body_field, dict):
+        body_text = str(body_field.get("text") or "")
+    else:
+        body_text = str(body_field or "")
+
+    page_id = str(_curious_coder_first(ad, "pageID", "pageId", "page_id") or "")
+    page_name = str(_curious_coder_first(ad, "pageName", "page_name") or "")
+    library_id = str(
+        _curious_coder_first(ad, "adArchiveID", "adArchiveId", "adID", "adId") or ""
+    )
+
+    is_active = bool(_curious_coder_first(ad, "isActive", "is_active", "active"))
+
+    raw_platforms = ad.get("publisherPlatform") or ad.get("platforms") or []
+    platforms = [
+        str(p).lower() for p in raw_platforms
+        if isinstance(p, str) and p.strip()
+    ]
+
+    canonical: Dict[str, Any] = {
+        "adId": library_id,
+        "pageName": page_name,
+        "brand": page_name,  # mirror so brand-fallback still works
+        "pageID": page_id,
+        "active": is_active,
+        "startDate": _curious_coder_unix_to_iso(
+            _curious_coder_first(ad, "startDate", "start_date")
+        ),
+        "platforms": platforms,
+        "format": media_format,
+        "imageUrls": [{"url": u} for u in image_urls],
+        "videoUrls": [{"url": u} for u in video_urls],
+        "body": body_text,
+        "linkTitle": str(snapshot.get("title") or "") if snapshot else "",
+        "linkUrl": str(snapshot.get("link_url") or "") if snapshot else "",
+        "ctaText": str(snapshot.get("cta_text") or "") if snapshot else "",
+        "ctaUrl": str(
+            snapshot.get("cta_url")
+            or snapshot.get("link_url")
+            or ""
+        ) if snapshot else "",
+        "adUrl": _ad_library_url_for(library_id) if library_id else "",
+        "_curious_coder": True,
+    }
+    return canonical
+
+
+def _curious_coder_attribute_ads(
+    canonical_ads: List[Dict[str, Any]],
+    page_urls: List[str],
+    distributor_mapping: Dict[str, UUID],
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Map each canonical ad to one of the input dealer URLs.
+
+    Whoareyouanas uses a fan-out-per-dealer model so each ad is
+    implicitly tagged with its source URL by which actor invocation
+    produced it. curious_coder is bulk: ads come back interleaved,
+    each carrying its own ``pageID`` + ``pageName``. We map back via:
+
+      1. **Slug-by-name index.** Build a slug→page_url map from the
+         input list (``yanceyrents`` → ``https://facebook.com/YanceyRents/``).
+      2. **Per-ad attribution**, in priority order:
+           a) Exact slug match on the ad's ``pageName`` → page_url
+              (lowercase, alphanumeric-only normalised both sides).
+           b) Substring match on ``pageName`` against any input slug
+              (or vice versa) — handles Yancey Rents → yanceyrents
+              and "Yancey Rents - The Cat Rental Store" → yancey.bros.co
+              edge cases.
+           c) Fall through to the first input page_url. Last-resort
+              attribution; downstream brand-fallback and matcher
+              veto handle the case where the ad genuinely doesn't
+              belong to any dealer in the scan.
+
+    Returns the same ``[(source_page_url, ad), …]`` shape produced by
+    the whoareyouanas fan-out aggregator, so the downstream
+    distributor-resolution + image-insert loop handles both paths
+    identically.
+    """
+    if not canonical_ads or not page_urls:
+        return []
+
+    # Build slug → page_url and a normalised-name → page_url index
+    # from the dealer URLs supplied to the scan.
+    slug_to_url: Dict[str, str] = {}
+    for url in page_urls:
+        slug = _extract_page_slug(url)
+        if slug:
+            slug_to_url.setdefault(_normalize_for_match(slug), url)
+
+    out: List[Tuple[str, Dict[str, Any]]] = []
+    fallback_url = page_urls[0]
+
+    for ad in canonical_ads:
+        page_name = ad.get("pageName") or ""
+        page_name_norm = _normalize_for_match(page_name)
+        matched: Optional[str] = None
+
+        # (a) exact slug == normalised-name.
+        if page_name_norm and page_name_norm in slug_to_url:
+            matched = slug_to_url[page_name_norm]
+
+        # (b) substring either direction.
+        if not matched and page_name_norm:
+            for slug_norm, url in slug_to_url.items():
+                if slug_norm and (
+                    slug_norm in page_name_norm or page_name_norm in slug_norm
+                ):
+                    matched = url
+                    break
+
+        # (c) fallback.
+        out.append((matched or fallback_url, ad))
+
+    return out
+
+
+def _curious_coder_build_input(
+    page_urls: List[str],
+    *,
+    country: str = "US",
+    active_status: str = "active",
+    limit_per_source: int = 0,
+) -> Dict[str, Any]:
+    """Build the JSON body for one bulk curious_coder actor run.
+
+    The actor accepts plain Facebook page URLs in the ``urls`` array
+    and figures out the per-page Ad Library URL on its own — that's
+    the whole architectural advantage we're trying to validate. We
+    just pass the dealer URLs through unchanged.
+
+    ``limit_per_source`` left at 0 → omitted entirely → actor scrapes
+    ALL ads per dealer, which is the recall behaviour we want for
+    compliance scanning. Set a positive integer during pilot trials
+    to bound spend.
+    """
+    body: Dict[str, Any] = {
+        "urls": [{"url": _normalize_fb_url(u)} for u in page_urls],
+        "scrapeAdDetails": True,
+        "scrapePageAds.activeStatus": active_status,
+        "scrapePageAds.countryCode": country,
+        "scrapePageAds.sortBy": "most_recent",
+    }
+    if limit_per_source and limit_per_source > 0:
+        body["limitPerSource"] = int(limit_per_source)
+    return body
+
+
+async def _curious_coder_run_bulk(
+    page_urls: List[str],
+    *,
+    country: str = "US",
+    active_status: str = "active",
+    limit_per_source: int = 0,
+) -> Tuple[List[Dict[str, Any]], Optional[float], Optional[str]]:
+    """Fire one bulk curious_coder run and return the raw dataset.
+
+    Failure modes (network error, actor failure, dataset fetch error)
+    degrade to ``([], None, run_id_or_None)`` and a logged WARNING —
+    same contract as ``_run_actor_for_page`` in the whoareyouanas
+    path so the caller doesn't have to special-case this.
+    """
+    actor_input = _curious_coder_build_input(
+        page_urls,
+        country=country,
+        active_status=active_status,
+        limit_per_source=limit_per_source,
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{APIFY_BASE}/acts/{CURIOUS_CODER_ACTOR_ID}/runs",
+                params={"token": settings.apify_api_key},
+                json=actor_input,
+            )
+            resp.raise_for_status()
+            run_info = resp.json()["data"]
+        run_id = run_info["id"]
+        log.info(
+            "curious_coder bulk run started for %d dealer(s): %s",
+            len(page_urls), run_id,
+        )
+        completed = await _poll_run(run_id)
+    except TimeoutError:
+        log.error("curious_coder bulk run timed out")
+        return [], None, None
+    except Exception as e:
+        log.warning("curious_coder bulk run failed to start/poll: %s", e)
+        return [], None, None
+
+    if completed.get("status") != "SUCCEEDED":
+        log.warning(
+            "curious_coder bulk run ended with status %s (run_id=%s)",
+            completed.get("status"), completed.get("id"),
+        )
+        return [], completed.get("usageTotalUsd"), completed.get("id")
+
+    dataset_id = completed.get("defaultDatasetId")
+    if not dataset_id:
+        log.warning("curious_coder bulk run succeeded but no dataset id returned")
+        return [], completed.get("usageTotalUsd"), completed.get("id")
+
+    try:
+        ads = await _fetch_dataset_items(dataset_id)
+    except Exception as e:
+        log.warning("curious_coder dataset fetch failed: %s", e)
+        ads = []
+
+    return ads, completed.get("usageTotalUsd"), completed.get("id")
+
+
+# ---------------------------------------------------------------------------
+# Shared persistence helper (used by both actor paths)
+# ---------------------------------------------------------------------------
+
+async def _persist_meta_ads_by_source(
+    ads_by_source: List[Tuple[str, Dict[str, Any]]],
+    *,
+    page_urls: List[str],
+    distributor_mapping: Dict[str, UUID],
+    scan_job_id: UUID,
+    channel: str,
+    actor_id: str,
+) -> int:
+    """Resolve images, attribute distributors, and insert
+    ``discovered_images`` rows for a list of canonical-shape ads.
+
+    Both the whoareyouanas (fan-out) and curious_coder (bulk) paths
+    converge on this function with the same ``[(page_url, ad), …]``
+    shape after their own normalisation steps. Centralising this
+    logic ensures field-name fixes, image fallback rules, and metadata
+    schema changes apply uniformly to both code paths without
+    duplication.
+
+    The caller is responsible for:
+
+      * Setting ``scan_jobs.status='running'`` BEFORE calling.
+      * Handling the empty-input case (this helper assumes
+        ``ads_by_source`` is non-empty; it would set status to
+        ``analyzing`` with ``total_items=0`` if called with zero
+        ads, which is harmless but the caller usually wants to set
+        ``status='completed'`` instead).
+
+    Returns the total number of ``discovered_images`` rows inserted.
+    """
+    # Sample payload log — shape verification on the wire format.
+    sample = ads_by_source[0][1]
+    log.info(
+        "Sample ad payload (actor=%s) keys: %s | imageUrls=%d, "
+        "videoUrls=%d, pageName=%s, adId=%s",
+        actor_id,
+        list(sample.keys()),
+        len(sample.get("imageUrls") or sample.get("images") or []),
+        len(sample.get("videoUrls") or sample.get("videos") or []),
+        sample.get("pageName") or sample.get("brand"),
+        _ad_id(sample),
+    )
+    log.debug("Full sample ad payload: %s", json.dumps(sample, default=str)[:2000])
+
+    # Image fallback (Playwright Ad Library DOM extraction).
+    raw_ads = [ad for _, ad in ads_by_source]
+    pw_resolved = await _resolve_images_for_ads(raw_ads)
+
+    # Distributor resolution + insertion.
+    slug_map = _build_url_to_distributor_map(page_urls, distributor_mapping)
+    img_buffer = DiscoveredImageBuffer()
+    ads_with_images = 0
+    ads_skipped = 0
+
+    for source_page_url, ad in ads_by_source:
+        library_id = _ad_id(ad)
+        if not library_id:
+            ads_skipped += 1
+            continue
+
+        ad_url = ad.get("adUrl") or _ad_library_url_for(library_id)
+        brand = ad.get("pageName") or ad.get("brand") or ""
+        platforms = ad.get("platforms") or []
+        active = ad.get("active")
+        ad_status = "active" if active else ("inactive" if active is False else "")
+        start_date = ad.get("startDate")
+        media_format = ad.get("format") or ""
+
+        image_urls = _collect_media_urls(ad)
+        extraction_method = "apify_meta"
+        if not image_urls and library_id in pw_resolved:
+            image_urls = pw_resolved[library_id]
+            extraction_method = "apify_meta+playwright_fallback"
+
+        if not image_urls:
+            log.warning(
+                "No images resolved for ad %s (%s) — skipping",
+                library_id, brand,
+            )
+            ads_skipped += 1
+            continue
+
+        ads_with_images += 1
+
+        ad_channel = channel
+        platforms_lc = [str(p).lower() for p in platforms]
+        if "instagram" in platforms_lc and "facebook" not in platforms_lc:
+            ad_channel = "instagram"
+
+        distributor_id = (
+            _resolve_distributor_from_source(source_page_url, slug_map)
+            or _resolve_distributor_by_brand(ad, slug_map)
+        )
+
+        for img_url in image_urls:
+            img_buffer.add({
+                "scan_job_id": str(scan_job_id),
+                "distributor_id": str(distributor_id) if distributor_id else None,
+                "source_url": ad_url,
+                "image_url": img_url,
+                "source_type": "extracted_image",
+                "channel": ad_channel,
+                "metadata": {
+                    "extraction_method": extraction_method,
+                    "apify_actor": actor_id,
+                    "library_id": library_id,
+                    "brand": brand,
+                    "ad_status": ad_status,
+                    "media_format": media_format,
+                    "platforms": platforms,
+                    "start_date": start_date,
+                    "link_title": ad.get("linkTitle", ""),
+                    "link_url": ad.get("linkUrl", ""),
+                    "cta_text": ad.get("ctaText", ""),
+                    "cta_url": ad.get("ctaUrl", ""),
+                    "body": (ad.get("body") or "")[:500],
+                    "source_page_url": source_page_url,
+                },
+            })
+
+    total_inserted = img_buffer.flush_all()
+
+    supabase.table("scan_jobs").update({
+        "status": "analyzing",
+        "total_items": total_inserted,
+    }).eq("id", str(scan_job_id)).execute()
+
+    log.info(
+        "Apify Meta Ads scan complete (actor=%s): %d images from %d ads "
+        "(%d skipped, %d resolved via Playwright)",
+        actor_id, total_inserted, ads_with_images, ads_skipped,
+        len(pw_resolved),
+    )
+    return total_inserted
+
+
+# ---------------------------------------------------------------------------
+# curious_coder bulk-run pipeline
+# ---------------------------------------------------------------------------
+
+async def _scan_meta_ads_curious_coder(
+    page_urls: List[str],
+    scan_job_id: UUID,
+    distributor_mapping: Dict[str, UUID],
+    *,
+    channel: str = "facebook",
+) -> int:
+    """End-to-end scan via the curious_coder bulk actor.
+
+    Differences from the whoareyouanas path:
+
+      * ONE bulk Apify run, not N fan-out runs. Cost difference at
+        the rate card is $0.75/1k ads vs $10/1k.
+      * No slug→pageId resolver is needed — the actor accepts plain
+        Facebook page URLs and figures out the per-page Ad Library
+        URLs internally.
+      * Per-ad attribution is via ``pageName`` matching against the
+        input URL slugs (``_curious_coder_attribute_ads``) since the
+        bulk dataset interleaves ads from every dealer.
+
+    Same downstream insertion path as whoareyouanas — the matcher
+    pipeline can't tell which actor produced any given row.
+    """
+    log.info(
+        "Starting Apify Meta Ads scan (channel=%s, actor=%s, MODE=BULK) "
+        "for %d page(s)",
+        channel, CURIOUS_CODER_ACTOR_ID, len(page_urls),
+    )
+
+    supabase.table("scan_jobs").update({
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", str(scan_job_id)).execute()
+
+    raw_ads, cost_usd, run_id = await _curious_coder_run_bulk(
+        page_urls,
+        active_status="active",
+        limit_per_source=settings.apify_meta_curious_coder_limit_per_source,
+    )
+
+    if run_id:
+        try:
+            from . import cost_tracker
+            cost_tracker.record_apify_run(
+                actor_or_task=CURIOUS_CODER_ACTOR_ID,
+                run_id=run_id,
+                usage_total_usd=cost_usd,
+                items_returned=len(raw_ads),
+            )
+        except Exception as cost_err:
+            log.debug("Cost capture skipped (curious_coder): %s", cost_err)
+
+    log.info(
+        "curious_coder bulk run complete: %d raw ad(s) returned, "
+        "$%.4f reported cost",
+        len(raw_ads), float(cost_usd or 0.0),
+    )
+
+    if not raw_ads:
+        supabase.table("scan_jobs").update({
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "total_items": 0,
+        }).eq("id", str(scan_job_id)).execute()
+        log.warning(
+            "curious_coder returned 0 ads for %d dealer URL(s) — "
+            "scan complete with no creatives", len(page_urls),
+        )
+        return 0
+
+    canonical_ads = [_curious_coder_normalize(ad) for ad in raw_ads]
+    ads_by_source = _curious_coder_attribute_ads(
+        canonical_ads, page_urls, distributor_mapping,
+    )
+
+    if not ads_by_source:
+        supabase.table("scan_jobs").update({
+            "status": "completed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "total_items": 0,
+        }).eq("id", str(scan_job_id)).execute()
+        return 0
+
+    return await _persist_meta_ads_by_source(
+        ads_by_source,
+        page_urls=page_urls,
+        distributor_mapping=distributor_mapping,
+        scan_job_id=scan_job_id,
+        channel=channel,
+        actor_id=CURIOUS_CODER_ACTOR_ID,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
 
@@ -1369,22 +2097,21 @@ async def scan_meta_ads(
     channel: str = "facebook",
     campaign_assets: Optional[List[Dict[str, Any]]] = None,
 ) -> int:
-    """Scan Meta Ad Library via the ``whoareyouanas/meta-ad-scraper``
-    actor for Facebook/Instagram ad creatives.
+    """Scan Meta Ad Library for Facebook/Instagram ad creatives.
 
-    The signature is unchanged from the previous actor — callers pass a
-    list of dealer Facebook URLs and we fan out internally.
+    Dispatches to the configured Apify actor:
 
-    Steps:
-        1. Resolve every page URL to its numeric Facebook pageId via
-           the tiered resolver (cache → DB → HTTP probe → Playwright).
-        2. Fan out meta-ad-scraper runs in parallel (bounded by
-           ``settings.apify_meta_max_parallel_runs``) over the
-           dealers whose pageId resolved successfully. Dealers that
-           didn't resolve are logged as warnings and skipped.
-        3. For each ad, pull image URLs (3-tier fallback).
-        4. Insert each image as a ``discovered_images`` row, tagging
-           the source dealer via the page_url that triggered the run.
+      * ``whoareyouanas~meta-ad-scraper`` (default, $10/1k ads, fan-out
+        per dealer with slug→pageId resolver) — original production
+        path. See module docstring + log.md 2026-05-06 entry.
+
+      * ``curious_coder~facebook-ads-library-scraper`` ($0.75/1k ads,
+        bulk URL input, no resolver) — feature-flagged 2026-05-07
+        for A/B trials. See log.md same date for the full cost /
+        reliability comparison and trial plan.
+
+    Public signature is identical for both paths — callers don't
+    have to know which actor is active.
 
     Returns the total number of discovered images inserted.
     """
@@ -1397,10 +2124,20 @@ async def scan_meta_ads(
     if not page_urls:
         raise ValueError("No Facebook page URLs provided for Meta Ads scan.")
 
+    # Dispatch to the curious_coder bulk path when the operator has
+    # opted into it via env. Default actor remains whoareyouanas, so
+    # the deployed behaviour does NOT change unless APIFY_META_ACTOR_ID
+    # is explicitly set.
+    if _is_curious_coder_active():
+        return await _scan_meta_ads_curious_coder(
+            page_urls, scan_job_id, distributor_mapping, channel=channel,
+        )
+
     log.info(
         "Starting Apify Meta Ads scan (%s, actor=%s) for %d page(s) "
         "[fan-out parallelism=%d]",
-        channel, ACTOR_ID, len(page_urls), settings.apify_meta_max_parallel_runs,
+        channel, WHOAREYOUANAS_ACTOR_ID, len(page_urls),
+        settings.apify_meta_max_parallel_runs,
     )
 
     supabase.table("scan_jobs").update({
@@ -1506,111 +2243,11 @@ async def scan_meta_ads(
         log.warning("No ads found for any provided Facebook pages")
         return 0
 
-    # Sample payload for debugging the wire format on first ad only.
-    sample = ads_by_source[0][1]
-    log.info(
-        "Sample ad payload keys: %s | imageUrls=%d, videoUrls=%d, "
-        "pageName=%s, adId=%s",
-        list(sample.keys()),
-        len(sample.get("imageUrls") or sample.get("images") or []),
-        len(sample.get("videoUrls") or sample.get("videos") or []),
-        sample.get("pageName") or sample.get("brand"),
-        _ad_id(sample),
+    return await _persist_meta_ads_by_source(
+        ads_by_source,
+        page_urls=page_urls,
+        distributor_mapping=distributor_mapping,
+        scan_job_id=scan_job_id,
+        channel=channel,
+        actor_id=WHOAREYOUANAS_ACTOR_ID,
     )
-    log.debug("Full sample ad payload: %s", json.dumps(sample, default=str)[:2000])
-
-    # 3: Resolve images for ads missing imageUrls/videoUrls (Playwright tier).
-    raw_ads = [ad for _, ad in ads_by_source]
-    pw_resolved = await _resolve_images_for_ads(raw_ads)
-
-    # 4: Distributor resolution + insertion.
-    slug_map = _build_url_to_distributor_map(page_urls, distributor_mapping)
-    img_buffer = DiscoveredImageBuffer()
-    ads_with_images = 0
-    ads_skipped = 0
-
-    for source_page_url, ad in ads_by_source:
-        library_id = _ad_id(ad)
-        if not library_id:
-            ads_skipped += 1
-            continue
-
-        # Prefer the actor's directly-emitted ad URL when present
-        # (matches the Ad Library permalink the actor itself logs);
-        # fall back to synthesising it from library_id otherwise.
-        ad_url = ad.get("adUrl") or _ad_library_url_for(library_id)
-        brand = ad.get("pageName") or ad.get("brand") or ""
-        platforms = ad.get("platforms") or []
-        active = ad.get("active")
-        ad_status = "active" if active else ("inactive" if active is False else "")
-        start_date = ad.get("startDate")
-        media_format = ad.get("format") or ""
-
-        # 3-tier image resolution.
-        image_urls = _collect_media_urls(ad)
-        extraction_method = "apify_meta"
-        if not image_urls and library_id in pw_resolved:
-            image_urls = pw_resolved[library_id]
-            extraction_method = "apify_meta+playwright_fallback"
-
-        if not image_urls:
-            log.warning(
-                "No images resolved for ad %s (%s) — skipping",
-                library_id, brand,
-            )
-            ads_skipped += 1
-            continue
-
-        ads_with_images += 1
-
-        # If the actor reports the ad ran ONLY on Instagram, surface
-        # that — keeps the existing `instagram` channel split working.
-        ad_channel = channel
-        platforms_lc = [str(p).lower() for p in platforms]
-        if "instagram" in platforms_lc and "facebook" not in platforms_lc:
-            ad_channel = "instagram"
-
-        distributor_id = (
-            _resolve_distributor_from_source(source_page_url, slug_map)
-            or _resolve_distributor_by_brand(ad, slug_map)
-        )
-
-        for img_url in image_urls:
-            img_buffer.add({
-                "scan_job_id": str(scan_job_id),
-                "distributor_id": str(distributor_id) if distributor_id else None,
-                "source_url": ad_url,
-                "image_url": img_url,
-                "source_type": "extracted_image",
-                "channel": ad_channel,
-                "metadata": {
-                    "extraction_method": extraction_method,
-                    "apify_actor": ACTOR_ID,
-                    "library_id": library_id,
-                    "brand": brand,
-                    "ad_status": ad_status,
-                    "media_format": media_format,
-                    "platforms": platforms,
-                    "start_date": start_date,
-                    "link_title": ad.get("linkTitle", ""),
-                    "link_url": ad.get("linkUrl", ""),
-                    "cta_text": ad.get("ctaText", ""),
-                    "cta_url": ad.get("ctaUrl", ""),
-                    "body": (ad.get("body") or "")[:500],
-                    "source_page_url": source_page_url,
-                },
-            })
-
-    total_inserted = img_buffer.flush_all()
-
-    supabase.table("scan_jobs").update({
-        "status": "analyzing",
-        "total_items": total_inserted,
-    }).eq("id", str(scan_job_id)).execute()
-
-    log.info(
-        "Apify Meta Ads scan complete: %d images from %d ads "
-        "(%d skipped, %d resolved via Playwright)",
-        total_inserted, ads_with_images, ads_skipped, len(pw_resolved),
-    )
-    return total_inserted

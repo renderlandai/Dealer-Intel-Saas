@@ -43,6 +43,39 @@ class Settings(BaseSettings):
     # Max parallel actor runs when fanning out across multiple dealer pages.
     # Each run charges $10/1000 ads — keep this low to bound burst spend.
     apify_meta_max_parallel_runs: int = Field(default=4, description="Max simultaneous Apify Meta actor runs across dealers")
+    # Which Apify actor to use for Meta Ad Library scraping. Two known
+    # values today (2026-05-07 onward):
+    #
+    #   * ``whoareyouanas~meta-ad-scraper`` (default — current production)
+    #     - $10 / 1,000 ads
+    #     - One actor run per dealer (we fan out)
+    #     - Requires numeric pageId resolution (slug → ID)
+    #     - DOM scroll-and-extract; brittle to Meta UI churn
+    #
+    #   * ``curious_coder~facebook-ads-library-scraper`` (alternative)
+    #     - $0.75 / 1,000 ads (~13× cheaper at the rate card; the actor
+    #       README cites a historical ~$0.20/1k average)
+    #     - ONE bulk actor run for the whole scan (urls: [{url}, …])
+    #     - Accepts page URLs directly — slug resolver is not needed
+    #     - 24,730 total users, 100% success rate, GraphQL-based
+    #
+    # Wire this through env to A/B compare without touching code. The
+    # underlying ``scan_meta_ads`` dispatcher in ``apify_meta_service``
+    # selects the right code path based on this setting; the public
+    # function signature is the same either way.
+    apify_meta_actor_id: str = Field(
+        default="whoareyouanas~meta-ad-scraper",
+        description="Apify actor slug used by scan_meta_ads (whoareyouanas~meta-ad-scraper or curious_coder~facebook-ads-library-scraper)",
+    )
+    # Optional cap on ads scraped per dealer URL when using the
+    # curious_coder actor. Leave at 0 to scrape ALL active ads (the
+    # actor's ``limitPerSource`` blank semantics — and the whole reason
+    # we'd consider this actor in the first place). Set a positive
+    # integer to bound spend during pilot trials.
+    apify_meta_curious_coder_limit_per_source: int = Field(
+        default=0,
+        description="Per-dealer ad cap for curious_coder actor (0 = scrape all available)",
+    )
     
     # Stripe (billing)
     stripe_secret_key: str = ""

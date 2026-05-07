@@ -2,6 +2,179 @@
 
 ---
 
+## 2026-05-07 (late evening) — Feature flag: curious_coder/facebook-ads-library-scraper as alternative actor
+
+### Why this exists
+
+After today's three-bug-week on `whoareyouanas/meta-ad-scraper`
+(commits `c16958c`, `163aea0`, `35a9b8b` — `targetUrl`-mode fix,
+`imageUrls/videoUrls/adId` field rename, post-filter fail-open) the
+operator surfaced a deeper question in Ask mode: **is this scraper
+truly better than the previous one, given how much it costs?**
+
+Honest review of the actor landscape:
+
+| Actor | Price/1k ads | Architecture | Users | Success rate |
+|---|---|---|---|---|
+| `whoareyouanas/meta-ad-scraper` (current) | **$10.00** | DOM scroll, 1 run/dealer | 1,734 | 97.5% |
+| `nourishing_courier/meta-ads-scraper-pro` (pre-2026-05-06) | $4.00–$2.50 | GraphQL, bulk URLs | 217 | 100% |
+| `curious_coder/facebook-ads-library-scraper` (alternative) | **$0.75** (avg ~$0.20) | bulk URLs, page-URL native | **24,730** | **100%** |
+
+The current actor is 13× more expensive than `curious_coder` at the
+rate card and DOM-based (brittle to Meta UI churn). The original
+`nourishing_courier` recall complaint was almost certainly a
+misconfiguration on our side (`maxAds: 200` cap + no residential
+proxy → sample-throttled), not a fundamental flaw.
+
+`curious_coder` accepts plain Facebook page URLs DIRECTLY in a bulk
+input array — no slug→pageId resolver needed at all, which means we
+can **delete** ~600 lines of resolver / Playwright / `og:title`
+extraction code if the trial pans out.
+
+This commit **does not deploy** the swap — it ships the alternative
+path behind a feature flag so an A/B trial can run from env config
+without touching code.
+
+### What changed
+
+* `backend/app/config.py`
+  - New `apify_meta_actor_id` setting (default
+    `whoareyouanas~meta-ad-scraper` — production behaviour
+    unchanged unless explicitly overridden).
+  - New `apify_meta_curious_coder_limit_per_source` setting
+    (default 0 = scrape all available ads per dealer; positive
+    integer caps spend during pilot).
+
+* `backend/app/services/apify_meta_service.py`
+  - Module docstring rewritten to describe both paths.
+  - `WHOAREYOUANAS_ACTOR_ID` and `CURIOUS_CODER_ACTOR_ID`
+    constants; `ACTOR_ID` kept as a back-compat alias.
+  - `_active_actor_id()` + `_is_curious_coder_active()` predicates
+    that tolerate both `~` and `/` slug forms (operators copy from
+    Apify's UI in the latter form).
+  - **New curious_coder helpers** (10 functions, ~280 LOC):
+    `_curious_coder_first` (defensive multi-key reader),
+    `_curious_coder_unix_to_iso` (date normalisation),
+    `_curious_coder_collect_creative_urls` (image/video/carousel
+    extraction with HD→SD→preview fallback ladder),
+    `_curious_coder_normalize` (raw → canonical ad shape),
+    `_curious_coder_attribute_ads` (page-URL attribution by
+    pageName matching), `_curious_coder_build_input`,
+    `_curious_coder_run_bulk`, `_scan_meta_ads_curious_coder`.
+  - **New shared helper** `_persist_meta_ads_by_source` — extracted
+    from the bottom of `scan_meta_ads`. Both paths feed it the
+    same `[(page_url, ad), …]` shape and it handles the
+    Playwright image fallback, distributor resolution, metadata
+    construction, and `discovered_images` insertion uniformly.
+    Bug fixes to either flow (post-filter, field-name remap, etc.)
+    now apply to both actors automatically.
+  - **Dispatcher in `scan_meta_ads`**: branches on
+    `_is_curious_coder_active()` early — if true, delegates to
+    `_scan_meta_ads_curious_coder` and skips the slug→pageId
+    resolver, the per-dealer fan-out semaphore, and the keyword-
+    search post-filter (none of which apply to bulk-mode).
+
+### Field-mapping table (curious_coder → canonical)
+
+| curious_coder field | canonical field | notes |
+|---|---|---|
+| `adArchiveID` / `adID` | `adId` | Library identifier |
+| `pageID` / `pageId` | `pageID` + reads through `_ad_id` | Numeric page id |
+| `pageName` | `pageName` + `brand` | Mirror so `_ad_advertiser_name` fallback works |
+| `isActive` | `active` | Bool |
+| `startDate` (unix) | `startDate` (ISO) | ms-vs-s auto-detected |
+| `publisherPlatform` | `platforms` | Lowercased |
+| `snapshot.images[].original_image_url` | `imageUrls[].url` | Falls back to resized |
+| `snapshot.videos[].video_hd_url` | `videoUrls[].url` | HD → SD → preview fallback |
+| `snapshot.cards[]` | flattened into images/videos, `format=carousel` | |
+| `snapshot.body.text` or string | `body` | Both shapes tolerated |
+| `snapshot.title` | `linkTitle` | |
+| `snapshot.link_url` | `linkUrl` | |
+| `snapshot.cta_text` | `ctaText` | |
+| (synthesised) | `adUrl` | `facebook.com/ads/library/?id=<adArchiveID>` |
+
+### Per-ad attribution (bulk-mode specific)
+
+In whoareyouanas, source URL is implicit (one run per dealer). In
+curious_coder bulk mode, ads from every dealer are interleaved in
+the same dataset. `_curious_coder_attribute_ads` maps each ad back
+to one of the input dealer URLs via:
+
+  1. **Exact slug → normalised pageName** match (after
+     lowercase + alphanumeric-only normalisation, so
+     "Yancey Rents" → "yanceyrents" → matches `facebook.com/YanceyRents/`).
+  2. **Substring either direction** (handles "Yancey Rents - The
+     Cat Rental Store" → slug "yanceyrents" via `slug_norm in name_norm`).
+  3. **Fallback** to the first input URL — last-resort
+     attribution; matcher pipeline + `_resolve_distributor_by_brand`
+     reject foreign-advertiser collisions on visual / brand grounds.
+
+### How to enable the trial
+
+In Digital Ocean App Platform env (or `.env` for local):
+
+```
+APIFY_META_ACTOR_ID=curious_coder/facebook-ads-library-scraper
+APIFY_META_CURIOUS_CODER_LIMIT_PER_SOURCE=200   # optional spend cap
+```
+
+Both `~` and `/` slug forms are accepted (the predicate
+normalises). To revert: unset or set back to
+`whoareyouanas~meta-ad-scraper`.
+
+### Tests
+
+`backend/tests/test_apify_meta_curious_coder.py` (47 tests):
+
+* `TestCuriousCoderFirst` (5) — multi-key reader edge cases
+* `TestUnixToIso` (5) — date normalisation across input shapes
+* `TestCollectCreativeUrls` (8) — image/video/carousel fallback
+  ladder + invalid-input defensive guards
+* `TestCuriousCoderNormalize` (10) — full canonical-shape mapping
+  including the alternative field names, body-shape variants,
+  format detection, and missing-snapshot edge case
+* `TestCuriousCoderAttribution` (7) — page-URL attribution with
+  exact-match, substring-match, fall-through, and empty-name cases
+* `TestCuriousCoderBuildInput` (5) — actor input shape including
+  the limitPerSource omit-when-zero semantics
+* `TestActorDispatch` (6) — predicate tolerates `/` and `~` slug
+  forms, whitespace, and falls back to whoareyouanas on
+  empty/typo'd values
+
+All 47 new + 19 pre-existing post-filter tests + 22 matcher safety
+tests = 88/88 pass on local Python 3.9. Pre-existing imports
+verified (`scan_meta_ads`, `_scan_meta_ads_curious_coder`,
+`_persist_meta_ads_by_source` all importable from the public
+service module).
+
+### Cost projection
+
+Assuming a 50-dealer compliance scan averaging 10 active ads per
+dealer (500 ads total):
+
+| Path | Apify cost | Reliability | Wall time |
+|---|---|---|---|
+| whoareyouanas (current) | $5.00 | 97.5% per-run × 50 runs ≈ 28% chance of ≥1 failure | ~12 min (4-way fan-out) |
+| curious_coder (this commit, on opt-in) | **$0.38** | 100% per-run × 1 run | ~3-5 min (single bulk run) |
+
+13× cheaper, single point of (less likely) failure, less wall time.
+Not deployed. Pilot trial recommended on 5-dealer scan first.
+
+### Pending follow-ups
+
+* **Pilot trial** — run a 5-dealer A/B comparison against the
+  Yancey/Carolina-CAT/Altorfer dealers that produced empty results
+  on the current actor today. If `curious_coder` returns ads where
+  `whoareyouanas` returns 0, switch.
+* **Schema-drift integration test** — same gap as flagged in
+  earlier commits; would now cover BOTH paths' field names with
+  saved-payload-replay fixtures.
+* **API token rotation + Bearer header migration** — still open
+  from yesterday's exposed-token review. Both code paths still
+  pass the token as `?token=` query param.
+
+---
+
 ## 2026-01-19  — Project Genesis
 
 ### Summary
