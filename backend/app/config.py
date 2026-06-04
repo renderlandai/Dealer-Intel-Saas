@@ -142,6 +142,15 @@ class Settings(BaseSettings):
     initial_backoff: float = Field(default=2.0, description="Initial retry backoff in seconds")
     batch_size: int = Field(default=5, description="Images to process in parallel")
     batch_delay: float = Field(default=0.5, description="Delay between batches in seconds")
+    # Per-request hard cap applied to the Anthropic SDK constructor. The SDK's
+    # built-in default is 600s, which combined with `max_retries=5` produced
+    # the 2026-05-07 evening incident: a single connection that opened but
+    # never returned a body burned 50 minutes of wall-clock and starved the
+    # heartbeat into auto-failure. 120s × 5 retries gives a worst-case 10 min
+    # budget per image, which the page-level `page_hard_timeout_seconds`
+    # backstop then bounds further. Lower if Anthropic is healthy and you want
+    # faster fail-fast; raise if you legitimately need long-context responses.
+    anthropic_request_timeout_seconds: float = Field(default=120.0, description="Per-request timeout passed to anthropic.Anthropic(timeout=...)")
     
     # Image optimization
     max_image_width: int = Field(default=1024, description="Max image width for API")
@@ -177,6 +186,24 @@ class Settings(BaseSettings):
     # Strict variant — see hash_prefilter_strict_max_diff for rationale.
     clip_similarity_strict_threshold: float = Field(default=0.55, description="Min CLIP cosine similarity for CV-localized crops")
     clip_model_name: str = Field(default="clip-ViT-B-32", description="SentenceTransformers CLIP model")
+
+    # Phase-9 follow-up #3 (2026-05-11): full-page-screenshot containment
+    # fallback. The per-image matcher walks raw `<img>` elements and the
+    # CV-localized crop helper looks for pixel-precise asset rectangles
+    # inside the page screenshot. Both miss the case where the asset is
+    # itself a screenshot of a hero banner that the page composes from
+    # CSS background + an isolated equipment PNG + HTML text — none of
+    # those layers individually resembles the asset, but the rendered
+    # result clearly does. This fallback fires AFTER per-image matching
+    # has produced 0 hits for a page: it sends the (asset, full-page
+    # screenshot) pair to Opus 4-6 with a containment prompt and writes
+    # a synthetic match if the model says the asset appears anywhere in
+    # the screenshot. Cost is one extra Opus call per (asset, page-with-
+    # 0-matches) pair; expected to be cheap because most pages with
+    # promotional content already match at the per-image stage.
+    enable_containment_fallback: bool = Field(default=True, description="Run a full-page screenshot containment check on pages with 0 per-image matches")
+    containment_fallback_threshold: int = Field(default=70, description="Min Opus confidence (0-100) to count as a containment match")
+    containment_fallback_max_assets: int = Field(default=10, description="Skip the containment fallback when a campaign has more than this many assets (cost guardrail)")
     
     # Filter model — use a fast/cheap model for the relevance yes/no check
     filter_model: str = Field(default="claude-haiku-4-5-20251001", description="Cheap model for image relevance filtering")
@@ -216,6 +243,20 @@ class Settings(BaseSettings):
     # Page Discovery
     enable_page_discovery: bool = Field(default=True, description="Auto-discover subpages on dealer sites")
     max_pages_per_site: int = Field(default=15, description="Max pages to scan per dealer website")
+    # Phase-9 follow-up (2026-05-11): the previous design ran
+    # `discover_pages` for every dealer SERIALLY in a single loop with
+    # no heartbeat inside it. A single hung dealer (e.g. generaldeequipos.com
+    # on 2026-05-11 11:42 EDT — homepage HTML never finished loading via
+    # httpx) wedged the whole 45-dealer fan-out before a single extraction
+    # ever started, and 20 min later the cleanup job auto-failed the scan.
+    # These two knobs bound that risk:
+    #   * `page_discovery_concurrency` parallelises discovery (HTTP-bound,
+    #     independent per-dealer, perfect candidate for `asyncio.gather`).
+    #   * `page_discovery_per_dealer_timeout_seconds` caps a single bad
+    #     dealer's discovery so it can never block the rest. On timeout
+    #     we fall back to scanning just the dealer's homepage.
+    page_discovery_concurrency: int = Field(default=8, description="Max dealers having pages discovered in parallel")
+    page_discovery_per_dealer_timeout_seconds: int = Field(default=60, description="Cancel one dealer's page discovery after this many seconds (0 = no cap)")
     max_concurrent_pages: int = Field(default=4, description="Max pages to extract in parallel per site (legacy scan_dealer_websites only)")
     # Phase 5-minimal: how many dealers `run_website_scan` processes in
     # parallel. Each dealer owns its own MatchBuffer / ProcessedImageBuffer
@@ -235,17 +276,81 @@ class Settings(BaseSettings):
     # calls + ample Haiku headroom). Drop these if you ever see 429 storms.
     pages_per_dealer_concurrency: int = Field(default=4, description="Max pages scanned in parallel within a single dealer")
     images_per_page_concurrency: int = Field(default=5, description="Max images analysed in parallel within a single extracted page")
+    # Concurrency for the post-scan analyse pass that Facebook / Google /
+    # Instagram / manual analyse paths use. Previously sequential, which
+    # meant 500 images @ 1-2s each = 8-16 min minimum AND a single hung
+    # Claude call stalled the whole loop and starved the heartbeat. With
+    # this fan-out the same scan finishes in ~2 min and one wedged image
+    # only blocks one slot.
+    post_analysis_concurrency: int = Field(default=5, description="Max images analysed in parallel inside run_image_analysis (FB / Google / IG)")
+    # Minimum interval between heartbeat writes. The website runner now
+    # stamps a heartbeat from inside the per-image fan-out (Phase 8 fix
+    # for the 2026-05-07 evening incident) — without this debounce a
+    # 100-image page would fire 100 UPDATEs in tight succession.
+    heartbeat_min_interval_seconds: float = Field(default=10.0, description="Throttle inside-loop heartbeat writes to at most one per this many seconds per scan")
     # When True, run_website_scan writes incremental matches_count /
     # processed_items / total_items to scan_jobs as each dealer finishes,
     # instead of only at the end. Lets the operator UI show real progress
     # and ensures partial results survive a watchdog kill.
     enable_progress_streaming: bool = Field(default=True, description="Stream per-dealer counters to scan_jobs while scan is running")
+    # Phase-8.2: how often the website runner flushes
+    # `pipeline_stats.dealer_outcomes` to scan_jobs while dealers are
+    # finishing. Set to 0 to write on every dealer completion; bump
+    # higher if a 100-dealer scan is generating too many JSONB rewrites.
+    # 3.0 s comfortably keeps the UI badge fresh without thrashing the
+    # row.
+    dealer_outcome_stream_interval_seconds: float = Field(default=3.0, description="Throttle live writes of pipeline_stats.dealer_outcomes to at most one per this many seconds")
     # Hard wall-clock the dispatch wrapper enforces via asyncio.wait_for.
     # 0 disables the wrapper entirely (idle-detection in the cleanup job
     # becomes the only kill signal — see scheduler_service._cleanup_stale_scans).
     # Default 0: trust the heartbeat-based cleanup, which won't kill an
     # actively-writing scan no matter how long it runs.
     scan_hard_timeout_seconds: int = Field(default=0, description="Hard asyncio wall-clock timeout for one scan (0 = use heartbeat-based cleanup only)")
+    # Hard cap on a single page (extract + analyse). Phase-8 backstop: a
+    # wedged page now self-cancels at this limit so the dealer's other
+    # pages keep running and the heartbeat keeps advancing. 0 disables.
+    #
+    # Phase-9 (2026-05-11): dropped from 900 → 480 because the previous
+    # value was the *only* in-flight guard inside `_process_one_page`,
+    # so a 60-image page hitting one slow Anthropic socket could burn
+    # the full 15 minutes before yielding the dealer slot. The new
+    # sub-caps (`page_extract_timeout_seconds` /
+    # `page_analyze_timeout_seconds`) bound each phase independently;
+    # this outer cap is a belt-and-suspenders backstop for any code
+    # path the sub-caps don't cover.
+    page_hard_timeout_seconds: int = Field(default=480, description="Cancel a single page after this many seconds (0 = no cap)")
+    # Phase-9 sub-caps. The previous design only wrapped the entire
+    # `_process_one_page` in a single 900s `wait_for`, which made it
+    # impossible to tell whether Playwright extraction or Anthropic
+    # analysis was the slow phase when a page timed out. Splitting the
+    # budget gives us:
+    #   * fail-fast extraction (most healthy pages finish in <30s; a
+    #     stalled Playwright nav has no business burning 15 minutes),
+    #   * a separate cap for the per-image AI fan-out so Anthropic
+    #     hiccups can't poison the extraction budget,
+    #   * structured `outcome` values (`extract_timeout` /
+    #     `analyze_timeout`) in `blocked_details` so post-mortems
+    #     don't have to read worker logs.
+    # 0 disables the corresponding sub-cap (legacy behaviour — falls
+    # back to the outer `page_hard_timeout_seconds`).
+    page_extract_timeout_seconds: int = Field(default=120, description="Cancel a single page's Playwright extraction after this many seconds (0 = no inner cap)")
+    page_analyze_timeout_seconds: int = Field(default=300, description="Cancel a single page's per-image AI analysis after this many seconds (0 = no inner cap)")
+    # Hard cap on a single dealer (all its pages, plus prep / teardown).
+    # The `_process_one_dealer` task is wrapped in `asyncio.wait_for` so a
+    # pathological dealer cannot starve the rest of the scan. 0 disables.
+    #
+    # Phase-9 (2026-05-11): dropped from 2700 → 1500 once the per-page
+    # sub-caps lowered the worst-case page time. New math at default
+    # settings (`max_pages_per_site=15`, `pages_per_dealer_concurrency=4`,
+    # worst-case page = `page_hard_timeout_seconds=480`):
+    #     ceil(15/4) * 480s = 4 * 480s = 1920s   (theoretical max)
+    # Real dealers don't run 4 worst-case pages in parallel — typical
+    # mix is 3-4 fast pages per slow one, so 1500s gives the typical
+    # dealer huge headroom and kills only the truly pathological one.
+    # That is exactly the desired behaviour for 40-dealer batches:
+    # one bad dealer can't eat the heartbeat budget and starve the
+    # other 39.
+    dealer_hard_timeout_seconds: int = Field(default=1500, description="Cancel a single dealer after this many seconds (0 = no cap)")
     # Heartbeat freshness threshold the cleanup job uses to decide a scan
     # is truly stuck. Was hard-coded to 4h; making it configurable so a
     # tenant scanning hundreds of dealers can give scans more leash.

@@ -100,8 +100,8 @@ const config: Config = {
         "shimmer": "shimmer 2s infinite linear",
       },
       boxShadow: {
-        "glow": "0 0 20px hsl(38 92% 55% / 0.15)",
-        "glow-lg": "0 0 40px hsl(38 92% 55% / 0.2)",
+        "glow": "0 0 20px hsl(243 75% 59% / 0.15)",
+        "glow-lg": "0 0 40px hsl(243 75% 59% / 0.2)",
         "glow-info": "0 0 20px hsl(225 65% 58% / 0.15)",
         "inner-glow": "inset 0 1px 0 hsl(45 15% 92% / 0.05)",
       },

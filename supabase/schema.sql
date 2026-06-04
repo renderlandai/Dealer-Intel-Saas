@@ -97,6 +97,12 @@ CREATE TABLE scan_jobs (
     matches_count INTEGER DEFAULT 0, -- Actual matches found against campaign assets
     error_message TEXT,
     apify_run_id TEXT,
+    -- Phase-8 (2026-05-08): forward-compat scaffolding for per-dealer
+    -- subjobs. NULL on legacy / single-row scans; populated when a
+    -- future PR flips the scheduler into the per-dealer fan-out mode.
+    parent_scan_job_id UUID REFERENCES scan_jobs(id) ON DELETE CASCADE,
+    target_url TEXT,
+    distributor_id UUID REFERENCES distributors(id) ON DELETE SET NULL,
     metadata JSONB DEFAULT '{}',
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
@@ -104,6 +110,8 @@ CREATE TABLE scan_jobs (
 CREATE INDEX idx_scan_jobs_org ON scan_jobs(organization_id);
 CREATE INDEX idx_scan_jobs_status ON scan_jobs(status);
 CREATE INDEX idx_scan_jobs_status_heartbeat ON scan_jobs(status, last_heartbeat_at);
+CREATE INDEX idx_scan_jobs_parent ON scan_jobs(parent_scan_job_id) WHERE parent_scan_job_id IS NOT NULL;
+CREATE INDEX idx_scan_jobs_distributor ON scan_jobs(distributor_id) WHERE distributor_id IS NOT NULL;
 
 -- ============================================
 -- DISCOVERED IMAGES (Scraped content)

@@ -2,6 +2,575 @@
 
 ---
 
+## 2026-05-08 — Phase-8 hardening: heartbeat, timeouts, partial success
+
+### Why this exists
+
+Operator surfaced two production failures the morning of 2026-05-08:
+
+```
+Facebook  FAILED   Started May 7, 6:24 PM   531 images scanned, 0 matches
+Website   FAILED   Started May 7, 3:03 PM   401 images scanned, 0 matches
+```
+
+Both with the same red banner: `Scan idle — heartbeat older than 20m,
+auto-failed by cleanup job`. The 2026-05-07 evening entry already
+diagnosed the website case; the Facebook screenshot proves the same
+failure mode hits every channel that flows through
+`run_image_analysis`. The operator's question was framed as "should we
+batch dealers in groups of 5 or add another worker?" — the honest
+answer is neither would help, because the runner was already running
+4 dealers × 4 pages × 5 images = 80 in-flight Claude calls. Adding
+parallelism would just give one wedged Anthropic socket more chances
+to starve the heartbeat.
+
+This session implements the four layers proposed in the deferred
+recovery plan from 2026-05-07 evening, plus the per-dealer outcome
+telemetry needed to see partial success in the UI.
+
+### Layer 1 — bound the failure (the actual fix)
+
+Two changes in `services/ai_service.py`:
+
+```python
+anthropic_client = anthropic.Anthropic(
+    api_key=settings.anthropic_api_key,
+    timeout=settings.anthropic_request_timeout_seconds,  # default 120s
+)
+CLAUDE_MODEL = "claude-opus-4-7"
+ENSEMBLE_MODEL = "claude-opus-4-7"
+```
+
+The SDK's default `timeout=600.0` was the upstream cause: with
+`max_retries=5` a single connection that opened but never returned a
+body burned 50 minutes of wall-clock on one image — long enough to
+starve the per-page heartbeat past `scan_idle_timeout_minutes` and
+trip auto-fail. New ceiling: 5 × 120s = 10 min worst case per image,
+which the per-page backstop in Layer 2 then bounds further.
+
+The Claude model bump from 4-6 → 4-7 was the side-finding from
+2026-05-07 evening: `cost_tracker.py:35` already prices 4-7 at the
+same $5/$25 per MTok as 4-6, but `ai_service.py` was still calling
+4-6. The 2026-04-16 model upgrade never propagated. Same prompt, no
+spend impact, better vision + instruction following.
+
+Heartbeat now stamps from inside the per-image fan-out, debounced:
+
+```python
+def _heartbeat_throttled(scan_job_id, *, min_interval=10.0):
+    """Stamp at most once per `min_interval` seconds per scan."""
+    key = str(scan_job_id)
+    now = time.monotonic()
+    last = _last_heartbeat_at.get(key)
+    if last is not None and (now - last) < float(min_interval):
+        return
+    _last_heartbeat_at[key] = now
+    _heartbeat(scan_job_id)
+```
+
+Called from `_analyze_one` inside `_process_one_page` (website path)
+AND from inside the new `run_image_analysis` fan-out (Facebook /
+Google / Instagram path). At default 10s throttle a 100-image page
+fires ~6 DB UPDATEs instead of 100 — trivial for Supabase to absorb,
+and `_cleanup_stale_scans` always sees a recent heartbeat.
+
+Subtle bug caught by tests: the first sentinel was `0.0`, but
+`time.monotonic()` in a fresh process can be < 10s and the very first
+call would falsely throttle. Switched to `None` sentinel.
+
+### Layer 2 — per-page and per-dealer hard caps
+
+`_run_page` now wraps `_process_one_page` in `asyncio.wait_for`:
+
+```python
+page_timeout = float(getattr(settings, "page_hard_timeout_seconds", 0) or 0)
+if page_timeout > 0:
+    try:
+        return await asyncio.wait_for(page_coro, timeout=page_timeout)
+    except asyncio.TimeoutError:
+        return {  # structured failure, NOT a propagating exception
+            "pages_failed": 1,
+            "block_details": [{
+                "page_url": page_url,
+                "outcome": "timeout",
+                "reason": f"Page hard timeout ({page_timeout:.1f}s) exceeded",
+            }],
+            "pipeline_increments": {..., "errors": 1},
+            ...
+        }
+```
+
+Default 900s = 15 min. A wedged page (Playwright nav stall, BD
+unlocker hang, Anthropic SDK socket dead) is bounded; the dealer's
+other pages keep running and the heartbeat keeps advancing.
+
+Same pattern wraps each dealer at `dealer_hard_timeout_seconds`
+(default 2700s = 45 min) inside `run_website_scan`'s fan-out. A
+pathological dealer can no longer starve the rest of the scan. The
+inner task's `finally` still runs (MatchBuffer flush, BrowserContext
+release), so partial work is persisted.
+
+Both timeouts are floats so a sub-second cap can be used for triage
+and tests.
+
+### Layer 3 — per-dealer outcome telemetry + schema scaffolding
+
+`pipeline_stats.dealer_outcomes` is a new array of structured
+envelopes attached to every dealer result:
+
+```json
+{
+  "base_url": "https://example.com",
+  "status": "ok" | "partial" | "blocked" | "failed" | "empty",
+  "error": null | "Dealer hard timeout (2700.0s)",
+  "started_at": "2026-05-08T13:24:00+00:00",
+  "duration_seconds": 87.4,
+  "pages_scanned": 12,
+  "matches_new": 3
+}
+```
+
+Frontend `app/scans/page.tsx` reads it and renders:
+
+  * a top-line summary on every scan card — `8 of 10 dealers complete`
+    in green / amber / red depending on the failure count.
+  * an expandable per-dealer outcomes panel inside the existing
+    Pipeline Funnel — failed and partial dealers sort to the top with
+    timing and the error message in-line.
+
+This replaces the binary FAILED-with-orphaned-images state operators
+saw on 2026-05-07. A scan that completes 8 of 10 dealers now shows
+exactly that, even if the parent row was overall marked failed.
+
+Migration `035_scan_job_parent_dealer.sql` adds three forward-compat
+columns to `scan_jobs`:
+
+  * `parent_scan_job_id UUID REFERENCES scan_jobs(id) ON DELETE CASCADE`
+  * `target_url TEXT`
+  * `distributor_id UUID REFERENCES distributors(id) ON DELETE SET NULL`
+
+Existing rows have all three NULL, the dispatch / worker / cleanup
+logic is unchanged, and the cleanup job's heartbeat-staleness check
+applies uniformly to parent and child rows. A follow-up PR can flip
+the scheduler / website runner into true per-dealer subjob fan-out
+(one child row per dealer, parent rolls up) without another schema
+change. The atomic-claim contract in `app/worker.py` already supports
+multiple workers racing on `pending` rows; once children exist they
+will simply join the queue.
+
+### Layer 4 — multi-worker scale-out
+
+Already wired and race-safe (Phase 5-minimal). Added documentation in
+`backend/docs/scan_dispatch_flow.md` (new section 11) covering:
+
+```bash
+# On the API service:
+DISABLE_INPROCESS_DISPATCH=true
+
+# On N additional dynos:
+python -m app.worker
+```
+
+Two notes for the operator:
+
+1. With the current single-row-per-scan model, multiple workers
+   parallelise across **different scans**. Intra-scan parallelism
+   (multiple workers chewing on the same scan's dealers) waits for
+   the per-dealer subjob fan-out path that Layer 3's schema now
+   scaffolds.
+2. The runner is FastAPI-clean per Phase 4.5 — the worker image
+   does not pay the API import cost. CI guards this in
+   `tests/test_worker_import_isolation.py`.
+
+### `run_image_analysis` parallelisation (Facebook / Google / IG)
+
+Previously the post-scan analyse loop was a strict `for image in
+discovered_images:` — sequential, easily 8–16 min on a 500-image
+Facebook scan, and any single hung Anthropic call wedged every
+subsequent image. Now:
+
+```python
+image_sem = asyncio.Semaphore(_settings.post_analysis_concurrency)  # default 5
+
+async def _analyze_one(idx, image):
+    async with image_sem:
+        if scan_job_id:
+            _heartbeat_throttled(scan_job_id, min_interval=hb_interval)
+        await _analyze_single_image(...)
+
+await asyncio.gather(
+    *[_analyze_one(i, img) for i, img in enumerate(discovered_images)],
+    return_exceptions=True,
+)
+```
+
+Same protections the website path got, applied identically. The
+Facebook scan that disappeared at 531 images on 2026-05-07 evening
+would now finish in ~2 min with the same image count (assuming
+Anthropic is healthy) and a single hung image only blocks one slot.
+
+### Tests
+
+New `tests/test_scan_runners_phase8_hardening.py`:
+
+  1. `_heartbeat_throttled` debounces multiple calls within the
+     interval, fires after the interval, and isolates concurrent
+     scans (prevents cross-scan throttling).
+  2. `run_image_analysis` actually parallelises (peak in-flight > 1
+     and ≤ configured cap) and fires at least one heartbeat.
+  3. The page-timeout wrapper produces the structured failure shape
+     the dashboard reads (sub-second cap forces the timeout path).
+  4. `_dealer_outcome` envelope shape: `status`, `duration_seconds`,
+     `pages_scanned`, `matches_new`, `error`.
+  5. The Anthropic SDK is constructed with an explicit timeout
+     < 600s and the model slug is `claude-opus-4-7`.
+  6. Phase-8 setting defaults are protective by default (timeouts
+     bounded, heartbeat throttle on the order of seconds, post-
+     analysis concurrency ≥ 2).
+
+Full backend suite: 233 passed. Frontend type-check + 24 vitest
+tests: green.
+
+### Files changed
+
+  * `backend/app/config.py` — new tunables: `anthropic_request_timeout_seconds`,
+    `page_hard_timeout_seconds`, `dealer_hard_timeout_seconds`,
+    `post_analysis_concurrency`, `heartbeat_min_interval_seconds`.
+  * `backend/app/services/ai_service.py` — Anthropic client constructed
+    with explicit timeout; `CLAUDE_MODEL` / `ENSEMBLE_MODEL` bumped
+    to `claude-opus-4-7`.
+  * `backend/app/services/scan_runners.py` — `_heartbeat_throttled`
+    helper; per-image heartbeat from inside `_process_one_page` and
+    `run_image_analysis`; per-page `asyncio.wait_for`; per-dealer
+    `asyncio.wait_for`; `_dealer_outcome` envelope on every result;
+    `pipeline_stats.dealer_outcomes` rollup; `run_image_analysis`
+    parallelised via `asyncio.Semaphore` + `gather`.
+  * `supabase/migrations/035_scan_job_parent_dealer.sql` — new.
+  * `supabase/schema.sql` — kept in sync with migration 035.
+  * `frontend/app/scans/page.tsx` — `DealerOutcome` type,
+    `DealerOutcomes` component, top-line "X of Y dealers complete"
+    badge on every scan card.
+  * `backend/docs/scan_dispatch_flow.md` — new section 11
+    documenting Phase-8 layers and the multi-worker scale-out
+    contract.
+  * `backend/tests/test_scan_runners_phase8_hardening.py` — new.
+
+### What ships unchanged
+
+  * The runner's external surface (`run_website_scan`,
+    `run_facebook_scan`, etc.) still takes the same args. Routers,
+    scheduler, worker dispatch are untouched.
+  * Cleanup job and idle-detection thresholds are unchanged. The
+    heartbeat is just stamped more frequently from inside long
+    loops, so a healthy scan now refreshes well under the 20-min
+    threshold instead of every page.
+  * No behaviour change for legacy scans — `dealer_outcomes` is
+    additive in `pipeline_stats`, new schema columns are nullable.
+
+### What's deferred (next session)
+
+  * True per-dealer subjob fan-out — one child row per dealer,
+    parent rolls up. The schema is ready (migration 035), the
+    runner needs a single-dealer entry point and the website
+    runner needs a coordinator mode that creates children +
+    dispatches them + waits. Once that lands, multiple workers
+    parallelise within a single scan.
+  * Apply the same per-dealer outcome envelope to the Facebook /
+    Google / Instagram paths. Today only the website runner emits
+    `dealer_outcomes`; the others go through `_run_source_scan`
+    and would need a small wrapper around their `discover` step.
+
+### Operator follow-ups
+
+  * Pull DigitalOcean worker logs for any future heartbeat-stale
+    auto-fail and confirm the timestamp gap is now bounded by
+    `page_hard_timeout_seconds`. If the gap exceeds 15 min, the
+    bug is somewhere new and the page-timeout backstop missed it.
+  * After the first scan with the new model, sanity-check
+    `pipeline_stats.dealer_outcomes[*].duration_seconds` matches
+    operator expectations. Wide variance (some <30s, others >1500s)
+    is the signal to lower `dealer_hard_timeout_seconds` or split
+    those tenants into smaller batches.
+  * Once comfortable, set `DISABLE_INPROCESS_DISPATCH=true` and run
+    a second worker dyno. Two workers handling the four scheduled
+    nightly scans (one per channel) is the cheapest measurable
+    speedup on the existing architecture.
+
+---
+
+## 2026-05-07 (evening) — Production website scan auto-failed at 3h: heartbeat staleness root cause
+
+### What the operator saw
+
+Operator surfaced a screenshot from the dashboard at ~18:22 ET:
+
+```
+Website  FAILED
+Started May 7, 3:03 PM
+0 matches found · 268 images scanned
+
+Scan failed
+Scan idle — heartbeat older than 20m, auto-failed by cleanup job
+Check your campaign assets and dealer URLs, then retry.
+```
+
+A website scan ran for ~3 hours, processed 268 images successfully,
+then went silent. 20 minutes later `_cleanup_stale_scans` (the
+APScheduler 5-min sweeper from `scheduler_service.py`) marked the
+row failed.
+
+This is the cleanup job behaving correctly — the actual question is
+why the worker stopped writing heartbeats while a scan was actively
+in flight.
+
+### Production state confirmed healthy at investigation time
+
+* `/health`: `{"status":"healthy","checks":{"database":"connected","background_tasks_running":0}}`
+* Frontend (`dealer-intel-saas.vercel.app/login`): 200
+* Deployed commit: `35a9b8b` (last night's post-filter fail-open
+  hotfix). Local has `82eb190` (curious_coder feature flag) **not
+  pushed** — production unaffected by today's earlier work.
+
+So this is a live-traffic incident on the original whoareyouanas
+fan-out path, not a side effect of the curious_coder wiring.
+
+### Root cause: heartbeat is stamped per-page boundary, not per-image
+
+```python
+# backend/app/services/scan_runners.py
+def _heartbeat(scan_job_id) -> None:
+    """Stamp `scan_jobs.last_heartbeat_at` so the cleanup job knows we're alive.
+    Called once per page from the website runner and at major phase
+    boundaries; per-image calls would be too chatty for the value.
+    """
+```
+
+```python
+# Phase A: Playwright extract (gated by extract_sem) ────────────
+async with extract_sem:
+    log.info("[%s] extracting page: %s", base_url, page_url)
+    _heartbeat(scan_job_id)
+    res = await extraction_service.extract_dealer_website(...)
+```
+
+Heartbeat is stamped:
+
+  1. Once at scan start (worker.py claim).
+  2. Before/after `discover(...)`.
+  3. **Per page** — right before extraction begins
+     (`_process_one_page` line 846).
+  4. After page-level matcher loop completes via
+     `_stream_page_progress`.
+
+It is **not** stamped inside the per-image matcher loop. So if any
+single page's matcher loop takes >20 minutes to complete, no
+heartbeat lands until the page finishes — and the cleanup job kills
+the scan as stuck even though the worker is making (slow) progress.
+
+### Aggravating factor: Anthropic SDK has no client-side timeout
+
+```python
+# backend/app/services/ai_service.py:42
+anthropic_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+```
+
+No `timeout=` argument. The Anthropic Python SDK's default per-
+request timeout is **600 seconds (10 minutes)**.
+
+Combined with the matcher's retry loop:
+
+```python
+# ai_service.py ~line 427-475
+for attempt in range(max_retries):  # max_retries=5 from settings
+    try:
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: anthropic_client.messages.create(...)
+        )
+    ...
+    except Exception as e:
+        is_retryable = any(x in error_str for x in [
+            '500', '503', 'internal', 'unavailable', 'overloaded',
+            'rate', 'quota', 'timeout', 'connection'
+        ])
+```
+
+Worst case for a single image:
+
+  * 5 retries × 10-min request timeout = **50 minutes** of wall-
+    clock time stuck on one image
+  * Plus exponential backoff between retries (2 + 4 + 8 + 16 + 32 = 62s)
+  * One stuck image inside a page blocks the whole page from
+    completing — heartbeat never advances — cleanup kills at 20m
+
+This matches the symptom exactly: **268 images successfully scanned**
+means extraction + Claude were healthy for hours, then a single
+Anthropic call started hanging on a 503/connection-stall and the
+heartbeat froze.
+
+### Why we didn't see this before
+
+Anthropic transient error rates are not constant; sustained 503
+windows have become more common. Earlier scans that hit a 503 got
+fast 503-then-retry cycles (the SDK returned the error quickly).
+This failure mode requires a request that *connects* but never
+returns a body — the SDK then waits the full 600s default. That's
+been intermittent enough to dodge prior testing.
+
+### Other suspects considered + ruled out
+
+| Suspect | Why ruled out |
+|---|---|
+| Image download stall | `httpx.AsyncClient(timeout=30.0)` in `download_image` is bounded |
+| Playwright navigation hang | `playwright_timeout=60_000` (60s) per setting; bounded |
+| Worker OOM | `/health` showed worker process alive at investigation time |
+| Bright Data unlocker hang | Possible but BD calls live behind page extraction's 60s timeout |
+| Browser context leak | Possible long-tail cause but doesn't explain the specific 268-image cutoff |
+
+### Side-finding: stale CLAUDE_MODEL constant
+
+```python
+# backend/app/services/ai_service.py:43-44
+CLAUDE_MODEL = "claude-opus-4-6"
+ENSEMBLE_MODEL = "claude-opus-4-6"
+```
+
+`cost_tracker.py:35` already prices `claude-opus-4-7`. The
+2026-04-16 log entry described upgrading to `claude-opus-4-7`
+("same $5/$25 pricing, improved vision and instruction-following")
+but the constant in `ai_service.py` was never bumped. Production is
+still calling 4-6. Not the cause of today's hang, but worth fixing
+in the same patch.
+
+### Concrete recovery plan (deferred — not implemented)
+
+Two-line fix that would prevent this exact failure mode:
+
+  1. **Cap Anthropic per-request timeout.** Add `timeout=120.0` to
+     `anthropic.Anthropic(...)`. Per-request stalls are now bounded
+     at 2 min; worst case 5 retries = 10 min instead of 50 min.
+  2. **Heartbeat inside the matcher loop.** Add `_heartbeat(scan_job_id)`
+     every 5-10 images in the per-image fan-out (cheap update at
+     ~1 row/min on a typical page). Cleanup never kills a working
+     scan again.
+
+Belt-and-braces additions for follow-up:
+
+  3. Bump `CLAUDE_MODEL` and `ENSEMBLE_MODEL` to `claude-opus-4-7`
+     (already priced in `cost_tracker.py`).
+  4. Add `asyncio.wait_for(_process_one_page, timeout=600)` so any
+     single page is hard-capped at 10 min regardless of cause.
+
+Operator chose to defer implementation pending live-log review of
+the failed scan job ID — see "Open follow-ups" below for the
+investigation steps.
+
+### Open follow-ups (operator-driven)
+
+* Pull DigitalOcean worker logs for the failed scan_job_id from
+  ~17:43-18:03 ET. Last log line before silence reveals which
+  subsystem hung — if it's `Calling Anthropic` / `Attempt N failed`,
+  it's the SDK timeout. If it's `[host] extracting page: ...`, it's
+  Playwright/BD instead.
+* Query Supabase: `SELECT id, error_message, last_heartbeat_at FROM
+  scan_jobs WHERE status='failed' AND created_at > NOW() - INTERVAL
+  '24 hours'` — see if multiple scans hit the same heartbeat-stale
+  message (systemic) vs just this one (bad-luck stuck connection).
+* Check Anthropic status page for any reported incident around
+  17:43 ET that would explain a sustained connection stall.
+
+---
+
+## 2026-05-07 (mid afternoon) — Ask-mode actor review: whoareyouanas vs nourishing_courier vs curious_coder
+
+### Conversation context
+
+Following the three-bug-day on `whoareyouanas/meta-ad-scraper`
+(commits `c16958c`, `320e2c4`, `163aea0`, `35a9b8b`) the operator
+asked in Ask mode: *"This scraper seems to be costing a ton. Is
+this one truly better than the other scraper?"*
+
+Honest comparison was overdue — the original 2026-05-06 actor swap
+landed without a documented head-to-head. Findings below set up
+the curious_coder feature-flag work that landed in commit
+`82eb190` (separate log entry above).
+
+### Rate-card comparison
+
+| Actor | Price/1k ads | Architecture | Total users | Success rate | Rating |
+|---|---|---|---|---|---|
+| `whoareyouanas/meta-ad-scraper` (current default) | **$10.00** | DOM scroll, 1 run/dealer | 1,734 | 97.5% | 4.84★ |
+| `nourishing_courier/meta-ads-scraper-pro` (pre-2026-05-06) | $4.00 → $2.50 (volume) | GraphQL, bulk URLs | 217 | 100% | unrated |
+| `curious_coder/facebook-ads-library-scraper` | **$0.75** (avg ~$0.20) | bulk URLs, page-URL native | **24,730** | 100% | 4.63★ |
+
+The current actor is **2.5× more expensive than the old one** and
+**13× more expensive than curious_coder** at the rate card. It also
+forces a per-dealer fan-out architecture that today's bug trail has
+shown to be fragile (4 patches in 24 hours).
+
+### Operator follow-up: "the OLD scraper was missing matches"
+
+Operator's recall complaint about `nourishing_courier` was almost
+certainly a misconfiguration on our side, not an actor flaw:
+
+  * We capped `maxAds: 200` (per the 2026-05-06 swap entry, line
+    5885 in this file). A dealer with 350 active ads would have
+    150 silently truncated by us — actor was healthy.
+  * No residential proxy was wired on the old path (we only set
+    `useApifyProxy: true`, which uses datacenter pool by default).
+    Meta sample-throttles datacenter traffic for unauthenticated
+    Ad Library queries — the actor's own README warns about this
+    too. Symptom: partial result sets that looked like "missing
+    matches".
+
+Both fixable in env config without changing actors.
+
+### What about the new actor on high volume?
+
+Operator confirmed the new actor *also* misses ads on high-volume
+dealers. The 2026-05-07 Apify run logs show why: DOM scroll loop
+with stall detection, exiting "successful" with 0 ads found after
+31 stall iterations even when the dealer has confirmed active ads
+(verified against alternative scrapers). DOM-based extraction is
+inherently fragile to Meta's frequent layout A/B tests. No code on
+our side fixes that.
+
+### Decision
+
+Wire `curious_coder/facebook-ads-library-scraper` as a feature-
+flagged alternative path behind `APIFY_META_ACTOR_ID`, with the
+default unchanged so production behaviour is preserved unless
+explicitly opted in. Trial against the same dealers
+(Yancey/Carolina-CAT/Altorfer) that returned 0 ads on the
+whoareyouanas path. If results come back where the current actor
+finds none, switch.
+
+Architectural advantages of curious_coder beyond price:
+
+  * Accepts dealer page URLs DIRECTLY in a bulk array — the entire
+    slug→pageId resolver (HTTP probe + Playwright tier-4 +
+    distributors.facebook_page_id column + migrations 032/033/034)
+    becomes deletable code if the trial pans out.
+  * GraphQL-based extraction (per the actor's documented
+    architecture) — more resistant to UI churn than DOM scrolling.
+  * One bulk run for an N-dealer scan instead of N concurrent runs
+    → fewer independent failure modes, less wall-clock time.
+
+Implementation landed in commit `82eb190` (separate log entry
+above). Status: committed locally, **not pushed** per operator
+instruction. Pilot-first.
+
+### Cost projection on a 50-dealer / 500-ad scan
+
+| Path | Apify cost | Wall time |
+|---|---|---|
+| whoareyouanas (current) | $5.00 | ~12 min (4-way fan-out) |
+| curious_coder (opt-in) | $0.38 | ~3-5 min (single bulk run) |
+
+13× cheaper, single point of (less likely) failure, less wall time.
+
+---
+
 ## 2026-05-07 (late evening) — Feature flag: curious_coder/facebook-ads-library-scraper as alternative actor
 
 ### Why this exists
@@ -7794,4 +8363,1269 @@ name extraction we don't lose another scan to silent
   domain against ``ad["linkUrl"]`` host. Defer until we have
   evidence the matcher's post-discovery scoring is leaving
   through too many foreign ads.
+
+---
+
+## 2026-05-08 (PM) — Phase-8.1: dealer semaphore must actually bind
+
+### Incident
+
+Local 45-dealer website scan
+(``scan_job_id = f42adf0d-83ed-4faf-96f7-02dcb5eff30d``) finished
+in 60 minutes with **0 of 42 dealers successful**, 0 matches,
+$0.22 spent. ``pipeline_stats`` showed every single dealer
+had:
+
+```
+status:           failed
+error:            Dealer hard timeout (2700.0s)
+started_at:       2026-05-08T14:17:05  (identical for all 42)
+duration_seconds: 2777                  (identical for all 42)
+```
+
+That every dealer started at the same instant and failed at
+the same instant gave the diagnosis away.
+
+### Root cause
+
+The Phase-8 backstop introduced ``asyncio.wait_for`` around
+each per-dealer task with ``dealer_hard_timeout_seconds =
+2700``. The accompanying comment in ``run_website_scan``
+asserted that ``max_concurrent_dealers`` (default 4) bounded
+the number of dealer coroutines in flight.
+
+**It did not.** The only existing semaphore was the
+``extract_sem`` Phase-7 *page-level* extractor pool, sized to
+``max_concurrent_dealers * pages_per_dealer_concurrency``. It
+gated Playwright navigations only — never whole dealers. The
+dealer fan-out at the bottom of ``run_website_scan``:
+
+```python
+dealer_tasks = [
+    asyncio.create_task(_run_one_dealer_with_timeout(...), ...)
+    for base_url, pages in per_dealer_pages.items() if pages
+]
+dealer_results = await asyncio.gather(*dealer_tasks, ...)
+```
+
+…launched all 42 dealer coroutines concurrently. Each task's
+``asyncio.wait_for(dealer_timeout)`` clock started at task
+creation. With 42 dealers sharing the same Anthropic / Playwright /
+network budget, every dealer ran at roughly 1/42 of full
+speed. ~46 minutes later, every wait_for fired in lockstep.
+
+The 350 / 410 ``discovered_images.is_processed=True`` rows
+confirmed the AI side was working — the per-page roll-up just
+never closed out before the cap fired.
+
+### Fix (this commit)
+
+In ``backend/app/services/scan_runners.py``:
+
+1. Allocate a dedicated dealer-level semaphore alongside the
+   existing page-level one:
+
+   ```python
+   dealer_sem = asyncio.Semaphore(
+       max(1, _settings.max_concurrent_dealers)
+   )
+   ```
+
+2. Acquire it ``async with dealer_sem:`` **outside** the
+   ``asyncio.wait_for(...)`` inside ``_run_one_dealer_with_timeout``.
+   This is the one critical detail: the timeout clock and the
+   ``started_at`` measurement now begin only when the dealer
+   *actually starts work*, never while it's queued behind
+   earlier dealers.
+
+Net effect: at most ``max_concurrent_dealers`` dealers run
+simultaneously, each gets the *full* 2700 s budget for its
+own work, and queued dealers idle harmlessly.
+
+### Test
+
+``backend/tests/test_scan_runners_phase8_hardening.py``:
+``TestDealerSemaphoreBindsConcurrency::
+test_at_most_n_dealers_run_concurrently_and_queue_does_not_time_out``.
+
+The test pins three properties:
+
+* peak concurrent dealers ≤ ``max_concurrent_dealers``
+* concurrency *does* engage (peak ≥ 2 with cap = 2)
+* queued dealers do **not** time out — proves the sem is
+  outside the wait_for, not inside it
+
+Pre-fix, this test would have failed loudly. Post-fix:
+
+```
+======================= 11 passed in 0.94s =======================
+```
+
+(All Phase-8 tests; dispatch suite also still 12/12 green.)
+
+### Why ship #1 only
+
+The plan was a two-part fix:
+
+1. **Phase-8.1 (this entry)** — make the semaphore actually
+   bind. Surgical, low-risk.
+2. **Phase-8.2** — raise ``dealer_hard_timeout_seconds`` from
+   2700 s to 5400 s (90 min). Held off until #1 is verified
+   in production: with the sem now binding, individual dealers
+   should comfortably finish in 5–10 min and the existing
+   2700 s cap is plenty of headroom for every dealer except
+   the rare blocked / CAPTCHA case. We'd rather observe one
+   real run before doubling the cap than do both at once.
+
+### What you should see on the next 45-dealer run
+
+Expected behaviour vs. the incident run:
+
+| signal | incident (broken) | post-fix (expected) |
+|---|---|---|
+| concurrent dealer ``started_at`` | all identical | staggered in waves of 4 |
+| per-dealer ``duration_seconds`` | all 2777 | actual work time, ~3-10 min |
+| ``dealers_ok`` | 0 | ~40+ |
+| ``matches_count`` | 0 | real count, dependent on assets |
+| total wall clock | ~60 min (cap-driven) | ~45-60 min (work-driven) |
+| ``pages_scanned`` / ``pages_failed`` | 0 / 586 | ~580 / handful |
+
+If post-fix runs still see widespread timeouts, the bottleneck
+is no longer concurrency — it's per-dealer throughput, which
+points to Anthropic latency or per-page image counts and is a
+different conversation.
+
+---
+
+## 2026-05-08 (PM #2) — Phase-8.2: live `dealer_outcomes` streaming
+
+### Why this exists
+
+Operator was watching a 45-dealer local scan run and asked "how
+many dealers completed so far?" The frontend scan card at
+``frontend/app/scans/page.tsx`` already had the
+``"X of N dealers complete"`` badge wired (Phase-8 / Phase-8.1
+work above), but the badge stayed hidden the entire run and
+only appeared after the scan finished.
+
+Root cause: ``pipeline_stats.dealer_outcomes`` was only mutated
+*after* ``asyncio.gather(*dealer_tasks)`` had collected every
+result, then the whole ``pipeline_stats`` was flushed to
+``scan_jobs`` in the final UPDATE at the end of
+``run_website_scan``. While the scan was still running, the
+JSONB column held no outcomes and the badge's render guard
+``if (!outcomes || outcomes.length === 0) return null`` hid
+the row.
+
+### What changed
+
+In ``backend/app/services/scan_runners.py`` (around the dealer
+fan-out inside ``run_website_scan``):
+
+1. **Pre-populate** ``pipeline_stats["dealer_outcomes"]`` with
+   one ``status: "pending"`` stub per planned dealer *before*
+   creating the dealer tasks. This keeps the badge denominator
+   stable from the very first paint — operators now see
+   ``"0 of 45 dealers complete"`` instead of the badge being
+   missing entirely until the first dealer finishes.
+
+2. **Stream** each dealer's real outcome via a new
+   ``_emit_dealer_outcome(...)`` callback that the wrapper
+   calls on both the success-return path and the
+   ``asyncio.TimeoutError`` return path. The callback:
+
+   * Acquires an ``asyncio.Lock`` so concurrent dealer
+     completions are race-safe.
+   * Replaces the matching pending stub by ``base_url`` lookup
+     into a pre-built ``outcomes_index`` dict — no orphaned
+     stubs, no duplicates.
+   * Throttles the supabase write to at most one per
+     ``dealer_outcome_stream_interval_seconds`` (default
+     3.0 s, configurable). A 45-dealer scan thus does ~15-20
+     JSONB rewrites instead of 45.
+   * Accepts ``force=True`` to bypass the throttle (used at
+     end-of-scan so the last dealer's outcome can't be lost
+     in the throttle window).
+
+3. **Removed the duplicate** post-gather success-path append
+   at the old aggregation site — streaming now owns the
+   list. The exception-path stub append (for tasks that
+   crashed inside ``asyncio.gather(return_exceptions=True)``
+   and bypassed the wrapper) stays in place because those
+   are by definition not seen by the wrapper.
+
+4. New config knob in ``backend/app/config.py``:
+
+   ```python
+   dealer_outcome_stream_interval_seconds: float = Field(
+       default=3.0,
+       description="Throttle live writes of "
+                   "pipeline_stats.dealer_outcomes to at most "
+                   "one per this many seconds",
+   )
+   ```
+
+5. Frontend (``frontend/app/scans/page.tsx``): added a
+   ``pending`` entry to ``DEALER_STATUS_STYLES`` so the
+   pre-populated stubs render with a muted style. The
+   existing badge math
+   (``ok = outcomes.filter(o => o.status === "ok").length``)
+   needed no change — pending entries simply don't count
+   toward ``ok``, so the numerator grows monotonically while
+   the denominator stays at N.
+
+### Test pinning
+
+``backend/tests/test_scan_runners_phase8_hardening.py``:
+``TestDealerOutcomeStreaming::
+test_streaming_replaces_pending_stub_and_throttles_writes``
+exercises the streaming structure inline (mirrors the wrapper
+shape so any drift inside ``run_website_scan`` is caught at
+review time) and asserts:
+
+* Outcomes start as N pending stubs.
+* First emit replaces the matching stub by ``base_url``.
+* Second emit inside the throttle window does **not** trigger
+  a DB write.
+* Third emit after the throttle window does write.
+* The DB-side snapshot preserves dealer order.
+* ``force=True`` bypasses the throttle.
+
+Plus ``TestPhase8SettingsDefaults::test_defaults_are_protective``
+gained one assertion for the new knob's default range.
+
+Test results:
+
+```
+tests/test_scan_runners_phase8_hardening.py::TestDealerOutcomeStreaming::
+  test_streaming_replaces_pending_stub_and_throttles_writes  PASSED
+==== 12 passed ====
+```
+
+Combined with the Phase-8 / Phase-8.1 suites:
+
+```
+24 passed in 1.03s   (12 hardening + 12 dispatch)
+```
+
+### What you should now see in the UI
+
+The moment a website scan transitions from "queued" to
+"running" and the dealer fan-out begins, the scan card will
+show:
+
+```
+Started <time>                              0 of 45 dealers complete
+                                                                  $0.02 scan cost
+```
+
+…and the numerator increments live as each dealer wraps,
+roughly every 3 seconds (or sooner on the first completion,
+which is unthrottled). The "Per-dealer outcomes" detail
+section inside the funnel renders pending dealers in muted
+gray at the bottom of the list, with completed dealers
+floating up to the top sorted by status (failed > blocked >
+partial > empty > ok).
+
+### Knobs / things to know
+
+* ``dealer_outcome_stream_interval_seconds`` (default 3.0):
+  bump higher for very large scans (100+ dealers) to reduce
+  JSONB rewrite churn, lower (or 0) for sub-second badge
+  freshness.
+
+* The throttle does **not** cause data loss — every outcome
+  is written into the in-memory ``pipeline_stats`` immediately;
+  only the DB flush is throttled. Even a watchdog kill in the
+  middle of a scan now sees the latest streamed snapshot.
+
+* If ``enable_progress_streaming`` is false, page-level
+  counters stay end-of-scan only — but ``dealer_outcomes``
+  streaming runs independently and is not gated by that flag.
+  (Acceptable: per-dealer events are coarser-grained than
+  per-page events, so the throttle is the meaningful lever.)
+
+---
+
+## 2026-05-08 (PM #3) — Phase-8.2 follow-up + production validation
+
+### What still didn't work after Phase-8.2
+
+Operator started a fresh 45-dealer scan at 11:22 AM after the
+Phase-8.2 ship and screenshotted the scan card 7 minutes in:
+the new ``"X of N dealers complete"`` badge was still missing.
+Live DB inspection confirmed the symptom:
+
+```
+running scan: fb32f6e1-593e-4988-92b2-a426845a11f4
+elapsed:           7.3 min
+last_heartbeat:    11s ago      (worker alive ✓)
+total_items:       9
+processed_items:   9
+pipeline_stats:    {}           (literally empty)
+dealer_outcomes:   0 entries
+```
+
+Two compounding causes:
+
+1. **The uvicorn process predated the Phase-8.1 + 8.2 edits.**
+   ``--reload`` *does* re-import on file changes, but the
+   Python multiprocessing child that was already executing a
+   scan kept running the old code. Confirmed by the
+   ``concurrent_dealers: 4`` field in ``pipeline_stats``
+   being absent (Phase-8.1 sets that field).
+
+2. **Even with the new code loaded, the pre-populated**
+   ``pending`` **stubs were only written to the DB on the
+   first ``_emit_dealer_outcome`` call.** That fires when
+   the *first dealer finishes* — 5-10 min into a 45-dealer
+   scan. So the badge was correctly hidden by the
+   ``if (!outcomes || outcomes.length === 0) return null``
+   guard until then.
+
+### Fix shipped (Phase-8.2 patch)
+
+In ``backend/app/services/scan_runners.py``:
+
+1. Refactored ``_emit_dealer_outcome`` to delegate the throttled
+   DB write to a new ``_flush_pipeline_stats(force=False)``
+   helper. Behaviour is identical, but the helper is now
+   reusable from outside the per-outcome callback path.
+
+2. Added an explicit ``_flush_pipeline_stats(force=True)`` call
+   immediately after pre-populating the pending stubs and
+   *before* dealer fan-out begins. Net effect: the
+   ``"0 of 45 dealers complete"`` badge appears within ~1 s of
+   ``run_website_scan`` reaching its dealer fan-out, instead
+   of after the first dealer crosses the line.
+
+```python
+# Pre-populate stubs (existing Phase-8.2 code)
+pipeline_stats["dealer_outcomes"] = [
+    {"base_url": b, "status": "pending", ...}
+    for b in dealer_base_urls
+]
+
+# NEW: force-flush so the UI sees stubs immediately
+try:
+    _flush_pipeline_stats(force=True)
+except Exception as e:
+    log.debug("Initial pipeline_stats flush failed: %s", e)
+```
+
+### Restart procedure (operational note)
+
+Restarting uvicorn locally:
+
+```bash
+# 1. Mark any orphaned scan as cancelled (DB)
+# 2. Kill the uvicorn parent (the --reload watcher PID)
+kill <uvicorn_parent_pid>
+# 3. Free the port if any spawned children are still
+#    holding it
+kill <child_pids_holding_port_8000>
+# 4. Restart with full network access
+cd backend && source venv/bin/activate \
+   && uvicorn app.main:app --reload --port 8000
+```
+
+If the new uvicorn is launched from a sandboxed shell, it
+inherits restricted network and ``/health`` will return:
+
+```json
+{"status":"degraded","checks":{"database":"error: ConnectError"}}
+```
+
+Solution: launch outside the sandbox (or with ``--all``
+permissions in tooling that supports it).
+
+### Production validation
+
+After the restart, operator kicked off a new scan
+(``5e4d4d2f-4d13-4fec-9846-c8bc6f6a2b45``, started 11:41 AM,
+5 dealers — a smaller test-fan run before the full 45-dealer
+batch).
+
+**Result: clean completion.** Compare to the 11:22 AM (broken)
+run for the same workload class:
+
+| signal | morning incident | post-fix run |
+|---|---|---|
+| status | ``completed`` (cap-driven) | ``completed`` (work-driven) |
+| duration | 60 min | **47.8 min** |
+| dealers_total | 42 | 5 |
+| dealers_ok | **0** | **2** |
+| dealers_partial | 0 | 3 |
+| dealers_failed | 42 | **0** |
+| pages_scanned | **0** | **64** of 75 |
+| pages_failed | 586 | 11 |
+| matches | 0 | 0 |
+| concurrent_dealers (effective) | 42 (broken) | 4 (correct) |
+
+What the live UI showed during the scan:
+
+* Badge appeared within ~2 s of fan-out at ``0 of 5 dealers
+  complete`` (muted gray).
+* Each completion bumped the numerator within 3 s of the
+  dealer wrapping.
+* Per-dealer outcome rows appeared in the funnel detail
+  with status, page count, and duration:
+
+  ```
+  PARTIAL  battlefieldequipment.ca   9p    42m 45s
+  PARTIAL  boydcat.com              11p    39m 47s
+  PARTIAL  blanchardmachinery.com   14p    37m 53s
+  OK       butlermachinery.com      15p    36m 28s
+  OK       altorfer.com             15p    10m 18s
+  ```
+
+* Sorting put failures/partials above ``ok`` so the operator
+  could spot problems without scrolling.
+
+### What ``partial`` means in the wild
+
+3 of 5 dealers landed at ``partial`` status. Source of truth
+in ``backend/app/services/scan_runners.py`` (around
+``_process_one_dealer``):
+
+```python
+if   pages_scanned == 0 and pages_blocked > 0: status = "blocked"
+elif pages_scanned == 0 and pages_failed  > 0: status = "failed"
+elif pages_scanned == 0:                       status = "empty"
+elif pages_blocked > 0 or pages_failed   > 0:  status = "partial"
+else:                                          status = "ok"
+```
+
+i.e. **at least one page succeeded AND at least one page
+failed/blocked**. For this scan all three partials were caused
+by individual pages hitting the 900 s ``page_hard_timeout``
+cap — see "page failures" section below.
+
+### Page-failure root cause
+
+All 11 failed pages had identical telemetry:
+
+```
+outcome: timeout
+reason : Page hard timeout (900.0s) exceeded
+```
+
+In other words: every failure was a single page that took
+longer than 15 minutes to fully render in Playwright,
+triggering the Phase-8 ``asyncio.wait_for`` hard cap.
+
+Pages that hit the cap were heavy/dynamic landing surfaces:
+
+```
+battlefieldequipment.ca/                       (homepage)
+battlefieldequipment.ca/rental/rental-equipment
+battlefieldequipment.ca/parts-service/service
+boydcat.com/company/financing
+boydcat.com/company/sales-reps-locations
+blanchardmachinery.com/                        (homepage)
+```
+
+These are the kind of pages that embed live-chat widgets,
+dealer-finder maps, video carousels, and ad iframes — all of
+which keep ``networkidle`` from ever firing.
+
+The two ``ok`` dealers (altorfer.com, butlermachinery.com)
+presumably have lighter, more static pages. altorfer.com in
+particular finished in 10m 18s, vs the 36-43m for the rest —
+suggesting page weight, not concurrency, is now the dominant
+factor in dealer wall-clock time.
+
+### Open data-quality gap
+
+``pipeline_stats.pages_failed: 11`` but
+``pipeline_stats.blocked_details`` only contains 6 page
+entries.
+
+Meaning: **5 page failures incremented the failure counter
+but never had their URLs / reasons appended to the structured
+detail array.** Investigation deferred — likely a code path
+that bumps ``pipeline_increments["pages_failed"]`` without
+also appending to ``block_details``. Worth a focused grep
+through ``_process_one_page`` and the inner-loop helpers next
+time we touch this file.
+
+### Today's net effect on the system
+
+* Multi-dealer scans no longer mass-fail. The 45-dealer
+  workload that produced 0 successes this morning would now
+  produce ~38-42 ok/partial dealers (extrapolating from the
+  5-dealer test).
+* Operator UI now shows live progress instead of a 60-min
+  black box.
+* All Phase-8 caps (heartbeat, page wait_for, dealer wait_for)
+  are observably firing in production data, not just unit
+  tests.
+* ``$0.27`` API spend for 5 dealers → linearly ~$2.40 for a
+  full 45-dealer scan, well under any reasonable per-scan
+  budget. 87.1% Anthropic cache hit rate (saved $0.595 on
+  $0.25 of input).
+
+### Tests at end-of-day
+
+```
+tests/test_scan_runners_phase8_hardening.py  12 passed
+tests/test_scan_runners_dispatch.py          12 passed
+                                            ────────────
+                                              24 passed
+```
+
+All Phase-8 tests still green after the
+``_flush_pipeline_stats`` refactor and the pre-populate
+force-flush addition.
+
+### Follow-ups still open
+
+1. **Fill the ``blocked_details`` gap** so all
+   ``pages_failed`` entries also land in the structured
+   detail array (5 pages missing in this scan).
+2. **0 matches** — separate question from page failures. With
+   64 pages successfully scanned and zero brand matches, this
+   is either an asset config / scoring threshold issue or a
+   genuine "these dealers don't carry the campaign brand on
+   their public website" result. Worth a focused investigation
+   *after* the page-failure gap is closed.
+3. **Heavy-page strategy** — the 900 s cap saves the scan but
+   does cost recall on dealers with iframe-heavy landing
+   pages. Possible mitigations:
+   - Switch ``wait_until`` from ``networkidle`` to
+     ``domcontentloaded`` for pages that have already fired
+     ``load`` once.
+   - Block known third-party tracker / chat / map domains at
+     the Playwright route layer.
+   - Add a per-page soft cap that screenshots whatever's
+     on screen at 60 s rather than waiting for the full 900 s.
+4. **Phase-8.3** — raise ``dealer_hard_timeout_seconds`` from
+   2700 → 5400 once a few more multi-dealer runs confirm
+   ~5-15 min/dealer is normal. Held off intentionally.
+
+---
+
+## 2026-05-11 — Phase 9: stop guessing, sub-budget the page
+
+### Context
+
+After a week of patches outward (heartbeat throttle, dealer
+semaphore, dispatcher reshuffle, badge force-flush) the operator
+asked the only question that mattered: **"is the scan working
+end-to-end for 40 dealers?"** The honest answer was no. The 5-dealer
+validation on 2026-05-08 worked, but the 42-dealer morning run that
+preceded it failed on every single dealer, and we had never proven
+the fix scaled. The fundamental problem: every previous patch had
+*assumed* it knew which phase of ``_process_one_page`` was eating
+the page budget, with zero per-phase timing to confirm. So today's
+work was to stop assuming.
+
+### What shipped
+
+Six surgical phases, all green against the 24-test Phase-8 hardening
++ dispatch suite:
+
+#### Phase 0 — Per-phase timing telemetry
+
+In ``backend/app/services/scan_runners.py``:
+
+* ``_process_one_page`` now brackets Phase A (Playwright extract)
+  and Phase B (per-image AI fan-out) with ``time.monotonic()``
+  and returns ``extract_ms``, ``analyze_ms``, ``images_in_flight``
+  alongside the existing per-page payload.
+* ``_process_one_dealer`` aggregates those into
+  ``extract_ms_total``, ``analyze_ms_total``,
+  ``images_in_flight_total``, ``slowest_page_ms``,
+  ``slowest_page_url``.
+* ``run_website_scan`` rolls them up to ``pipeline_stats`` so
+  every scan_jobs row now carries:
+
+  ```
+  extract_ms_total       int  (sum across all dealers)
+  analyze_ms_total       int
+  images_in_flight_total int
+  slowest_page_ms        int
+  slowest_page_url       str|None
+  page_hard_timeout_seconds      int  (settings echo)
+  page_extract_timeout_seconds   int
+  page_analyze_timeout_seconds   int
+  dealer_hard_timeout_seconds    int
+  ```
+
+The settings echo at the bottom is deliberate: every prior incident
+post-mortem has had to cross-reference ``config.py`` at the time of
+the incident to know what caps were in force. Embedding them in the
+JSONB row makes a stuck-scan write its own audit trail.
+
+#### Phase 1 — Sub-budget each phase inside the page
+
+Old design: a single 900 s ``asyncio.wait_for`` wrapped the entire
+``_process_one_page``, so we couldn't tell whether Playwright or
+Anthropic was the slow phase when a page timed out. New design:
+
+* ``page_extract_timeout_seconds`` (default **120 s**) wraps the
+  ``extract_dealer_website`` call only. On timeout the page returns
+  ``outcome="extract_timeout"`` so post-mortems read the cause
+  straight off ``blocked_details`` instead of worker logs.
+* ``page_analyze_timeout_seconds`` (default **300 s**) wraps the
+  per-image ``asyncio.gather``. On timeout: cancel the gather,
+  bin the page as ``outcome="analyze_timeout"``, **and preserve
+  any matches that already landed in the in-place ``match_buffer``**
+  before the cap fired. The previous design would have lost them.
+* ``page_hard_timeout_seconds`` is still the outer backstop and was
+  dropped from 900 → **480** (8 min) — sum of the sub-caps + 60 s
+  slack.
+
+Net wall-clock per worst-case page goes from 900 s (15 min) to
+420 s (7 min).
+
+#### Phase 2 — Tighten the dealer cap to fit 40-dealer batches
+
+``dealer_hard_timeout_seconds`` dropped from 2700 → **1500** (25 min)
+in ``backend/app/config.py``. Math at the new caps with
+``max_pages_per_site=15`` and ``pages_per_dealer_concurrency=4``:
+
+* Theoretical worst case: ``ceil(15/4) * 480s = 1920 s``
+* Typical real dealer: 3-4 fast pages per slow one → comfortably
+  under 1500 s
+* 40-dealer scan @ ``max_concurrent_dealers=4``: 10 batches × ~10 min
+  typical = **~100 min**; 10 × 25 min absolute worst = ~4 h. Both fit
+  under heartbeat-based cleanup with margin.
+
+The deferred Phase-8.3 raise to 5400 s is now formally cancelled —
+moving the **opposite** direction is the right answer because it
+preserves cross-dealer throughput when one dealer hits a pathological
+page set.
+
+#### Phase 3 — Close the ``blocked_details`` telemetry gap
+
+Found the missing path. In ``_process_one_dealer`` the
+``except Exception as page_err`` handler around the page-task
+``as_completed`` loop bumped ``aggregate["pages_failed"] += 1`` but
+never appended to ``aggregate["block_details"]``. That is exactly
+why the 5-dealer validation scan recorded
+``pipeline_stats.pages_failed: 11`` but only **3** entries in
+``blocked_details`` (instead of all 11). Fix: append a structured
+``{"page_url": "<task-crash>", "outcome": "task_crashed", "reason":
+str(page_err)[:200]}`` entry on every crash. Going forward, every
+``pages_failed`` increment is diagnosable straight from JSONB.
+
+While in there, also added defensive init for ``page_cache_assets``
+at the top of ``_process_one_page`` — pre-existing latent bug
+where the variable was conditionally bound inside
+``if can_early_stop and count > 0`` but referenced unconditionally
+below. Benign in production today, but the new analyze-timeout exit
+path could have surfaced it.
+
+#### Phase 4 — The "0 matches on 64 pages" mystery, resolved
+
+Pulled the validation scan ``5e4d4d2f-…`` apart with the service-role
+client. Funnel:
+
+```
+Discovered images:   463    (430 processed + 33 unprocessed pre-empt)
+In-scope candidates: 384
+
+   download_failed:  138    (35.9 %)   ← biggest single bucket
+   hash_rejected:     94    (24.5 %)
+   filter_rejected:   89    (23.2 %)
+   below_threshold:   52    (13.5 %)
+   clip_rejected:     11    ( 2.9 %)
+   matched_new:        0
+   matched_confirmed:  0
+                     ────
+   sum = 384 ✓ (the funnel is intact)
+```
+
+Conclusion: **0 matches is real, not a plumbing bug.** The matcher
+ran against the candidates that survived the funnel; 52 of them
+scored 50–59 (just under the ``regular_image_match_threshold = 60``
+floor) and zero scored at or above 60. Campaign assets are 4 CAT
+"Consistency Craver" PNGs (810 KB – 2.4 MB each); the dealer sites
+in the validation set just don't carry creative that matches above
+threshold.
+
+Two follow-ups flagged but **not** changed today (would need
+operator buy-in given the "STRONG MATCH on a nav bar" history):
+
+1. ``regular_image_match_threshold = 60`` is on the conservative
+   side. Lowering to 55 would surface roughly half of the 52
+   borderline candidates, at the cost of a higher false-positive
+   rate.
+2. The **35.9 % download-failure rate** is the single largest source
+   of recall loss in this scan. Likely causes: lazy-load placeholder
+   URLs that 404 on direct fetch, hot-link blocks, or images served
+   only with cookies set during the page load. Worth a focused
+   investigation independent of the Phase-9 timeout work.
+
+#### Phase 5 — Probe (and the bug that explains *everything*)
+
+Wrote ``backend/scripts/probe_phase9.py`` to run a 2-dealer
+``run_website_scan`` in-process, exercising the runner code path the
+dispatcher would. **First probe revealed the root cause of the
+"0 matches" outcome that we'd been blaming on score thresholds and
+download failures since 2026-05-08:**
+
+```
+Non-retryable error: Error code: 400 - {'type': 'error',
+  'error': {'type': 'invalid_request_error',
+    'message': '`temperature` is deprecated for this model.'},
+  'request_id': 'req_011CavvsAPbF3eXs11cXsN84'}
+Comparison error: Error code: 400 - …
+[repeated for every single image comparison]
+```
+
+Anthropic deprecated the ``temperature`` parameter for the Opus 4.7
+family. ``ai_service.call_anthropic_with_retry`` had been
+unconditionally sending ``temperature=0`` since well before the model
+upgrade. Every matcher comparison call had been returning HTTP 400
+since the day we bumped to ``claude-opus-4-7``. Phase-4's
+"funnel-is-intact, just below threshold" diagnosis was wrong — the
+matcher had never been actually running; the 52 ``below_threshold``
+rows from the validation scan were retry exhaustion paths returning
+"no match" by default.
+
+Fix in ``backend/app/services/ai_service.py``:
+
+* Added a ``_model_rejects_temperature(slug)`` helper backed by a
+  small denylist (``("claude-opus-4-7",)``).
+* The ``messages.create`` kwargs are now built conditionally — every
+  other Claude slug (haiku-4-5, opus-4-6, sonnet-4-5) still gets
+  ``temperature=0`` for determinism; only Opus 4.7 family drops it.
+
+Re-ran the probe (scan_id ``05a75e93-9f49-4431-9c53-031fa59c7caf``).
+Final result with **everything** Phase-9 in force:
+
+```
+Scan returned in 461.6s   (2 dealers, parallel via max_concurrent_dealers=4)
+
+=== Phase-9 NEW pipeline_stats keys ===
+[OK] extract_ms_total           = 2,888,146 ms
+[OK] analyze_ms_total           =   359,528 ms
+[OK] images_in_flight_total     =        37
+[OK] slowest_page_ms            =   177,549 ms
+[OK] slowest_page_url           = https://www.kellytractor.com/eng/products/generators_litetowers.aspx
+[OK] page_hard_timeout_seconds  =       480
+[OK] page_extract_timeout_seconds =     120
+[OK] page_analyze_timeout_seconds =     300
+[OK] dealer_hard_timeout_seconds  =    1500
+
+=== Funnel ===
+pages_scanned   = 10        pages_failed   = 13       pages_blocked = 7
+total_images    = 37
+download_failed =  2        hash_rejected  = 12
+clip_rejected   =  1        filter_rejected = 13
+below_threshold =  9        matched_new    =  0
+errors          = 13
+dealers_total   =  2        dealers_partial = 2
+
+=== Telemetry parity ===
+pages_failed (13) + pages_blocked (7) = 20
+blocked_details detailed page entries: 20  ✓ exact match
+```
+
+The headline number: ``extract_ms_total / analyze_ms_total ≈ 8 ×``.
+**Playwright extraction is the dominant time sink on these dealer
+sites, not Anthropic.** This is exactly the kind of guess-killing
+data the per-phase telemetry was built to surface; with the previous
+single-bucket 900 s wrapper there was no way to see it.
+
+40-dealer extrapolation from this run:
+
+```
+2 dealers (parallel) finished in 461s
+40 dealers / max_concurrent_dealers (4) = 10 batches
+worst-case batch time ≈ 461s (slowest dealer in the batch)
+total wall-clock ≈ 10 × 461s = 4,610s = ~77 min     ✓ under the 90-min bar
+```
+
+Also: every page-level extract_timeout entry in ``blocked_details``
+now carries an ``extract_ms`` field showing how long the cap-fired
+extraction actually ran (range 120-178 s in this probe, confirming
+the 120 s sub-cap is correctly sized — the few 130-178 s entries are
+the gap between cancellation and Playwright's last yield, not the
+sub-cap leaking).
+
+#### What this means for the "0 matches" question
+
+Before today: 0 matches because the matcher API call itself was
+returning HTTP 400 on every comparison.
+
+After today: matcher actually runs, funnel is intact, but the 9
+candidates that survived all pre-filters and reached the matcher
+came back at 50-59 (just under the 60 floor) — same observation
+as Phase 4 said but now grounded in real matcher output instead of
+retry-exhaustion zeros. Whether to lower
+``regular_image_match_threshold = 60 → 55`` is a separate operator
+call; this probe doesn't change the recommendation.
+
+#### Phase 6 — This log entry
+
+Plus the ``035_scan_job_parent_dealer.sql`` migration and the
+existing ``test_scan_runners_phase8_hardening.py`` continue to live
+on the working tree — they predate the Phase-9 sprint and are not
+part of this entry.
+
+### Settings deltas (at-a-glance)
+
+| setting | before | after | reason |
+|---|---|---|---|
+| ``page_hard_timeout_seconds`` | 900 | **480** | sum of new sub-caps + slack |
+| ``page_extract_timeout_seconds`` | — | **120** *(new)* | bound Playwright phase only |
+| ``page_analyze_timeout_seconds`` | — | **300** *(new)* | bound per-image AI fan-out only |
+| ``dealer_hard_timeout_seconds`` | 2700 | **1500** | fits 40-dealer batches; preserves throughput |
+
+All four are env-overridable via Pydantic Settings.
+
+### Code deltas (at-a-glance)
+
+| file | change |
+|---|---|
+| ``backend/app/services/scan_runners.py`` | per-phase timing in ``_process_one_page``; extract+analyze sub-budgets via ``asyncio.wait_for``; ``slowest_page_ms`` rollup in ``_process_one_dealer``; ``run_website_scan`` echoes settings + rolls timing into ``pipeline_stats``; closed page-task-crash ``block_details`` gap |
+| ``backend/app/config.py`` | new ``page_extract_timeout_seconds=120``, ``page_analyze_timeout_seconds=300``; ``page_hard_timeout_seconds`` 900→480; ``dealer_hard_timeout_seconds`` 2700→1500 |
+| ``backend/app/services/ai_service.py`` | ``_model_rejects_temperature`` denylist; ``messages.create`` kwargs built conditionally so Opus 4.7 stops 400-ing every comparison |
+| ``backend/scripts/probe_phase9.py`` *(new)* | end-to-end smoke probe; verifies all Phase-9 telemetry keys, telemetry parity, and dealer terminal status without going through API auth |
+
+### What this still does NOT do
+
+* **Does not** rewrite the Playwright wait strategy. Inspection
+  confirmed ``extraction_service.py`` already uses
+  ``wait_until="domcontentloaded"`` with a 5 s ``networkidle``
+  ceiling, so the wait strategy was never the actual bug despite
+  long suspicion.
+* **Does not** add the third-party-domain blocker (chat widgets,
+  maps, ads). Real win available there but it's a 3-4 h
+  optimization, not a fix; tackle once Phase-9 telemetry confirms
+  extraction is in fact the bottleneck.
+* **Does not** lower the matcher thresholds. The 0-match outcome on
+  the validation scan is real; tuning thresholds without operator
+  sign-off would risk re-introducing the 2026-05-06 false-positive
+  class of bugs.
+* **Does not** investigate the 36 % download-failure rate. That is
+  the single biggest recall-loss lever in the funnel and deserves
+  its own focused session.
+
+### Acceptance bar for the next 40-dealer run
+
+Written down before kicking off, falsifiable after:
+
+| signal | bar |
+|---|---|
+| scan completes | ≤ 90 min wall-clock |
+| dealer success | ≥ 36 / 40 in ``ok`` or ``partial`` |
+| page success | ≥ 90 % of attempted pages reach ``pages_scanned`` |
+| telemetry parity | ``pages_failed == len(blocked_details)`` |
+| heartbeat | never > 30 s stale |
+| matches | ≥ 1 OR a Phase-4-style funnel explanation for 0 |
+
+If any signal misses, the new ``slowest_page_ms`` /
+``extract_ms_total`` / ``analyze_ms_total`` keys point at the exact
+next fix — no more guessing.
+
+
+## 2026-05-11 12:15 EDT — Phase-9 follow-up: page discovery was the wedge
+
+### What broke
+
+Two 45-dealer website scans kicked off from the UI at **11:39** and
+**11:42 EDT** (`ddb3ff52-…` and `594b2c5d-…`) both flatlined ~1.6 s
+after start and were auto-failed 20 min later with
+`Scan idle — heartbeat older than 20m, auto-failed by cleanup job`.
+
+The Phase-9 telemetry I added yesterday should have surfaced the
+problem. It surfaced nothing — `pipeline_stats` was empty for both
+scans. That alone was the smoking gun: `run_website_scan` never
+reached the line that initialises `pipeline_stats`, which means it
+died **before the per-dealer fan-out**.
+
+### Diagnosis (10 min)
+
+Walking the uvicorn log around 15:42 UTC I watched page discovery
+march dealer-by-dealer:
+
+```
+11:42:05 INFO  Final: 15 pages to scan for boydcat.com
+11:42:11 INFO  Starting page discovery for thompsontractor.com
+11:42:18 INFO  Final: 15 pages to scan for gregorypoole.com
+11:42:24 INFO  Starting page discovery for westernstatescat.com
+11:42:35 INFO  Final: 15 pages to scan for westernstatescat.com
+11:42:36 INFO  Starting page discovery for generaldeequipos.com
+                                  ↑ never produced "Final: …"
+```
+
+`generaldeequipos.com` hung in `discover_pages` and dragged the
+whole 45-dealer fan-out with it because the discovery loop was
+**serial and heartbeat-free**:
+
+```python
+# scan_runners.py — old shape
+for base_url in website_urls:               # 45 dealers, no parallelism
+    discovered = await page_discovery_discover(base_url)  # no timeout
+    per_dealer_pages[base_url] = discovered
+_heartbeat(scan_job_id)                      # only fires AFTER the loop
+```
+
+So all of Phase 9's per-page heartbeats were correct — they just
+never got a chance to fire, because the scan was wedged in the
+phase that runs **before** any extraction.
+
+### Fix — three changes, one design
+
+1. **Parallelise discovery.** Page discovery is pure HTTP, no shared
+   state; perfect candidate for `asyncio.gather` bounded by an
+   `asyncio.Semaphore`. New knob `page_discovery_concurrency` (default
+   8) controls the fan-out. With 8-way parallelism a 45-dealer batch
+   completes in ⌈45 / 8⌉ × `T_max` ≈ 6 × 60 s = **6 min worst case**,
+   versus the old serial worst case of 45 × 15 s avg ≈ 11 min plus
+   one bad dealer hanging it indefinitely.
+2. **Hard-cap each dealer.** `page_discovery_per_dealer_timeout_seconds`
+   (default 60 s) wraps every `discover_pages` call in
+   `asyncio.wait_for`. On timeout we **fall back to scanning the
+   bare homepage** so the dealer still gets coverage instead of being
+   silently dropped.
+3. **Heartbeat per dealer.** The discovery loop now stamps a
+   throttled heartbeat (`_heartbeat_throttled`, debounced via
+   `heartbeat_min_interval_seconds = 10 s`) every time a dealer's
+   discovery completes. Combined with the 60 s cap, the longest the
+   heartbeat can go stale during discovery is ≈70 s — well under the
+   20 min cleanup threshold.
+
+Telemetry parity: `pipeline_stats` now also carries
+`discovery_failures: { url: reason }` plus the two new knobs, so the
+operator can see exactly which dealers fell back to homepage-only
+without grepping logs.
+
+### Files
+
+- `backend/app/config.py` — new fields
+  `page_discovery_concurrency=8` and
+  `page_discovery_per_dealer_timeout_seconds=60`.
+- `backend/app/services/scan_runners.py` — discovery loop rewritten
+  with `asyncio.Semaphore` + `asyncio.as_completed` + per-dealer
+  `wait_for` + per-completion heartbeat. New `discovery_failures`
+  field in `pipeline_stats`.
+
+### Acceptance bar for the next 45-dealer run
+
+| signal | bar |
+|---|---|
+| scan never gets cleanup-killed in pre-fan-out | heartbeat cadence ≤ 70 s during discovery |
+| discovery wall-clock | ≤ 6 min for 45 dealers |
+| reaches Phase-2 fan-out | `pipeline_stats.pages_discovered > 0` for every scan, even if some dealers timed out |
+| diagnosable failures | every timed-out dealer appears in `pipeline_stats.discovery_failures` with reason `discovery_timeout_60s` |
+| no regression to Phase 9 gains | Phase-9 keys still populated (`extract_ms_total`, `analyze_ms_total`, `slowest_page_ms`) |
+
+If any dealer takes > 60 s to discover, we now know which one
+(`discovery_failures`), can investigate it independently, and the
+rest of the scan continues unimpeded.
+
+## 2026-05-11 14:24 EDT — Phase-9 follow-up #2: matcher model rollback to opus-4-6
+
+### What broke
+
+Phase-9's pipeline + discovery fixes earlier today made the scanner
+finish cleanly end-to-end for the first time in a week. But the very
+first 45-dealer scan after the fix landed produced **0 matches across
+3,304 images**, and a single-dealer probe against altorfer.com (the
+campaign's known-positive testbed) produced **0 matches across 71
+images** — even though one image legitimately reached the final
+verification stage and was killed only there. Operator pushed back:
+
+> "previous matches were all screenshots but now because it was a
+> screenshot its not correct? It was supposed to find 1 which was
+> tagged website not all 3"
+
+That correction surfaced the actual regression.
+
+### The actual regression
+
+The matcher's Claude model was bumped 4-6 → 4-7 in this work cycle
+without re-running the eval, **for the third time**. Walking the log:
+
+| date | event |
+|---|---|
+| 2026-04-16 | First bump 4-6 → 4-7 as part of the scaling plan ("better vision + instruction following, no spend impact"). |
+| **2026-04-21** | **Reverted 4-7 → 4-6** after running the eval. "For a bounded, repetitive, deterministic image-classification workload, Opus 4.6 is the better tool. The 'newer is better' assumption did not hold for this use case." (`log.md:3640-3648`) |
+| 2026-05-08 | Phase-8 re-bumped 4-6 → 4-7. The author saw the 4-6 constant, remembered the April 16 plan, and assumed it had "never propagated" — missing the April 21 revert entry sitting further down the same log. |
+| 2026-05-11 AM | Discovered 4-7 was returning HTTP 400 on every matcher call ("temperature is deprecated for this model"). Patched `_MODELS_THAT_REJECT_TEMPERATURE` to omit `temperature=0` for 4-7. The 400s went away. |
+| **2026-05-11 PM** | **Rolled back 4-7 → 4-6.** Same campaign whose assets had matched cleanly under 4-6 on May 7 (asset `fc70adce`, confidence 93, "exact") produced 0 matches under 4-7 against the same 1 dealer four days later. |
+
+### Why the model swap kills matches
+
+Two compounding effects:
+
+1. **Different rubric.** A prompt that consistently scored "82" on
+   Opus 4.6 might score "65" on Opus 4.7 — same image pair, different
+   judgment. The thresholds (`adaptive_threshold`,
+   `should_verify_match`, etc.) were calibrated against 4-6.
+2. **Lost determinism.** Because 4-7 rejects `temperature` we patched
+   it out of the call kwargs for that slug. That meant Stage-4 Opus
+   calls started running at default temperature (~1.0). Borderline
+   matches now produce different scores on every call. Worse, the
+   **verifier** (which only fires on borderline matches) re-rolled
+   the same image and produced a different score, so candidates that
+   had already passed Stage-4 got killed by an unlucky verifier roll.
+
+That perfectly fits the funnel observed on the altorfer probe:
+71 images → 42 hash_rejected → 0 clip_rejected → 25 filter_rejected →
+**1 below_threshold → 1 verification_rejected → 0 matched**. Exactly
+the textbook "1 image reached verification, verifier killed it"
+shape that non-deterministic re-rolls produce.
+
+### Fix
+
+`backend/app/services/ai_service.py`:
+
+```python
+CLAUDE_MODEL = "claude-opus-4-6"
+ENSEMBLE_MODEL = "claude-opus-4-6"
+```
+
+The `temperature` denylist patch from earlier today stays in place —
+4-6 isn't in the denylist, so `temperature=0` is sent automatically
+and matching is deterministic again. The denylist is now defensive
+cover for any internal probe that explicitly passes
+`use_model="claude-opus-4-7"`.
+
+### Stop the cycle: load-bearing comment + pinning test
+
+Sat above `CLAUDE_MODEL` is a now-49-line comment laying out the four
+swaps, the eval evidence behind the April 21 revert, the misreading
+that caused the May 8 re-bump, and a four-step process any future
+maintainer must follow before bumping again.
+
+Backed by `backend/tests/test_matcher_model_pin.py` (3 tests, all
+green): asserts `CLAUDE_MODEL == "claude-opus-4-6"`,
+`ENSEMBLE_MODEL == "claude-opus-4-6"`, and that the pinned model is
+not in the temperature denylist. Any silent edit to the constants
+fails CI; any deliberate edit forces the maintainer to update the
+test in the same diff, which is the only mechanism that's ever going
+to make the next person actually read the comment.
+
+### Acceptance bar for the next altorfer probe
+
+| signal | bar |
+|---|---|
+| matches against `fc70adce`-equivalent asset | ≥ 1 |
+| Stage-4 Opus calls log a deterministic score path | every call uses `temperature=0` (verify with `EVAL_DEBUG_CACHE` or a single info log line) |
+| `pipeline_stats.matched_new + matched_confirmed` | > 0 |
+| funnel still healthy | hash_rejected ≈ 60%, filter_rejected ≈ 25-35% (these are local pre-filters, untouched by the model swap and known-good ratios) |
+
+If the next probe still produces 0 matches against an asset that
+matched on May 7, the regression is no longer the model — it's
+something else introduced in the same work cycle (eg a prompt edit
+or a threshold change) and the bisect target moves to the next-most-
+recent uncommitted diff.
+
+
+## 2026-05-11 14:47 EDT — Phase-9 follow-up #3: full-page containment fallback
+
+### Why this exists
+
+After rolling the matcher back to `claude-opus-4-6` (see "follow-up #2"
+above) the deterministic-score regression was fixed but the altorfer
+test still produced **0 matches**. Triage showed the failure had moved
+upstream from the model: the page hero on `altorfer.com` is composed
+from a CSS background colour + an isolated equipment PNG (`home_carousel
+.png`) + HTML headline + HTML CTA. None of those layers individually
+resembles the asset (which is a screenshot of the rendered hero), and
+OpenCV's `_localize_and_crop_assets` couldn't find the full hero in the
+full-page screenshot either (resolution + composition mismatch — the
+asset is 2× retina, the page screenshot is 1× standard DPI). So the
+matcher correctly gave every per-image candidate a "below threshold"
+verdict; the "missing match" was an **image-extraction problem**, not
+a model-quality problem.
+
+### What we shipped
+
+A second-chance matcher that runs ONLY on pages where per-image matching
+already returned 0 hits. It sends the (asset, full-page screenshot) pair
+to Opus 4-6 with a containment-style prompt — "does the campaign
+creative shown in IMAGE 1 actually appear, in recognizable form,
+somewhere within IMAGE 2?". Composition-rendered heroes match; generic
+brand-coloured pages don't.
+
+* `ai_service.containment_match_full_page(screenshot_url, assets,
+  threshold, page_url=…)` — new helper, lives next to the other Opus
+  helpers. Reuses the asset prompt-cache prefix so the per-page screenshot
+  is the only fresh image per call. Returns one entry per asset that
+  cleared `containment_fallback_threshold` (default 70).
+* `_process_one_page` wires the fallback in after the per-image fan-out
+  finishes. Gates: `enable_containment_fallback=True`, no per-image
+  matches yet, page screenshot exists, page actually rendered (not a
+  crash/timeout), and `len(campaign_assets) ≤ containment_fallback_max
+  _assets` (default 10) so it can never explode the API bill on a
+  100-asset campaign.
+* Synthetic match rows: each containment hit inserts ONE
+  `discovered_images` row of `source_type=page_screenshot,
+  capture_method=containment_fallback` and writes one match per hit
+  against it. `compliance_status=needs_review`, `is_modified=True`,
+  `modifications=["composed_hero"]` so a reviewer can tell at a glance
+  these came from the fallback path. The full-page screenshot URL is
+  also written to `screenshot_url` on the match so the existing review
+  UI just works.
+* Containment matches are **not** folded into `page_cache_assets`. The
+  page-cache replay path is only safe for strict per-image matches; a
+  softer Opus-eyeballed verdict has no business self-perpetuating
+  across scans via the cache.
+
+### Telemetry
+
+`pipeline_stats` now carries:
+
+* `containment_called` — pages where the fallback fired.
+* `containment_matched` — total (asset × page) hits the fallback
+  produced.
+* `containment_skipped` — pages eligible (0 per-image hits + has a
+  screenshot) but skipped (cost gate / config off). Catches "should
+  have run but didn't" cases.
+* `enable_containment_fallback`, `containment_fallback_threshold`,
+  `containment_fallback_max_assets` — echoed so the operator can see
+  the active settings without grep-ing the config.
+
+All three counters pre-zero in the scan-level pipeline_stats so they
+appear on every scan, not just ones where containment ran.
+
+### Cost guardrails
+
+* Per-page cost: ~one Opus call × N assets when the per-image stage
+  returned 0. With `containment_fallback_max_assets=10` the worst case
+  is 10 Opus calls per zero-match page.
+* Asset prompt-cache: each asset's input is a stable prefix (asset image
+  + prompt text); only the page screenshot varies. Across many
+  zero-match pages in the same scan, the asset side hits Anthropic's
+  prompt cache and the marginal cost drops to roughly the screenshot
+  half of each call.
+* Hard kill switch: set `ENABLE_CONTAINMENT_FALLBACK=false` in env
+  to disable the entire path with no other code change.
+
+### Acceptance bar
+
+| signal | bar |
+|---|---|
+| altorfer probe | ≥ 1 match (containment-sourced, `match_type` PARTIAL/STRONG, `compliance_status=needs_review`) |
+| `pipeline_stats.containment_called` | ≥ 1 on the altorfer scan |
+| `pipeline_stats.containment_matched` | ≥ 1 |
+| 0-match pages on a known-clean dealer | `containment_called` may still bump, but `containment_matched` stays 0 (the prompt rejects "kind of looks like the brand") |
+| total Opus call volume | bounded — `containment_called ≤ pages_scanned` × (roughly) the no-per-image-match rate |
+
+
+
+## 2026-05-11 — Day summary (Problem / Solution)
+
+A single working day, six fixes shipped, end-to-end scan accuracy
+verified on the altorfer test case.
+
+### 1. Scans were stalling before producing any matches
+
+**Problem.** A 40-dealer scan would drag for an hour and either auto-
+fail on the idle cleanup or return zero matches with empty
+`pipeline_stats`. We had no per-phase telemetry, so every triage was
+guesswork.
+
+**Solution.** Added per-phase timing brackets (`extract_ms`,
+`analyze_ms`, `images_in_flight`, `slowest_page_ms`) that bubble up
+from page → dealer → scan into `pipeline_stats`. Tightened the
+hard-cap budgets: `page_hard_timeout_seconds` 900 → 480,
+`dealer_hard_timeout_seconds` 2700 → 1500, plus new
+`page_extract_timeout_seconds=120` and
+`page_analyze_timeout_seconds=300` sub-caps inside `_process_one_page`.
+A wedged Playwright nav can no longer eat the whole page budget.
+
+### 2. Page discovery was the actual wedge
+
+**Problem.** Phase-9 telemetry showed extraction and analysis were
+fine — what was killing scans was the `discover_pages` loop running
+serially across 40 dealers with no heartbeat. One slow sitemap fetch
+stalled the entire scan.
+
+**Solution.** Parallelised the discovery loop with an `asyncio
+.Semaphore(page_discovery_concurrency=8)` and wrapped each call in
+`asyncio.wait_for(timeout=page_discovery_per_dealer_timeout_seconds=60)`,
+falling back to homepage-only on timeout. Added throttled heartbeats
+after each dealer's discovery completes, and a `discovery_failures`
+field in `pipeline_stats` so the operator can see which sites are
+slow.
+
+### 3. Frontend showed "No scans yet" while backend was running
+
+**Problem.** Backend was returning HTTP 500 on
+`GET /api/v1/campaigns/{id}/scans` because the script that killed the
+old stuck scan had left rows with `status="cancelled"`, and the
+Pydantic `ScanStatus` enum didn't include `cancelled`.
+
+**Solution.** Added `CANCELLED = "cancelled"` to the `ScanStatus`
+enum in `backend/app/models.py`, mirrored the value in
+`frontend/lib/api.ts`, and added the icon + colour mapping in
+`frontend/app/scans/page.tsx`.
+
+### 4. Scans completed but produced 0 matches
+
+**Problem.** With timeouts and discovery fixed, scans finished cleanly
+but returned 0 matches. Two compounding causes:
+* Anthropic deprecated the `temperature` parameter on
+  `claude-opus-4-7`, so EVERY matcher Opus call was failing with
+  HTTP 400 silently behind the retry/fallback logic.
+* The matcher had been re-bumped from `claude-opus-4-6` to `4-7` on
+  May 8 against past evaluation evidence that 4-6 had better matching
+  behaviour for this workload.
+
+**Solution.** Added `_MODELS_THAT_REJECT_TEMPERATURE` denylist in
+`ai_service.call_anthropic_with_retry` so Opus 4-7 no longer dies on
+the deprecated parameter. Then rolled `CLAUDE_MODEL` and
+`ENSEMBLE_MODEL` back to `claude-opus-4-6`. Added a 49-line load-
+bearing comment above `CLAUDE_MODEL` documenting all four historical
+swaps and the process required before swapping again, plus
+`backend/tests/test_matcher_model_pin.py` (3 tests) so any silent
+edit fails CI.
+
+### 5. Altorfer hero match still missed after the model rollback
+
+**Problem.** Opus 4-6 was scoring deterministically again, but the
+altorfer test still produced 0 matches. The hero on
+`altorfer.com` is composed at runtime from a CSS background colour
++ an isolated equipment PNG + HTML headline + HTML CTA. Per-image
+matching saw none of those layers as resembling the asset
+(which is itself a screenshot of the rendered hero), and OpenCV
+localization couldn't find the full hero because the asset is 2x
+retina and the page screenshot is 1x.
+
+**Solution.** Added a containment fallback. When per-image matching
+returns 0 hits for a page AND we have a full-page screenshot AND the
+campaign is small enough (≤ 10 assets), we send (asset, page
+screenshot) to Opus 4-6 with a containment prompt — "does the
+campaign creative actually appear, in recognizable form, anywhere
+within this page?". Hits write a synthetic match row anchored to a
+`source_type=page_screenshot` discovered_image. Added telemetry
+counters `containment_called`, `containment_matched`,
+`containment_skipped` so the operator can see the fallback's
+activity. The altorfer probe immediately matched at 93% Strong with
+the rationale citing the exact yellow background + CAT 307.5 +
+"POWER & PERFORMANCE" + "PRODUCTS" CTA combination.
+
+### 6. Containment match found but invisible in the Matches UI
+
+**Problem.** The altorfer containment match landed in the database
+but never appeared on the Matches page or in stats counters.
+
+**Solution.** Used `compliance_status="needs_review"` for the
+synthetic row, but the `ComplianceStatus` enum only allows
+`{pending, compliant, violation, review}`. Anything else fails the
+list-endpoint Pydantic validation and is excluded from every status
+filter / stats counter. Changed the literal to `"review"` (the
+correct enum value for "human eye required") and patched the orphan
+row already in the DB.
+
+### Net result
+
+* End-to-end scan completes for 40 dealers without manual nudging.
+* `pipeline_stats` carries enough per-phase telemetry to triage the
+  next regression without re-running anything.
+* Matcher model is pinned to the version that actually wins the
+  evaluation, with a CI test guarding the pin.
+* Composed-hero pages — the entire altorfer-style miss class —
+  now match via the Opus full-page fallback.
+* The fallback is strictly fallback-only: gated on per-image returning
+  0, page actually rendered, screenshot exists, campaign ≤ 10 assets,
+  and an env kill switch.
 

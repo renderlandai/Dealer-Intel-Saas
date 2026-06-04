@@ -90,6 +90,7 @@ KNOWN_TASK_NAMES = (
     "run_instagram_scan_task",
     "run_analyze_scan_task",
     "run_reprocess_images_task",
+    "run_match_existing_task",
 )
 
 
@@ -193,6 +194,7 @@ async def dispatch_task(
         "run_instagram_scan_task": _run_instagram_scan,
         "run_analyze_scan_task": _run_analyze_scan,
         "run_reprocess_images_task": _run_reprocess_images,
+        "run_match_existing_task": _run_match_existing,
     }
     coro_fn = task_map[task_name]
 
@@ -237,6 +239,7 @@ async def execute_persisted_task(scan_job_id: str, task_name: str, args: Sequenc
         "run_instagram_scan_task": _run_instagram_scan,
         "run_analyze_scan_task": _run_analyze_scan,
         "run_reprocess_images_task": _run_reprocess_images,
+        "run_match_existing_task": _run_match_existing,
     }
     coro_fn = task_map.get(task_name)
     if coro_fn is None:
@@ -398,6 +401,34 @@ async def _run_analyze_scan(scan_job_id, campaign_id=None):
 
     await run_image_analysis(
         images.data, assets.data or [], brand_rules, org_id, scan_job_id,
+    )
+
+
+async def _run_match_existing(scan_job_id, campaign_id, source_scan_job_id=None):
+    """Re-match an existing scan's discovered creatives against a campaign.
+
+    No new discovery/Apify spend — this reuses ``discovered_images`` that a
+    prior scan (``source_scan_job_id``) already pulled for the dealer and
+    compares them against the chosen campaign's assets, writing status /
+    cost / results onto ``scan_job_id`` (a fresh tracking row). Both
+    ``campaign_id`` and ``source_scan_job_id`` are required in practice;
+    ``source_scan_job_id`` falls back to ``scan_job_id`` for direct calls.
+    """
+    from .services.scan_runners import match_existing_images_against_campaign
+
+    log.info(
+        "RUNNING match-existing job=%s campaign=%s source=%s",
+        scan_job_id, campaign_id, source_scan_job_id,
+    )
+    if not campaign_id:
+        _mark_job_failed(scan_job_id, "match-existing requires a campaign_id")
+        return
+    await _run_with_optional_timeout(
+        match_existing_images_against_campaign(
+            UUID(scan_job_id), UUID(campaign_id),
+            UUID(source_scan_job_id) if source_scan_job_id else None,
+        ),
+        scan_job_id, "Match existing",
     )
 
 

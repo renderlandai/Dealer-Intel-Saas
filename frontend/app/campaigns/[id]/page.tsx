@@ -44,6 +44,8 @@ import {
   deleteCampaign,
   startCampaignScan,
   startCampaignBatchScan,
+  getReuseCandidate,
+  matchScanAgainstCampaign,
   getCampaignScans,
   getCampaignMatches,
   getCampaignScanStats,
@@ -170,6 +172,12 @@ export default function CampaignDetailPage() {
   const [scanning, setScanning] = useState(false);
   const [scanningAll, setScanningAll] = useState(false);
   const [selectedSource, setSelectedSource] = useState<string | null>(null);
+  // In-app reuse prompt (replaces the browser's native confirm(), which can be
+  // silently suppressed by the browser after a user dismisses one dialog).
+  const [reusePrompt, setReusePrompt] = useState<{
+    candidate: Awaited<ReturnType<typeof getReuseCandidate>>;
+    source: string;
+  } | null>(null);
   // Dealer selector for the Scans tab. Empty selection = scan every active
   // dealer (matches backend default). The selection persists per-campaign in
   // localStorage so a user running repeated scans doesn't re-tick boxes.
@@ -444,12 +452,56 @@ export default function CampaignDetailPage() {
     }
   };
 
+  // "2 days ago" style label for the reuse prompt; falls back gracefully.
+  const relativeTime = (iso: string): string => {
+    const then = new Date(iso).getTime();
+    if (isNaN(then)) return "recently";
+    const mins = Math.max(0, Math.round((Date.now() - then) / 60000));
+    if (mins < 60) return mins <= 1 ? "just now" : `${mins} minutes ago`;
+    const hours = Math.round(mins / 60);
+    if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+    const days = Math.round(hours / 24);
+    return `${days} day${days === 1 ? "" : "s"} ago`;
+  };
+
   const handleStartScan = async (source: string) => {
     if (assets.length === 0) {
       alert("Please upload at least one asset before starting a scan.");
       return;
     }
 
+    // Offer to reuse a recent scan's already-discovered creatives instead of
+    // paying for a fresh scrape, when one exists that covers these dealers.
+    // Scoped to Facebook only — that's where the expensive Apify scrape is, so
+    // it's where reuse matters. The lookup is non-destructive; on any failure
+    // we silently fall through to a fresh scan.
+    if (source === "facebook") {
+      setScanning(true);
+      setSelectedSource(source);
+      let reuse: Awaited<ReturnType<typeof getReuseCandidate>> | null = null;
+      try {
+        reuse = await getReuseCandidate(
+          source,
+          selectedDealerIds.length > 0 ? selectedDealerIds : undefined,
+        );
+      } catch {
+        reuse = null;
+      }
+      setScanning(false);
+      setSelectedSource(null);
+
+      if (reuse?.reusable && reuse.job_id) {
+        // Surface the choice via an in-app modal instead of native confirm().
+        setReusePrompt({ candidate: reuse, source });
+        return;
+      }
+    }
+
+    await runFreshScan(source);
+  };
+
+  const runFreshScan = async (source: string) => {
+    setReusePrompt(null);
     setScanning(true);
     setSelectedSource(source);
     try {
@@ -458,15 +510,38 @@ export default function CampaignDetailPage() {
         source,
         selectedDealerIds.length > 0 ? selectedDealerIds : undefined,
       );
-      // Start polling for this scan
       setPollingScanId(scanJob.id);
-      // Refresh scans and stats
       await Promise.all([loadScans(), loadCampaign()]);
       setActiveTab("scans");
     } catch (error: any) {
       console.error("Failed to start scan:", error);
       const detail = error?.response?.data?.detail;
       alert(detail || "Failed to start scan. Please try again.");
+    } finally {
+      setScanning(false);
+      setSelectedSource(null);
+    }
+  };
+
+  const handleConfirmReuse = async () => {
+    if (!reusePrompt?.candidate.job_id) return;
+    const { candidate, source } = reusePrompt;
+    setReusePrompt(null);
+    setScanning(true);
+    setSelectedSource(source);
+    try {
+      const result = await matchScanAgainstCampaign(candidate.job_id!, campaignId);
+      if (result.job_id) {
+        setPollingScanId(result.job_id);
+        await Promise.all([loadScans(), loadCampaign()]);
+        setActiveTab("scans");
+      } else {
+        alert(result.message || "Nothing to reuse for this campaign.");
+      }
+    } catch (error: any) {
+      console.error("Failed to reuse scan:", error);
+      const detail = error?.response?.data?.detail;
+      alert(detail || "Failed to reuse scan. Please try again.");
     } finally {
       setScanning(false);
       setSelectedSource(null);
@@ -882,6 +957,53 @@ export default function CampaignDetailPage() {
             )}
           </CardContent>
         </Card>
+
+        {/* Reuse-vs-fresh-scan prompt (in-app modal, not native confirm) */}
+        {reusePrompt && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+            <div className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-xl">
+              <h3 className="text-lg font-semibold">Reuse a recent scan?</h3>
+              <p className="mt-2 text-sm text-muted-foreground">
+                We found a{" "}
+                {SCAN_SOURCES.find((x) => x.value === reusePrompt.source)?.label ||
+                  reusePrompt.source}{" "}
+                scan from{" "}
+                {reusePrompt.candidate.completed_at
+                  ? relativeTime(reusePrompt.candidate.completed_at)
+                  : "recently"}{" "}
+                with{" "}
+                <span className="font-medium text-foreground">
+                  {reusePrompt.candidate.image_count ?? 0} creative
+                  {(reusePrompt.candidate.image_count ?? 0) === 1 ? "" : "s"}
+                </span>{" "}
+                already discovered for these dealers.
+              </p>
+              <p className="mt-2 text-sm text-muted-foreground">
+                Reuse them to check this campaign instantly — with{" "}
+                <span className="font-medium text-foreground">no scraping cost</span> —
+                instead of running a new scan.
+              </p>
+              <div className="mt-5 flex flex-col gap-2 sm:flex-row-reverse">
+                <Button onClick={handleConfirmReuse} className="sm:flex-1">
+                  Reuse creatives (instant, $0)
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => runFreshScan(reusePrompt.source)}
+                  className="sm:flex-1"
+                >
+                  Run a fresh scan
+                </Button>
+              </div>
+              <button
+                onClick={() => setReusePrompt(null)}
+                className="mt-3 w-full text-center text-xs text-muted-foreground hover:text-foreground"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Tabs */}
         <Tabs value={activeTab} onValueChange={setActiveTab} className="space-y-4">

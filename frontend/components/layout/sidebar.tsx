@@ -89,20 +89,20 @@ export function Sidebar() {
                     "opacity-0 animate-fade-up",
                     isCollapsed ? "justify-center px-2" : "px-3",
                     isActive
-                      ? "bg-secondary text-foreground border-l-2 border-primary -ml-px"
+                      ? "brand-gradient text-white border-l-2 border-primary -ml-px"
                       : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
                   )}
                   style={{ animationDelay: `${index * 50}ms`, animationFillMode: 'forwards' }}
                 >
                   <item.icon className={cn(
                     "h-4 w-4 transition-colors flex-shrink-0",
-                    isActive ? "text-primary" : "text-muted-foreground group-hover:text-foreground"
+                    isActive ? "text-white drop-shadow-[0_1px_1px_rgba(0,0,0,0.35)]" : "text-muted-foreground group-hover:text-foreground"
                   )} />
                   {!isCollapsed && (
                     <>
-                      <span className="truncate">{item.name}</span>
+                      <span className={cn("truncate", isActive && "drop-shadow-[0_1px_1px_rgba(0,0,0,0.35)]")}>{item.name}</span>
                       {isActive && (
-                        <div className="ml-auto w-1.5 h-1.5 bg-primary rounded-full flex-shrink-0" />
+                        <div className="ml-auto w-1.5 h-1.5 bg-white/90 rounded-full flex-shrink-0 shadow-[0_0_6px_rgba(255,255,255,0.6)]" />
                       )}
                     </>
                   )}
@@ -135,7 +135,7 @@ export function Sidebar() {
                     "opacity-0 animate-fade-up",
                     isCollapsed ? "justify-center px-2 relative" : "px-3",
                     isActive
-                      ? "bg-secondary text-foreground border-l-2 border-info -ml-px"
+                      ? "bg-secondary text-foreground border-l-2 border-info -ml-px shadow-inner"
                       : "text-muted-foreground hover:text-foreground hover:bg-secondary/50"
                   )}
                   style={{ animationDelay: `${(navigation.length + index) * 50}ms`, animationFillMode: 'forwards' }}

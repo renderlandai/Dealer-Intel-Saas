@@ -44,6 +44,16 @@ interface CostSummary {
   line_item_count?: number;
 }
 
+interface DealerOutcome {
+  base_url: string | null;
+  status: string;
+  error: string | null;
+  started_at: string | null;
+  duration_seconds: number | null;
+  pages_scanned?: number;
+  matches_new?: number;
+}
+
 interface PipelineStats {
   total_images: number;
   download_failed: number;
@@ -69,6 +79,11 @@ interface PipelineStats {
   dealers_blocked?: number;
   dealers_failed?: number;
   dealers_empty?: number;
+  // Per-dealer outcome envelopes (Phase-8). Lets the UI show
+  // "8 of 10 dealers complete" with the failed two named in-line,
+  // instead of the binary FAILED-with-orphaned-images state from
+  // the 2026-05-07 evening incident.
+  dealer_outcomes?: DealerOutcome[];
   blocked_details?: Array<{
     base_url?: string;
     distributor_id?: string | null;
@@ -296,6 +311,105 @@ function CostBreakdown({ cost }: { cost: CostSummary }) {
   );
 }
 
+function formatDuration(seconds: number | null | undefined): string {
+  if (seconds == null || isNaN(Number(seconds))) return "—";
+  const s = Number(seconds);
+  if (s < 60) return `${s.toFixed(0)}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+function shortenUrl(url: string | null | undefined): string {
+  if (!url) return "(unknown dealer)";
+  try {
+    const u = new URL(url);
+    return u.hostname.replace(/^www\./, "");
+  } catch {
+    return url.length > 40 ? `${url.slice(0, 37)}…` : url;
+  }
+}
+
+const DEALER_STATUS_STYLES: Record<string, string> = {
+  ok: "text-green-400",
+  partial: "text-amber-400",
+  blocked: "text-amber-400",
+  empty: "text-muted-foreground",
+  failed: "text-red-400",
+  // Phase-8.2: dealers are pre-populated with this status as soon as
+  // the scan plans its dealer fan-out, so the "X of N dealers complete"
+  // badge has a stable denominator from the first paint instead of
+  // appearing only after the first dealer finishes.
+  pending: "text-muted-foreground/70",
+};
+
+function DealerOutcomes({ outcomes }: { outcomes: DealerOutcome[] }) {
+  if (!outcomes || outcomes.length === 0) return null;
+  // Show failed and partial dealers up top so the operator can act on
+  // them without scrolling. Within each bucket, preserve scan order.
+  const order: Record<string, number> = {
+    failed: 0, blocked: 1, partial: 2, empty: 3, ok: 4,
+  };
+  const sorted = [...outcomes].sort(
+    (a, b) => (order[a.status] ?? 9) - (order[b.status] ?? 9),
+  );
+  const ok = outcomes.filter((o) => o.status === "ok").length;
+  const total = outcomes.length;
+
+  return (
+    <div className="mt-2 pt-2 border-t border-border/30 text-xs">
+      <div className="flex items-center justify-between mb-1.5 text-muted-foreground">
+        <span className="font-medium">
+          Per-dealer outcomes — {ok} of {total} complete
+        </span>
+      </div>
+      <div className="space-y-1">
+        {sorted.map((o, idx) => (
+          <div
+            key={`${o.base_url ?? "unknown"}-${idx}`}
+            className="flex items-center justify-between gap-3 p-1.5 rounded bg-muted/30"
+          >
+            <div className="flex items-center gap-2 min-w-0 flex-1">
+              <span
+                className={`w-16 shrink-0 font-mono uppercase tracking-tight ${
+                  DEALER_STATUS_STYLES[o.status] ?? "text-muted-foreground"
+                }`}
+              >
+                {o.status}
+              </span>
+              <span className="truncate" title={o.base_url ?? undefined}>
+                {shortenUrl(o.base_url)}
+              </span>
+              {o.error && (
+                <span
+                  className="text-red-400/80 italic truncate flex-1"
+                  title={o.error}
+                >
+                  — {o.error}
+                </span>
+              )}
+            </div>
+            <div className="flex items-center gap-3 shrink-0 text-muted-foreground">
+              {o.pages_scanned != null && (
+                <span className="font-mono tabular-nums">
+                  {o.pages_scanned}p
+                </span>
+              )}
+              {o.matches_new != null && o.matches_new > 0 && (
+                <span className="font-mono tabular-nums text-green-400">
+                  +{o.matches_new}
+                </span>
+              )}
+              <span className="font-mono tabular-nums">
+                {formatDuration(o.duration_seconds)}
+              </span>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function PipelineFunnel({ stats }: { stats: PipelineStats }) {
   const newMatches = stats.matched_new ?? stats.matched ?? 0;
   const confirmed = stats.matched_confirmed ?? 0;
@@ -373,6 +487,9 @@ function PipelineFunnel({ stats }: { stats: PipelineStats }) {
           <span>{stats.image_cache.cached_mb} MB cached</span>
         </div>
       )}
+      {stats.dealer_outcomes && stats.dealer_outcomes.length > 0 && (
+        <DealerOutcomes outcomes={stats.dealer_outcomes} />
+      )}
       {stats.cost && <CostBreakdown cost={stats.cost} />}
     </div>
   );
@@ -431,6 +548,7 @@ export default function ScansPage() {
     analyzing: <Loader2 className="h-4 w-4 text-purple-400 animate-spin" />,
     completed: <CheckCircle className="h-4 w-4 text-green-400" />,
     failed: <XCircle className="h-4 w-4 text-red-400" />,
+    cancelled: <XCircle className="h-4 w-4 text-zinc-400" />,
   };
 
   const statusColors: Record<string, string> = {
@@ -439,6 +557,7 @@ export default function ScansPage() {
     analyzing: "bg-purple-500/20 text-purple-400",
     completed: "bg-green-500/20 text-green-400",
     failed: "bg-red-500/20 text-red-400",
+    cancelled: "bg-zinc-500/20 text-zinc-400",
   };
 
   const [expandedJobs, setExpandedJobs] = useState<Set<string>>(new Set());
@@ -618,6 +737,42 @@ export default function ScansPage() {
                     </div>
 
                     <div className="flex items-center gap-4">
+                      {(() => {
+                        const outcomes: DealerOutcome[] | undefined = job.pipeline_stats?.dealer_outcomes;
+                        if (!outcomes || outcomes.length === 0) return null;
+                        const ok = outcomes.filter((o) => o.status === "ok").length;
+                        const partial = outcomes.filter((o) => o.status === "partial").length;
+                        const failed = outcomes.filter(
+                          (o) => o.status === "failed" || o.status === "blocked",
+                        ).length;
+                        const allOk = ok === outcomes.length;
+                        return (
+                          <div className="text-right">
+                            <p
+                              className={`text-sm font-medium ${
+                                allOk
+                                  ? "text-green-400"
+                                  : failed > 0
+                                  ? "text-amber-400"
+                                  : "text-muted-foreground"
+                              }`}
+                            >
+                              {ok} of {outcomes.length} dealers complete
+                            </p>
+                            {(partial > 0 || failed > 0) && (
+                              <p className="text-xs text-muted-foreground">
+                                {partial > 0 && `${partial} partial`}
+                                {partial > 0 && failed > 0 && ", "}
+                                {failed > 0 && (
+                                  <span className="text-red-400">
+                                    {failed} failed
+                                  </span>
+                                )}
+                              </p>
+                            )}
+                          </div>
+                        );
+                      })()}
                       {Number(job.cost_usd ?? 0) > 0 && (
                         <div className="text-right">
                           <div className="flex items-center justify-end gap-1 text-sm font-medium text-emerald-400">

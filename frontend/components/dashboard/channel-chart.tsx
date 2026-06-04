@@ -80,10 +80,10 @@ export function ChannelChart({ data }: ChannelChartProps) {
                 axisLine={false}
               />
               <Tooltip
-                cursor={{ fill: 'hsl(220 15% 12%)' }}
+                cursor={{ fill: 'hsl(240 22% 14%)' }}
                 contentStyle={{
-                  backgroundColor: "hsl(220 18% 7%)",
-                  border: "1px solid hsl(220 15% 14%)",
+                  backgroundColor: "hsl(240 26% 11%)",
+                  border: "1px solid hsl(240 22% 18%)",
                   borderRadius: "2px",
                   fontFamily: "Inter, system-ui, sans-serif",
                   fontSize: "12px",

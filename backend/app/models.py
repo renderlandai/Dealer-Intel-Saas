@@ -49,6 +49,15 @@ class ScanStatus(str, Enum):
     ANALYZING = "analyzing"
     COMPLETED = "completed"
     FAILED = "failed"
+    # 2026-05-11: operator-initiated cancellation (Phase-9 cleanup
+    # script wrote rows back to the DB with this status). Without
+    # the enum value the `/api/v1/campaigns/{id}/scans` response
+    # serializer 500s on the entire array, masking valid scans
+    # behind a single cancelled row. Note: this is a *terminal*
+    # status (treated like `completed` / `failed` everywhere) — the
+    # cleanup job in `scheduler_service` does not pick these up
+    # again.
+    CANCELLED = "cancelled"
 
 
 # ============================================

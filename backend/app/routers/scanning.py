@@ -7,9 +7,10 @@ in this file means it can stay coupled to FastAPI / auth / slowapi /
 plan_enforcement without contaminating the worker import path —
 see Phase 4.5 in `log.md` and `backend/docs/scan_dispatch_flow.md`.
 """
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, Query
 from typing import List, Optional
 from uuid import UUID
+from datetime import datetime, timedelta, timezone
 
 from ..auth import AuthUser, get_current_user
 from ..database import supabase
@@ -143,6 +144,152 @@ async def list_scan_jobs(
     
     result = query.order("created_at", desc=True).limit(limit).execute()
     return result.data
+
+
+# Per-source reuse freshness windows. The matcher RE-DOWNLOADS each
+# discovered creative from its stored URL at match time, so the practical
+# reuse window is bounded by how long that URL stays valid — NOT by data
+# retention. Facebook / Instagram CDN URLs (fbcdn / scontent) are signed
+# and expire within days; dealer-hosted website banners are far more
+# stable. Keep these conservative so reuse never silently matches against
+# creatives whose URLs have already 404'd.
+SOURCE_REUSE_MAX_AGE_DAYS = {
+    "facebook": 7,
+    "instagram": 7,
+    "google_ads": 7,
+    "website": 14,
+}
+DEFAULT_REUSE_MAX_AGE_DAYS = 7
+
+_SOURCE_URL_FIELD = {
+    "facebook": "facebook_url",
+    "instagram": "instagram_url",
+    "website": "website_url",
+}
+
+
+def _coverage_key(distributor: dict, source: str) -> Optional[str]:
+    """The unit a dealer is "covered" by for reuse purposes.
+
+    For URL-based channels (Facebook / Instagram / Website) this is the
+    normalized channel URL — NOT the distributor id. That matters because
+    multiple distributor records can share one Facebook page (e.g. a
+    rooftop and its parent group), and the scraper attributes that page's
+    ads to a single distributor id. Keying coverage on the URL means a
+    scan that pulled the shared page counts for every dealer pointing at
+    it. Google Ads (and any future name-based source) has no URL, so it
+    falls back to the distributor id.
+
+    Returns ``None`` when the dealer can't be reached on this channel
+    (no URL configured) — such dealers are out of scope for the scan.
+    """
+    field = _SOURCE_URL_FIELD.get(source)
+    if field is None:  # google_ads (and any future name-based source)
+        return distributor.get("id")
+    raw = (distributor.get(field) or "").strip().lower()
+    if not raw:
+        return None
+    return raw.rstrip("/")
+
+
+async def find_reusable_scan(
+    org_id,
+    source: str,
+    requested_distributor_ids: Optional[List[UUID]] = None,
+) -> Optional[dict]:
+    """Find the most recent completed ``source`` scan whose already-discovered
+    creatives can be reused to audit a campaign for the requested dealers,
+    avoiding a fresh (expensive) scrape.
+
+    A scan qualifies only when it is same-org, same-source, ``completed``,
+    within the per-source freshness window, and its ``discovered_images``
+    cover every requested dealer the channel can reach — coverage compared
+    by channel URL (see :func:`_coverage_key`), not distributor id, so
+    rooftops that share a Facebook page count as covered. Reuse tracking
+    rows are naturally excluded (they carry no discovered images of their
+    own). Returns a candidate descriptor, or ``None``.
+    """
+    max_age = SOURCE_REUSE_MAX_AGE_DAYS.get(source, DEFAULT_REUSE_MAX_AGE_DAYS)
+
+    # Fetch the org's distributors once and build id -> row so we can map
+    # both the requested set and each scan's discovered distributor ids
+    # onto coverage keys.
+    dist_rows = supabase.table("distributors")\
+        .select("id, status, facebook_url, instagram_url, website_url")\
+        .eq("organization_id", str(org_id))\
+        .execute().data or []
+    by_id = {d["id"]: d for d in dist_rows}
+
+    if requested_distributor_ids:
+        requested_ids = [str(d) for d in requested_distributor_ids]
+    else:
+        requested_ids = [d["id"] for d in dist_rows if d.get("status") == "active"]
+
+    requested_keys = set()
+    for rid in requested_ids:
+        d = by_id.get(rid)
+        if not d:
+            continue
+        key = _coverage_key(d, source)
+        if key:
+            requested_keys.add(key)
+    if not requested_keys:
+        return None
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age)).isoformat()
+    candidates = supabase.table("scan_jobs")\
+        .select("id, completed_at")\
+        .eq("organization_id", str(org_id))\
+        .eq("source", source)\
+        .eq("status", "completed")\
+        .gte("completed_at", cutoff)\
+        .order("completed_at", desc=True)\
+        .limit(15)\
+        .execute().data or []
+
+    for job in candidates:
+        imgs = supabase.table("discovered_images")\
+            .select("distributor_id")\
+            .eq("scan_job_id", job["id"])\
+            .execute().data or []
+        covered_keys = set()
+        for r in imgs:
+            cid = r.get("distributor_id")
+            d = by_id.get(cid) if cid else None
+            if not d:
+                continue
+            key = _coverage_key(d, source)
+            if key:
+                covered_keys.add(key)
+        if requested_keys <= covered_keys:
+            return {
+                "job_id": job["id"],
+                "completed_at": job["completed_at"],
+                "image_count": len(imgs),
+                "dealer_count": len(requested_keys),
+                "max_age_days": max_age,
+            }
+    return None
+
+
+@router.get("/reuse-candidate", summary="Find a recent reusable scan for these dealers")
+async def reuse_candidate(
+    source: ScanSource,
+    distributor_ids: List[UUID] = Query(default=[]),
+    user: AuthUser = Depends(get_current_user),
+):
+    """Non-destructive lookup powering the "reuse vs. fresh scan" prompt.
+
+    Reports whether a recent completed ``source`` scan exists whose
+    creatives can be reused to audit a campaign for these dealers without a
+    new (expensive) Apify / website scrape. Starts nothing — the caller
+    decides between :func:`match_scan_against_campaign` (reuse) and
+    :func:`start_scan` (fresh).
+    """
+    match = await find_reusable_scan(user.org_id, source.value, distributor_ids)
+    if not match:
+        return {"reusable": False}
+    return {"reusable": True, **match}
 
 
 @router.get("/{job_id}", response_model=ScanJob, summary="Get scan job")
@@ -361,6 +508,101 @@ async def analyze_discovered_images(
     return {
         "message": "Analysis queued",
         "image_count": image_count,
+    }
+
+
+@router.post("/{job_id}/match-campaign", summary="Match existing scan creatives against a campaign")
+async def match_scan_against_campaign(
+    job_id: UUID,
+    campaign_id: UUID,
+    user: AuthUser = Depends(get_current_user),
+):
+    """Reuse a completed scan's already-discovered creatives to audit another
+    campaign — WITHOUT running a new (expensive) Apify / website scrape.
+
+    Discovered creatives are keyed to the dealer, not a campaign, so one
+    dealer scan can be matched against any number of campaigns for only the
+    cost of the cheap matcher pass. Idempotent: re-running against the same
+    campaign refreshes existing matches instead of duplicating them.
+    """
+    from ..tasks import dispatch_task
+
+    job = supabase.table("scan_jobs")\
+        .select("*")\
+        .eq("id", str(job_id))\
+        .eq("organization_id", str(user.org_id))\
+        .single()\
+        .execute()
+
+    if not job.data:
+        raise HTTPException(status_code=404, detail="Scan job not found")
+
+    if job.data["status"] != "completed":
+        raise HTTPException(status_code=400, detail="Scan job not completed yet")
+
+    campaign = supabase.table("campaigns")\
+        .select("id")\
+        .eq("id", str(campaign_id))\
+        .eq("organization_id", str(user.org_id))\
+        .single()\
+        .execute()
+
+    if not campaign.data:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    images = supabase.table("discovered_images")\
+        .select("id", count="exact")\
+        .eq("scan_job_id", str(job_id))\
+        .execute()
+
+    image_count = images.count or 0
+    if image_count == 0:
+        return {"message": "No discovered creatives on this scan to reuse", "count": 0}
+
+    assets = supabase.table("assets")\
+        .select("id", count="exact")\
+        .eq("campaign_id", str(campaign_id))\
+        .execute()
+
+    if not (assets.count or 0):
+        return {"message": "No campaign assets to match against", "count": 0}
+
+    # Create a FRESH tracking row (status='pending') for the reuse pass rather
+    # than re-dispatching the original completed scan. This is what makes the
+    # feature work under the worker-handoff deploy: the external worker only
+    # claims `status='pending'` rows, and it keeps the source scan's reported
+    # numbers (matches_count / pipeline_stats / cost) intact.
+    # NOTE: deliberately mirrors the column set `start_scan` inserts
+    # (org / campaign / source / status). We do NOT write `distributor_id`
+    # here — it's a later, optional migration that isn't present on every
+    # deployment, and the tracking row doesn't need it (the source images
+    # already carry their own distributor_id).
+    reuse_job = supabase.table("scan_jobs").insert({
+        "organization_id": str(user.org_id),
+        "campaign_id": str(campaign_id),
+        "source": job.data.get("source"),
+        "status": "pending",
+        "metadata": {"reuse_source_scan_job_id": str(job_id)},
+    }).execute()
+    if not reuse_job.data:
+        raise HTTPException(status_code=503, detail="Failed to create reuse job")
+    reuse_job_id = reuse_job.data[0]["id"]
+
+    dispatched = await dispatch_task(
+        "run_match_existing_task",
+        [str(reuse_job_id), str(campaign_id), str(job_id)],
+        str(reuse_job_id),
+        "match_existing",
+    )
+    if not dispatched:
+        raise HTTPException(status_code=503, detail="Failed to queue match task")
+
+    return {
+        "message": "Matching existing creatives against campaign",
+        "job_id": reuse_job_id,
+        "source_scan_job_id": str(job_id),
+        "image_count": image_count,
+        "asset_count": assets.count,
     }
 
 

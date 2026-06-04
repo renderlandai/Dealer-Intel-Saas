@@ -4,41 +4,44 @@
 
 @layer base {
   :root {
-    /* Refined dark palette - deep slate with warm amber accent */
-    --background: 220 20% 4%;
-    --foreground: 45 15% 92%;
+    /* Deep indigo-tinted dark palette with green secondary */
+    --background: 240 28% 8%;
+    --foreground: 240 15% 94%;
 
-    --card: 220 18% 7%;
-    --card-foreground: 45 15% 92%;
+    --card: 240 26% 11%;
+    --card-foreground: 240 15% 94%;
 
-    --popover: 220 18% 7%;
-    --popover-foreground: 45 15% 92%;
+    --popover: 240 26% 11%;
+    --popover-foreground: 240 15% 94%;
 
-    /* Warm amber/gold accent - distinctive and refined */
-    --primary: 38 92% 55%;
-    --primary-foreground: 220 20% 4%;
+    /* Brand: Indigo primary (#4F46E5) + Green brand accent (#22C55E, applied via .brand-gradient) */
+    --primary: 243 75% 59%;
+    --primary-foreground: 0 0% 100%;
 
-    --secondary: 220 15% 12%;
-    --secondary-foreground: 45 15% 85%;
+    /* Secondary kept as a neutral muted surface so generic chrome
+       (skeletons, table headers, kbd badges, hover states) stays subtle.
+       The brand green is exposed through .brand-gradient + --success. */
+    --secondary: 240 22% 14%;
+    --secondary-foreground: 240 15% 90%;
 
-    --muted: 220 15% 12%;
-    --muted-foreground: 220 10% 50%;
+    --muted: 240 22% 14%;
+    --muted-foreground: 240 12% 64%;
 
-    --accent: 38 92% 55%;
-    --accent-foreground: 220 20% 4%;
+    --accent: 243 75% 59%;
+    --accent-foreground: 0 0% 100%;
 
     --destructive: 0 72% 51%;
-    --destructive-foreground: 45 15% 92%;
+    --destructive-foreground: 240 15% 94%;
 
-    --success: 158 64% 42%;
-    --success-foreground: 220 20% 4%;
+    --success: 142 71% 45%;
+    --success-foreground: 0 0% 100%;
 
     --info: 225 65% 58%;
-    --info-foreground: 220 20% 4%;
+    --info-foreground: 240 28% 8%;
 
-    --border: 220 15% 14%;
-    --input: 220 15% 12%;
-    --ring: 38 92% 55%;
+    --border: 240 22% 18%;
+    --input: 240 22% 14%;
+    --ring: 243 75% 59%;
 
     --radius: 0.5rem;
   }
@@ -174,7 +177,7 @@
     background: linear-gradient(
       180deg,
       hsl(var(--background)) 0%,
-      hsl(220 18% 5%) 100%
+      hsl(240 26% 6%) 100%
     );
   }
 
@@ -205,36 +208,87 @@
 
   .hover-lift:hover {
     transform: translateY(-2px);
-    box-shadow: 0 8px 24px hsl(220 20% 4% / 0.4);
+    box-shadow: 0 8px 24px hsl(240 28% 4% / 0.5);
   }
 
   /* Focus ring style */
   .focus-ring {
     @apply focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary focus-visible:ring-offset-1 focus-visible:ring-offset-background;
   }
+
+  /* ─── Brand green gradient ─── */
+  /* Refined emerald → bright green diagonal with subtle inset highlight
+     and a soft drop shadow. Used for brand-anchor surfaces only
+     (active nav pill, brand accents) so the green reads premium, not flat. */
+  .brand-gradient {
+    background-image: linear-gradient(
+      135deg,
+      hsl(160 78% 22%) 0%,
+      hsl(150 72% 32%) 40%,
+      hsl(142 71% 45%) 100%
+    );
+    box-shadow:
+      inset 0 1px 0 hsl(140 80% 75% / 0.18),
+      inset 0 -1px 0 hsl(160 80% 12% / 0.35),
+      0 1px 2px hsl(160 80% 8% / 0.45);
+    color: #ffffff;
+  }
+
+  .brand-gradient:hover {
+    background-image: linear-gradient(
+      135deg,
+      hsl(160 78% 26%) 0%,
+      hsl(150 72% 36%) 40%,
+      hsl(142 75% 50%) 100%
+    );
+  }
+
+  /* Subtler version for less-prominent surfaces (badges, small chips). */
+  .brand-gradient-soft {
+    background-image: linear-gradient(
+      135deg,
+      hsl(160 50% 16% / 0.95) 0%,
+      hsl(142 55% 24% / 0.95) 100%
+    );
+    color: hsl(140 70% 80%);
+    border: 1px solid hsl(150 60% 32% / 0.4);
+  }
+
+  /* Gradient text for brand accents (logo glyph, headlines). */
+  .brand-gradient-text {
+    background-image: linear-gradient(
+      135deg,
+      hsl(150 70% 50%) 0%,
+      hsl(142 80% 58%) 100%
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+  }
 }
 
 /* Mapbox popup overrides */
 .dealer-map-popup .mapboxgl-popup-content {
-  background: hsl(220 18% 7%);
-  border: 1px solid hsl(220 15% 14%);
+  background: hsl(240 26% 11%);
+  border: 1px solid hsl(240 22% 18%);
   border-radius: 6px;
   padding: 8px 12px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
 }
 
 .dealer-map-popup .mapboxgl-popup-tip {
-  border-top-color: hsl(220 18% 7%);
+  border-top-color: hsl(240 26% 11%);
 }
 
 .mapboxgl-ctrl-group {
-  background: hsl(220 18% 7%) !important;
-  border: 1px solid hsl(220 15% 14%) !important;
+  background: hsl(240 26% 11%) !important;
+  border: 1px solid hsl(240 22% 18%) !important;
   border-radius: 4px !important;
 }
 
 .mapboxgl-ctrl-group button {
-  border-bottom-color: hsl(220 15% 14%) !important;
+  border-bottom-color: hsl(240 22% 18%) !important;
 }
 
 .mapboxgl-ctrl-group button span {
@@ -252,17 +306,17 @@
 }
 
 ::-webkit-scrollbar-thumb {
-  background: hsl(220 15% 20%);
+  background: hsl(240 18% 24%);
   border-radius: 0;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: hsl(220 15% 30%);
+  background: hsl(240 18% 34%);
 }
 
 /* Selection color */
 ::selection {
-  background: hsl(38 92% 55% / 0.3);
+  background: hsl(243 75% 59% / 0.3);
   color: hsl(45 15% 92%);
 }
 

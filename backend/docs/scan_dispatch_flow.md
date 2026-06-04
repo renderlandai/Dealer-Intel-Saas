@@ -95,7 +95,7 @@ Single function: `dispatch_task(task_name, args, scan_job_id, source)`.
 
 ```
 dispatch_task
-  ├── looks up task_name in task_map (6 entries)
+  ├── looks up task_name in task_map (7 entries)
   ├── asyncio.create_task(coro_fn(*args), name=f"{task_name}:{scan_job_id}")
   ├── _running_tasks.add(task)        ← keeps GC away
   ├── task.add_done_callback(_task_done)
@@ -112,6 +112,7 @@ dispatch_task
 | `run_instagram_scan_task`       | `services/scan_runners.run_instagram_scan`| instagram       |
 | `run_analyze_scan_task`         | local `_run_analyze_scan` wrapper  | `/scans/{id}/analyze` |
 | `run_reprocess_images_task`     | local `_run_reprocess_images` wrapper | reprocess-unprocessed |
+| `run_match_existing_task`       | local `_run_match_existing` wrapper | `/scans/{id}/match-campaign` |
 
 Every wrapper is `asyncio.wait_for(..., timeout=SCAN_TIMEOUT_SECONDS)`
 where `SCAN_TIMEOUT_SECONDS = 7200` (2h). On timeout or unhandled
@@ -423,7 +424,94 @@ revisiting after the worker split is real:
 
 ---
 
-## 11. Quick reference — where to look next
+## 11. Phase-8 hardening — heartbeat, timeouts, partial success (2026-05-08)
+
+A 10+ dealer scan that ran for 3 hours and processed 268 images
+disappeared into `_cleanup_stale_scans` on 2026-05-07 evening (see
+`log.md` of that date for the full diagnosis). Root cause: the
+heartbeat was stamped per-page, the Anthropic SDK had no client-side
+timeout, and a single hung Claude request burned the heartbeat budget
+past 20 minutes. Phase-8 layers four backstops onto the existing
+runner so the same failure mode cannot recur, and surfaces partial
+success in the UI for the cases that already complete.
+
+### Layer 1 — Bound the failure
+- `ai_service.anthropic_client` now passes `timeout=settings.anthropic_request_timeout_seconds`
+  (default **120s**) to the SDK constructor. With `max_retries=5`
+  worst-case becomes 5 × 120s = **10 min per image** instead of the
+  previous **50 min**.
+- `CLAUDE_MODEL` / `ENSEMBLE_MODEL` bumped from `claude-opus-4-6` to
+  `claude-opus-4-7` (the `cost_tracker` pricing table already prices
+  4-7 at the same $5/$25 per MTok). Same prompt, better vision +
+  instruction following, no spend impact.
+- `scan_runners._heartbeat_throttled` is now called from inside the
+  per-image fan-out (`_process_one_page` website path AND
+  `run_image_analysis` Facebook/Google/Instagram path), debounced to
+  one DB write per `settings.heartbeat_min_interval_seconds`
+  (default **10s**). A long matcher loop can no longer starve the
+  cleanup job.
+
+### Layer 2 — Per-page hard cap
+- `_run_page` now wraps `_process_one_page` in
+  `asyncio.wait_for(timeout=settings.page_hard_timeout_seconds)`
+  (default **900s = 15 min**). A wedged page is recorded as
+  `pages_failed += 1` with `outcome="timeout"` and the dealer's other
+  pages keep running. 0 disables the cap.
+- Same protection wraps each dealer at `settings.dealer_hard_timeout_seconds`
+  (default **2700s = 45 min**) inside the website runner's fan-out.
+  A pathological dealer cannot starve the rest of the scan.
+
+### Layer 3 — Per-dealer outcome telemetry + schema scaffolding
+- `pipeline_stats.dealer_outcomes` is a new array of
+  `{base_url, status, error, started_at, duration_seconds, pages_scanned, matches_new}`.
+  The frontend reads it (see `frontend/app/scans/page.tsx`) to render
+  "8 of 10 dealers complete" with the failed two named in-line —
+  replacing the binary FAILED-with-orphaned-images state operators
+  saw on 2026-05-07.
+- Migration `035_scan_job_parent_dealer.sql` adds three forward-compat
+  columns to `scan_jobs`:
+  - `parent_scan_job_id UUID REFERENCES scan_jobs(id) ON DELETE CASCADE`
+  - `target_url TEXT`
+  - `distributor_id UUID REFERENCES distributors(id) ON DELETE SET NULL`
+  Existing rows have all three NULL, dispatch logic is unchanged,
+  and the cleanup job's heartbeat-staleness check applies uniformly
+  to parent and child rows alike. A follow-up PR can flip the
+  scheduler / website runner into a true per-dealer fan-out mode
+  (one child row per dealer) without another schema change.
+
+### Layer 4 — Multi-worker scale-out
+
+Already wired and race-safe; the contract has not changed since
+Phase 5-minimal. To scale beyond a single worker on multi-scan
+workloads:
+
+```bash
+# On the API service:
+DISABLE_INPROCESS_DISPATCH=true
+
+# On N additional dynos (any number; they coordinate via the
+# atomic `eq("status", "pending")` claim in app/worker.py):
+python -m app.worker
+```
+
+Two notes:
+
+1. With the current single-row-per-scan model, multiple workers
+   parallelise across **different scans**. Intra-scan parallelism
+   (multiple workers chewing on the same scan's dealers) requires
+   the per-dealer subjob fan-out path that the Layer 3 schema
+   scaffolds. Until that ships, the inside-runner `asyncio` fan-out
+   (`max_concurrent_dealers × pages_per_dealer_concurrency ×
+   images_per_page_concurrency`) is the only intra-scan
+   parallelism.
+2. The runner is FastAPI-clean per Phase 4.5 — the worker image
+   does not pay the API import cost or share its memory budget
+   with Chromium / CLIP. CI guards this in
+   `tests/test_worker_import_isolation.py`.
+
+---
+
+## 12. Quick reference — where to look next
 
 | Question                                             | File                                                |
 |------------------------------------------------------|-----------------------------------------------------|

@@ -9,7 +9,7 @@ export type DistributorStatus = "active" | "inactive";
 export type MatchType = "exact" | "strong" | "partial" | "weak";
 export type ComplianceStatus = "pending" | "compliant" | "violation" | "review";
 export type ScanSource = "google_ads" | "facebook" | "instagram" | "youtube" | "website";
-export type ScanStatus = "pending" | "running" | "analyzing" | "completed" | "failed";
+export type ScanStatus = "pending" | "running" | "analyzing" | "completed" | "failed" | "cancelled";
 export type FeedbackVerdict = "true_positive" | "false_positive" | "true_negative" | "false_negative";
 
 export interface Campaign {
@@ -730,6 +730,44 @@ export const getComplianceTrend = async (days: number = 30): Promise<ComplianceT
 export const analyzeScanResults = async (jobId: string, campaignId?: string): Promise<ScanJob> => {
   const params = campaignId ? `?campaign_id=${campaignId}` : "";
   const { data } = await api.post(`/scans/${jobId}/analyze${params}`);
+  return data;
+};
+
+// Reuse a completed scan's already-discovered creatives to audit another
+// campaign — no new (expensive) Apify/website scrape. Lets you scan a
+// dealer once and check it against many campaigns.
+export const matchScanAgainstCampaign = async (
+  jobId: string,
+  campaignId: string
+): Promise<{ message: string; job_id?: string; image_count?: number; asset_count?: number; count?: number }> => {
+  const { data } = await api.post(
+    `/scans/${jobId}/match-campaign?campaign_id=${campaignId}`
+  );
+  return data;
+};
+
+export interface ReuseCandidate {
+  reusable: boolean;
+  job_id?: string;
+  completed_at?: string;
+  image_count?: number;
+  dealer_count?: number;
+  max_age_days?: number;
+}
+
+// Non-destructive lookup: is there a recent completed scan whose creatives
+// can be reused to audit a campaign for these dealers (no new scrape)?
+// Powers the "reuse vs. fresh scan" prompt; starts nothing.
+export const getReuseCandidate = async (
+  source: string,
+  distributorIds?: string[]
+): Promise<ReuseCandidate> => {
+  const params = new URLSearchParams();
+  params.append("source", source);
+  if (distributorIds && distributorIds.length > 0) {
+    distributorIds.forEach((id) => params.append("distributor_ids", id));
+  }
+  const { data } = await api.get(`/scans/reuse-candidate?${params.toString()}`);
   return data;
 };
 

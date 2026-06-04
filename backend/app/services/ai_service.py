@@ -38,11 +38,91 @@ log = logging.getLogger("dealer_intel.ai_service")
 
 settings = get_settings()
 
-# Configure Anthropic client
-anthropic_client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+# Configure Anthropic client.
+#
+# Timeout (2026-05-08 Phase-8 hardening): pass an explicit ``timeout`` to
+# the SDK constructor. The SDK default is 600s. With
+# ``settings.max_retries=5`` that meant a single hung TCP connection burned
+# up to 50 minutes of wall-clock on one image — long enough to starve the
+# per-page heartbeat past ``scan_idle_timeout_minutes`` and trip the
+# cleanup auto-fail. The new ceiling is
+# ``settings.anthropic_request_timeout_seconds`` (default 120s), bounding
+# worst-case retry budget at 5 × 120s = 10 min, which the per-page
+# ``page_hard_timeout_seconds`` backstop further constrains.
+anthropic_client = anthropic.Anthropic(
+    api_key=settings.anthropic_api_key,
+    timeout=settings.anthropic_request_timeout_seconds,
+)
+
+# ---------------------------------------------------------------------------
+# Matcher Claude model — DO NOT BUMP WITHOUT RUNNING THE EVAL.
+# ---------------------------------------------------------------------------
+# Long, load-bearing comment because this constant has been swung back and
+# forth four times and every wrong swap produces "0 matches in production"
+# without any other observable signal. If you are reading this because you
+# noticed ``ai_service`` calls ``opus-4-6`` while ``cost_tracker`` prices
+# ``opus-4-7``, the constant is correct and ``cost_tracker`` is a superset
+# of what we actually use — do not "fix" it. History:
+#
+#   * 2026-04-16  bumped 4-6 → 4-7 as part of the scaling plan.
+#   * 2026-04-21  REVERTED 4-7 → 4-6 after running the eval. Opus 4.7
+#                 scored materially worse on this account's image-matching
+#                 workload — its rubric is more conservative on borderline
+#                 cases and its scores have higher run-to-run variance even
+#                 at the same image pair. See ``log.md`` "Decision: revert".
+#   * 2026-05-08  Phase-8 RE-BUMPED 4-6 → 4-7. The author saw the 4-6
+#                 constant, remembered the April 16 plan, and assumed it
+#                 had "never propagated". They missed the April 21 revert
+#                 entry sitting further down the same log. Result was
+#                 invisible until 2026-05-11: every matcher call started
+#                 returning HTTP 400 because Opus 4.7 deprecated the
+#                 ``temperature`` parameter. We patched ``temperature``
+#                 handling, the 400s went away, and we got 0 matches
+#                 across a 45-dealer scan and a single-dealer probe even
+#                 though the funnel told us 1 image had reached the final
+#                 verifier.
+#   * 2026-05-11  ROLLED BACK 4-7 → 4-6 after confirming asset
+#                 ``fc70adce`` had matched on 2026-05-07 with 4-6
+#                 (confidence 93, "exact") and produced 0 matches with
+#                 4-7 against the same campaign on 2026-05-11.
+#
+# Ground rules for the next person who wants to bump this:
+#   1. Run the eval at ``backend/eval/`` first; do NOT eyeball it.
+#   2. Gate the bump on the eval report. Anthropic's marketing copy
+#      ("better vision and instruction following") is not evidence for
+#      our specific image-matching rubric.
+#   3. If you do bump, update the test in
+#      ``backend/tests/test_matcher_model_pin.py`` so future readers see
+#      the deliberate decision in the diff. That test exists for the
+#      sole purpose of forcing a maintainer to acknowledge this history.
 CLAUDE_MODEL = "claude-opus-4-6"
 ENSEMBLE_MODEL = "claude-opus-4-6"
 FILTER_MODEL = settings.filter_model
+
+
+# 2026-05-11 Phase-9: Anthropic deprecated the ``temperature`` parameter
+# for the Opus 4.7 family (and announced the same is coming for the next
+# Sonnet generation). Sending ``temperature`` to one of these models
+# returns a 400 ``invalid_request_error`` — there is no graceful
+# downgrade. The matcher itself rolled back to opus-4-6 the same day
+# (see the long comment by ``CLAUDE_MODEL`` above), so this denylist is
+# defensive: it only matters if a caller passes ``use_model="claude-
+# opus-4-7"`` explicitly (a few internal probes do). Every other Claude
+# slug (haiku-4-5, opus-4-6, sonnet-4-5, etc.) still accepts
+# ``temperature=0`` and benefits from the determinism guarantee — that
+# determinism is what the matcher's adaptive thresholds were calibrated
+# against, and is itself a reason 4-6 outperforms 4-7 here.
+_MODELS_THAT_REJECT_TEMPERATURE: tuple[str, ...] = (
+    "claude-opus-4-7",
+)
+
+
+def _model_rejects_temperature(model_slug: str) -> bool:
+    """Return True iff Anthropic will 400 if we send ``temperature`` to ``model_slug``."""
+    if not model_slug:
+        return False
+    slug = model_slug.strip().lower()
+    return any(slug.startswith(prefix) for prefix in _MODELS_THAT_REJECT_TEMPERATURE)
 
 
 class _ImageCache:
@@ -424,17 +504,29 @@ async def call_anthropic_with_retry(
             block["cache_control"] = {"type": "ephemeral"}
         content.append(block)
 
+    # 2026-05-11 Phase-9: ``claude-opus-4-7`` deprecated the
+    # ``temperature`` parameter and rejects requests that include it
+    # (HTTP 400 invalid_request_error: "temperature is deprecated for
+    # this model"). The probe uncovered that EVERY matcher comparison
+    # call had been failing this way since the model upgrade — which
+    # is the actual cause of the "0 matches" outcome that we'd been
+    # blaming on score thresholds and download failures. We drop the
+    # parameter for any opus-4-7-or-later slug; older Claude models
+    # (haiku-4-5, opus-4-6) still accept it, so keep it on those.
+    create_kwargs: Dict[str, Any] = {
+        "model": use_model,
+        "max_tokens": 2048,
+        "messages": [{"role": "user", "content": content}],
+    }
+    if not _model_rejects_temperature(use_model):
+        create_kwargs["temperature"] = 0
+
     for attempt in range(max_retries):
         try:
             # Run synchronous Anthropic call in executor
             response = await asyncio.get_event_loop().run_in_executor(
                 None,
-                lambda: anthropic_client.messages.create(
-                    model=use_model,
-                    max_tokens=2048,
-                    temperature=0,
-                    messages=[{"role": "user", "content": content}]
-                )
+                lambda: anthropic_client.messages.create(**create_kwargs),
             )
             try:
                 from . import cost_tracker
@@ -1339,6 +1431,204 @@ async def verify_borderline_match(
             "is_match": False,
             "error": str(e)
         }
+
+
+# ---------------------------------------------------------------------------
+# Phase-9 follow-up #3 (2026-05-11): full-page screenshot containment
+# fallback. See backend/app/services/scan_runners.py:_process_one_page for
+# the call site and ``settings.enable_containment_fallback`` for the on/off
+# switch. Lives here next to the other Opus-call helpers so prompt drift
+# stays in one file.
+# ---------------------------------------------------------------------------
+
+_CONTAINMENT_PROMPT = """You are a CONTAINMENT MATCHER for a dealer marketing compliance system.
+
+IMAGE 1 (FIRST IMAGE): An APPROVED CAMPAIGN CREATIVE. This is typically a
+SCREENSHOT of a hero banner / ad slot / rendered marketing surface as it
+should appear on dealer websites. The asset itself may include surrounding
+chrome (yellow background panels, headlines like "POWER & PERFORMANCE",
+call-to-action buttons like "PRODUCTS", spec callouts, etc.) — those
+elements are PART of the campaign creative, not noise.
+
+IMAGE 2 (SECOND IMAGE): A FULL-PAGE SCREENSHOT of a single dealer webpage,
+top-to-bottom. The campaign creative may appear ANYWHERE within this
+screenshot:
+* at any vertical position (above the fold, mid-page, footer)
+* at any size (full-width hero, half-width promo card, sidebar tile)
+* possibly cropped at the page edge
+* possibly composed from CSS background colour + an isolated equipment
+  PNG + HTML text rather than a single image file (the rendered result
+  still counts as a containment hit — what matters is what a human visitor
+  to the page would see)
+
+YOUR TASK: Decide whether the campaign creative shown in IMAGE 1 actually
+appears, in recognizable form, somewhere within IMAGE 2.
+
+Say is_match=true ONLY when ALL of the following are true:
+* The same headline text or tagline is visible (e.g. "POWER & PERFORMANCE",
+  the specific promo wording from IMAGE 1)
+* The same featured product / equipment is in the same prominent position
+  (same model, same pose if recognizable)
+* The same call-to-action or offer wording is visible (e.g. "PRODUCTS",
+  "SHOP NOW", a specific price)
+* The overall colour scheme and layout match (e.g. yellow-dominant hero
+  with the equipment on the left and CTA on the right)
+
+Reject (is_match=false) when ANY of the following holds:
+* IMAGE 1 is a generic logo or product photo that any dealer site could
+  carry without running this campaign
+* The page only shares the brand colour or font but lacks the specific
+  creative content (no matching headline, no matching offer)
+* The same product appears but with a different headline / different offer
+  / different CTA — that's a different campaign, not this one
+* The creative is "kind of there" — strong recognition or nothing
+
+Output ONLY a single JSON object with these keys, no markdown, no prose:
+{
+  "is_match": true|false,
+  "confidence_score": 0-100,
+  "location_hint": "header|hero|mid_page|sidebar|footer|unknown",
+  "rationale": "<one sentence describing what you saw or what was missing>"
+}
+"""
+
+
+async def containment_match_full_page(
+    full_page_screenshot_url: str,
+    campaign_assets: List[Dict[str, Any]],
+    threshold: int,
+    *,
+    page_url: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fallback matcher for pages where per-image matching produced 0 hits.
+
+    Sends each campaign asset alongside the page's full-page screenshot to
+    Opus with a containment prompt ("does the asset appear anywhere in this
+    screenshot?"). Returns a list of hits — one per asset that scored at or
+    above ``threshold`` — in the shape:
+
+        {
+            "asset": <campaign_asset row>,
+            "confidence_score": int,
+            "rationale": str,
+            "location_hint": str,
+            "raw": <full parsed Opus response>,
+        }
+
+    Returns ``[]`` when the screenshot can't be downloaded, the asset list
+    is empty, or no asset cleared the threshold. Per-asset failures are
+    swallowed and logged so one bad asset can't poison the whole fallback.
+
+    Cost: one Opus call per (asset, page) pair. The wiring in
+    ``_process_one_page`` only fires this when the per-image stage returned
+    0 matches AND the campaign has at most
+    ``settings.containment_fallback_max_assets`` assets, so the worst-case
+    cost stays bounded.
+    """
+    if not full_page_screenshot_url or not campaign_assets:
+        return []
+
+    try:
+        screenshot_bytes = await download_image(full_page_screenshot_url)
+    except Exception as e:
+        log.warning(
+            "Containment fallback: could not download page screenshot %s — %s",
+            full_page_screenshot_url[:80], e,
+        )
+        return []
+
+    screenshot_optimized = optimize_image_for_api(screenshot_bytes, "default")
+    if screenshot_optimized is None:
+        log.warning(
+            "Containment fallback: page screenshot failed optimization (page=%s)",
+            page_url,
+        )
+        return []
+
+    async def _check_one_asset(asset: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        asset_url = asset.get("file_url")
+        if not asset_url:
+            return None
+        try:
+            asset_bytes = await download_image(asset_url)
+        except Exception as e:
+            log.warning(
+                "Containment fallback: could not download asset %s — %s",
+                asset.get("name") or asset.get("id"), e,
+            )
+            return None
+        asset_optimized = optimize_image_for_api(asset_bytes, "asset")
+        if asset_optimized is None:
+            return None
+
+        try:
+            response_text = await call_anthropic_with_retry(
+                _CONTAINMENT_PROMPT,
+                [asset_optimized, screenshot_optimized],
+                model=ENSEMBLE_MODEL,
+                # Cache the asset + prompt prefix; the screenshot varies
+                # per page so it's the suffix and not cached. With many
+                # pages-with-0-matches in the same scan this saves real
+                # tokens.
+                cache_prefix_images=1,
+            )
+        except Exception as e:
+            log.warning(
+                "Containment fallback: Opus call failed for asset %s on page %s — %s",
+                asset.get("name") or asset.get("id"), page_url, e,
+            )
+            return None
+
+        try:
+            parsed = extract_json_from_response(response_text)
+        except Exception as e:
+            log.warning(
+                "Containment fallback: Opus returned non-JSON for asset %s — %s",
+                asset.get("name") or asset.get("id"), e,
+            )
+            return None
+
+        is_match = bool(parsed.get("is_match"))
+        try:
+            confidence = int(parsed.get("confidence_score") or 0)
+        except (TypeError, ValueError):
+            confidence = 0
+
+        log.info(
+            "Containment fallback: asset=%s page=%s is_match=%s confidence=%d location=%s",
+            asset.get("name") or asset.get("id"),
+            page_url, is_match, confidence,
+            parsed.get("location_hint"),
+        )
+
+        if not is_match or confidence < threshold:
+            return None
+
+        return {
+            "asset": asset,
+            "confidence_score": confidence,
+            "rationale": parsed.get("rationale", ""),
+            "location_hint": parsed.get("location_hint", "unknown"),
+            "raw": parsed,
+        }
+
+    # Fire all asset checks in parallel — each call already shares the
+    # cached asset prefix with itself across pages, but within a single
+    # page the assets are independent of each other and there's no reason
+    # to serialise them.
+    results = await asyncio.gather(
+        *[_check_one_asset(a) for a in campaign_assets],
+        return_exceptions=True,
+    )
+
+    hits: List[Dict[str, Any]] = []
+    for r in results:
+        if isinstance(r, BaseException):
+            log.warning("Containment fallback: per-asset task crashed — %s", r)
+            continue
+        if r:
+            hits.append(r)
+    return hits
 
 
 async def analyze_compliance(

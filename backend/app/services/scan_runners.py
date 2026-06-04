@@ -15,6 +15,9 @@ Public coroutines (called by `app.tasks`):
 - `run_facebook_scan`
 - `run_instagram_scan`
 - `auto_analyze_scan`        (campaign-linked auto-analyse after discovery)
+- `match_existing_images_against_campaign`
+                             (reuse a scan's creatives against another
+                              campaign — no new discovery / Apify spend)
 - `run_image_analysis`       (Facebook / Google / manual analyse loop)
 
 Internal helpers (used only by the runners):
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from uuid import UUID
@@ -82,7 +86,9 @@ def _heartbeat(scan_job_id) -> None:
     Best-effort: failures are logged at debug level and swallowed so a
     transient Supabase hiccup never fails an otherwise-healthy scan.
     Called once per page from the website runner and at major phase
-    boundaries; per-image calls would be too chatty for the value.
+    boundaries, plus from inside the per-image fan-out via
+    :func:`_heartbeat_throttled` so a long Claude page can't starve the
+    cleanup job (Phase-8 fix for the 2026-05-07 evening incident).
     """
     try:
         supabase.table("scan_jobs").update({
@@ -90,6 +96,42 @@ def _heartbeat(scan_job_id) -> None:
         }).eq("id", str(scan_job_id)).execute()
     except Exception as e:
         log.debug("Heartbeat write failed for %s: %s", scan_job_id, e)
+
+
+# Per-scan_job_id timestamp of the last successful heartbeat write. Used by
+# `_heartbeat_throttled` to ensure inside-loop callers don't fire one DB
+# UPDATE per image — once every `settings.heartbeat_min_interval_seconds`
+# is plenty for the cleanup job and trivial for Supabase to absorb.
+_last_heartbeat_at: Dict[str, float] = {}
+
+
+def _heartbeat_throttled(scan_job_id, *, min_interval: float = 10.0) -> None:
+    """Stamp the heartbeat at most once per `min_interval` seconds per scan.
+
+    The website runner used to only stamp the heartbeat between pages; a
+    page with many images that took >20 min to AI-analyse therefore went
+    silent long enough for `_cleanup_stale_scans` to auto-fail it (see
+    `log.md` 2026-05-07 evening). Phase-8 calls this helper from inside
+    the per-image fan-out so a healthy-but-slow page keeps proving it is
+    alive without firing one HTTP UPDATE per image.
+
+    Throttle key is the scan_job_id, so concurrent dealers in the same
+    scan share a single budget — which is what we want, because they
+    write to the same row.
+
+    A missing key always fires; the throttle only kicks in once we've
+    written at least once. Using ``None`` as the sentinel rather than
+    ``0.0`` avoids a subtle race in fresh processes where
+    ``time.monotonic()`` can be < ``min_interval`` and falsely throttle
+    the very first call.
+    """
+    key = str(scan_job_id)
+    now = time.monotonic()
+    last = _last_heartbeat_at.get(key)
+    if last is not None and (now - last) < float(min_interval):
+        return
+    _last_heartbeat_at[key] = now
+    _heartbeat(scan_job_id)
 
 
 # Substrings used to detect Playwright "browser binary missing" failures.
@@ -160,8 +202,24 @@ def _send_scan_notifications(
     scan_job_id: UUID,
     scan_source: str = "",
     pipeline_stats: Optional[Dict[str, Any]] = None,
+    image_scan_job_id: Optional[UUID] = None,
+    campaign_id: Optional[UUID] = None,
 ) -> None:
-    """Query scan results and send a combined scan report + violations email."""
+    """Query scan results and send a combined scan report + violations email.
+
+    ``image_scan_job_id`` lets the discovered-image lookup target a
+    DIFFERENT scan than the one whose org / totals we report on. This is
+    needed by the reuse path (``match_existing_images_against_campaign``):
+    the creatives live under the original source scan, while status / org
+    live on a fresh tracking row. Defaults to ``scan_job_id`` so normal
+    scans are unaffected.
+
+    ``campaign_id`` scopes the match counts / violations to that campaign's
+    assets. Normal scans only ever match one campaign per scan, so they
+    pass ``None`` (no scoping). The reuse path passes the target campaign
+    so the email doesn't over-count matches that other campaigns made
+    against the SAME source creatives.
+    """
     try:
         job = supabase.table("scan_jobs")\
             .select("organization_id, total_items, processed_items, matches_count")\
@@ -179,17 +237,36 @@ def _send_scan_notifications(
 
         img_rows = supabase.table("discovered_images")\
             .select("id")\
-            .eq("scan_job_id", str(scan_job_id))\
+            .eq("scan_job_id", str(image_scan_job_id or scan_job_id))\
             .execute()
         img_ids = [r["id"] for r in (img_rows.data or [])]
 
+        # When scoping to a campaign, resolve its asset ids up front. An
+        # empty list means the campaign has no assets → no matches can
+        # belong to it, so counts stay at zero.
+        campaign_asset_ids: Optional[List[str]] = None
+        if campaign_id:
+            a_rows = supabase.table("assets")\
+                .select("id")\
+                .eq("campaign_id", str(campaign_id))\
+                .execute()
+            campaign_asset_ids = [r["id"] for r in (a_rows.data or [])]
+
+        # Either no campaign scoping (None) or a non-empty asset set must
+        # be present for any match to count.
+        can_query_matches = bool(img_ids) and (
+            campaign_asset_ids is None or len(campaign_asset_ids) > 0
+        )
+
         compliant = 0
         violation_count = 0
-        if img_ids:
-            all_matches = supabase.table("matches")\
+        if can_query_matches:
+            mq = supabase.table("matches")\
                 .select("compliance_status")\
-                .in_("discovered_image_id", img_ids)\
-                .execute()
+                .in_("discovered_image_id", img_ids)
+            if campaign_asset_ids:
+                mq = mq.in_("asset_id", campaign_asset_ids)
+            all_matches = mq.execute()
             for m in (all_matches.data or []):
                 if m.get("compliance_status") == "compliant":
                     compliant += 1
@@ -222,11 +299,13 @@ def _send_scan_notifications(
         violations_formatted: List[Dict[str, Any]] = []
         if violation_count > 0 and img_ids:
             try:
-                v_matches = supabase.table("matches")\
+                vq = supabase.table("matches")\
                     .select("*, assets(name), distributors(name)")\
                     .eq("compliance_status", "violation")\
-                    .in_("discovered_image_id", img_ids)\
-                    .execute()
+                    .in_("discovered_image_id", img_ids)
+                if campaign_asset_ids:
+                    vq = vq.in_("asset_id", campaign_asset_ids)
+                v_matches = vq.execute()
                 for m in (v_matches.data or []):
                     analysis = m.get("ai_analysis", {}) or {}
                     comp_summary = ""
@@ -814,7 +893,25 @@ async def _process_one_page(
             "pipeline_increments": {},
             "matches_new": 0,
             "matches_confirmed": 0,
+            "extract_ms": 0,
+            "analyze_ms": 0,
+            "images_in_flight": 0,
         }
+
+    # Phase 9 telemetry: bracket each phase so the dealer aggregator can
+    # surface `slowest_page_ms` + `extract_ms_total` / `analyze_ms_total`
+    # in pipeline_stats. Without this, every previous incident has had to
+    # guess whether Playwright extraction or the per-image AI fan-out
+    # was eating the 900s page budget.
+    extract_ms = 0
+    analyze_ms = 0
+    images_in_flight = 0
+    extract_t0 = time.monotonic()
+    # Defensive init — `page_cache_assets` is populated only when
+    # `can_early_stop and count > 0`, but the bottom of this function
+    # references it unconditionally. Pre-existing latent bug; making
+    # it safe so the new analyze-timeout exit path can't surface it.
+    page_cache_assets: set = set()
 
     page_pipeline: Dict[str, Any] = {
         "download_failed": 0,
@@ -827,6 +924,15 @@ async def _process_one_page(
         "matched_confirmed": 0,
         "drift_detected": 0,
         "errors": 0,
+        # Phase-9 follow-up #3 telemetry: full-page containment fallback.
+        # ``called`` increments once per page that triggered the fallback;
+        # ``matched`` is the total number of (asset × page) hits the
+        # fallback produced; ``skipped`` increments once per page that
+        # was eligible (0 per-image hits + has a screenshot) but skipped
+        # because of cost / config gates. Surfaces in pipeline_stats.
+        "containment_called": 0,
+        "containment_matched": 0,
+        "containment_skipped": 0,
     }
     block_details: List[Dict[str, Any]] = []
     page_matched_assets: set = set()
@@ -840,19 +946,63 @@ async def _process_one_page(
     matches_confirmed_before = page_pipeline["matched_confirmed"]
 
     # ── Phase A: Playwright extract (gated by extract_sem) ────────────
+    extract_timeout = float(getattr(settings, "page_extract_timeout_seconds", 0) or 0)
     try:
         async with extract_sem:
             log.info("[%s] extracting page: %s", base_url, page_url)
             _heartbeat(scan_job_id)
-            res = await extraction_service.extract_dealer_website(
+            extract_coro = extraction_service.extract_dealer_website(
                 page_url, scan_job_id, distributor_id,
                 campaign_assets=campaign_assets,
                 dealer_key=base_url,
             )
-    except Exception as page_err:
+            # Phase-9 sub-cap: a healthy Playwright extraction wraps
+            # in well under a minute even on heavy dealer sites; a
+            # nav stall has no business burning the whole page budget.
+            # 0 disables the sub-cap (legacy behaviour — fall back to
+            # the outer page_hard_timeout_seconds backstop).
+            if extract_timeout > 0:
+                res = await asyncio.wait_for(extract_coro, timeout=extract_timeout)
+            else:
+                res = await extract_coro
+        extract_ms = int((time.monotonic() - extract_t0) * 1000)
+    except asyncio.TimeoutError:
+        extract_ms = int((time.monotonic() - extract_t0) * 1000)
         log.error(
-            "[%s] page extraction crashed for %s: %s",
-            base_url, page_url, page_err, exc_info=True,
+            "[%s] page %s extraction sub-cap exceeded (%.1fs)",
+            base_url, page_url, extract_timeout,
+        )
+        page_pipeline["errors"] += 1
+        return {
+            "page_url": page_url,
+            "skipped": False,
+            "total_discovered": 0,
+            "pages_scanned": 0,
+            "pages_empty": 0,
+            "pages_blocked": 0,
+            "pages_failed": 1,
+            "total_images": 0,
+            "page_match_tracker": {},
+            "block_details": [{
+                "page_url": page_url,
+                "outcome": "extract_timeout",
+                "reason": (
+                    f"Extraction sub-cap ({extract_timeout:.1f}s) exceeded"
+                ),
+                "extract_ms": extract_ms,
+            }],
+            "pipeline_increments": page_pipeline,
+            "matches_new": 0,
+            "matches_confirmed": 0,
+            "extract_ms": extract_ms,
+            "analyze_ms": 0,
+            "images_in_flight": 0,
+        }
+    except Exception as page_err:
+        extract_ms = int((time.monotonic() - extract_t0) * 1000)
+        log.error(
+            "[%s] page extraction crashed for %s after %dms: %s",
+            base_url, page_url, extract_ms, page_err, exc_info=True,
         )
         page_pipeline["errors"] += 1
         return {
@@ -869,10 +1019,14 @@ async def _process_one_page(
                 "page_url": page_url,
                 "outcome": extraction_service.OUTCOME_CRASHED,
                 "reason": str(page_err)[:200],
+                "extract_ms": extract_ms,
             }],
             "pipeline_increments": page_pipeline,
             "matches_new": 0,
             "matches_confirmed": 0,
+            "extract_ms": extract_ms,
+            "analyze_ms": 0,
+            "images_in_flight": 0,
         }
 
     count = res.count
@@ -979,6 +1133,16 @@ async def _process_one_page(
             async with image_sem:
                 if early_stop_event.is_set():
                     return None
+                # Phase-8: stamp the heartbeat from inside the per-image
+                # fan-out (debounced) so a long matcher loop can never
+                # starve `_cleanup_stale_scans` past
+                # `scan_idle_timeout_minutes`. The throttle key is the
+                # scan_job_id, so concurrent images share one DB write
+                # budget rather than firing N UPDATEs per page.
+                _heartbeat_throttled(
+                    scan_job_id,
+                    min_interval=getattr(settings, "heartbeat_min_interval_seconds", 10.0),
+                )
                 return await _analyze_single_image(
                     image_row, campaign_assets, brand_rules,
                     org_id, str(scan_job_id),
@@ -988,10 +1152,59 @@ async def _process_one_page(
                 )
 
         total_images_in_page = len(candidates)
-        results = await asyncio.gather(
+        images_in_flight = total_images_in_page
+        analyze_t0 = time.monotonic()
+        analyze_timeout = float(
+            getattr(settings, "page_analyze_timeout_seconds", 0) or 0
+        )
+        analyze_timed_out = False
+        gather_coro = asyncio.gather(
             *[_analyze_one(img) for img in candidates],
             return_exceptions=True,
         )
+        try:
+            # Phase-9 sub-cap: bound the per-image AI fan-out so a
+            # cluster of slow Anthropic sockets cannot eat the entire
+            # page budget. On timeout we still count whatever matches
+            # already landed in `match_buffer` (it mutates in place,
+            # so partial work is preserved); we just stop awaiting the
+            # remaining coroutines and bin the page as `analyze_timeout`.
+            if analyze_timeout > 0:
+                results = await asyncio.wait_for(
+                    gather_coro, timeout=analyze_timeout,
+                )
+            else:
+                results = await gather_coro
+        except asyncio.TimeoutError:
+            analyze_timed_out = True
+            results = []
+            log.error(
+                "[%s] page %s analyze sub-cap exceeded (%.1fs, %d images in flight)",
+                base_url, page_url, analyze_timeout, total_images_in_page,
+            )
+            # Best-effort cancel of the gather so dangling tasks don't
+            # keep firing Anthropic requests in the background.
+            gather_coro.cancel()
+            try:
+                await gather_coro
+            except Exception:
+                pass
+            block_details.append({
+                "page_url": page_url,
+                "outcome": "analyze_timeout",
+                "reason": (
+                    f"Analyze sub-cap ({analyze_timeout:.1f}s) exceeded "
+                    f"with {total_images_in_page} images in flight"
+                ),
+            })
+            page_pipeline["errors"] += 1
+            # Bin the page as failed so the dealer status rolls up
+            # correctly. The matches that DID complete before the cap
+            # are already in the match_buffer.
+            if pages_scanned > 0:
+                pages_scanned -= 1
+            pages_failed += 1
+        analyze_ms = int((time.monotonic() - analyze_t0) * 1000)
 
         # Page-cache gating threshold. Pages whose only match is in the
         # 60–79 borderline band MUST NOT enter the hot-page cache: that
@@ -1004,7 +1217,6 @@ async def _process_one_page(
             settings.partial_match_threshold + 10,
         )
 
-        page_cache_assets: set = set()
         for r in results:
             if isinstance(r, BaseException):
                 page_pipeline["errors"] += 1
@@ -1014,6 +1226,161 @@ async def _process_one_page(
                 page_matched_assets.add(asset_id)
                 if conf >= cache_threshold:
                     page_cache_assets.add(asset_id)
+
+        # ── Phase-9 follow-up #3: full-page containment fallback ──
+        #
+        # If per-image matching produced 0 hits for this page AND we
+        # have a full-page screenshot AND the campaign is small enough
+        # to keep the cost bounded, ask Opus whether the asset appears
+        # ANYWHERE within the page screenshot. This catches the
+        # composed-hero case (asset is a screenshot of a rendered
+        # banner; the page builds the banner from CSS background + an
+        # isolated equipment <img> + HTML text — none of those layers
+        # individually resembles the asset, but the rendered result
+        # clearly does). See ai_service.containment_match_full_page
+        # for the prompt and the May-11 incident in log.md for the
+        # full-page rationale.
+        run_containment = (
+            getattr(settings, "enable_containment_fallback", True)
+            and not page_matched_assets
+            and not analyze_timed_out
+            and bool(evidence_url)
+            and total_images_in_page > 0
+            and len(campaign_assets) <= int(
+                getattr(settings, "containment_fallback_max_assets", 10) or 10
+            )
+        )
+        if run_containment:
+            page_pipeline["containment_called"] = (
+                page_pipeline.get("containment_called", 0) + 1
+            )
+            try:
+                hits = await ai_service.containment_match_full_page(
+                    evidence_url,
+                    campaign_assets,
+                    threshold=int(
+                        getattr(settings, "containment_fallback_threshold", 70) or 70
+                    ),
+                    page_url=page_url,
+                )
+            except Exception as e:
+                log.error(
+                    "[%s] containment fallback crashed for %s: %s",
+                    base_url, page_url, e, exc_info=True,
+                )
+                hits = []
+
+            if hits:
+                # Persist a single page_screenshot discovered_image row
+                # to anchor the containment matches. Inserted via the
+                # raw supabase client (rather than the bulk helper) so
+                # we get the new row id back to attach matches to.
+                page_screenshot_image_id: Optional[str] = None
+                try:
+                    insert_row = {
+                        "scan_job_id": str(scan_job_id),
+                        "distributor_id": str(distributor_id) if distributor_id else None,
+                        "source_url": page_url,
+                        "image_url": evidence_url,
+                        "source_type": "page_screenshot",
+                        "channel": "website",
+                        "is_processed": True,
+                        "metadata": {
+                            "capture_method": "containment_fallback",
+                            "full_page": True,
+                            "reason": "per_image_zero_matches",
+                            "containment_hits": len(hits),
+                        },
+                    }
+                    res = (
+                        supabase.table("discovered_images")
+                        .insert(insert_row)
+                        .execute()
+                    )
+                    if res.data:
+                        page_screenshot_image_id = res.data[0].get("id")
+                except Exception as e:
+                    log.error(
+                        "[%s] containment fallback could not insert page_screenshot row for %s: %s",
+                        base_url, page_url, e,
+                    )
+
+                if page_screenshot_image_id:
+                    for hit in hits:
+                        asset = hit["asset"]
+                        asset_id = str(asset["id"])
+                        confidence = int(hit["confidence_score"])
+                        match_type = (
+                            "strong" if confidence >= settings.strong_match_threshold
+                            else ("partial" if confidence >= settings.partial_match_threshold
+                                  else "weak")
+                        )
+                        match_payload = {
+                            "asset_id": asset_id,
+                            "discovered_image_id": page_screenshot_image_id,
+                            "distributor_id": str(distributor_id) if distributor_id else None,
+                            "confidence_score": confidence,
+                            "match_type": match_type,
+                            "is_modified": True,
+                            "modifications": ["composed_hero"],
+                            "channel": "website",
+                            "source_url": page_url,
+                            "screenshot_url": evidence_url,
+                            # ComplianceStatus enum is {pending, compliant,
+                            # violation, review}. Containment matches are
+                            # an Opus eyeballing of the whole page and
+                            # always require a human eye, so they go
+                            # straight to the `review` bucket — that's
+                            # what powers the "Pending Review" tab in
+                            # the frontend along with `pending`.
+                            "compliance_status": "review",
+                            "compliance_issues": [],
+                            "ai_analysis": {
+                                "match_method": "full_page_containment",
+                                "rationale": hit.get("rationale", ""),
+                                "location_hint": hit.get("location_hint"),
+                                "raw": hit.get("raw"),
+                            },
+                            "discovered_at": _utc_now(),
+                            "last_seen_at": _utc_now(),
+                            "scan_count": 1,
+                        }
+                        try:
+                            match_buffer.add(match_payload)
+                            page_pipeline["matched_new"] += 1
+                            page_pipeline["containment_matched"] = (
+                                page_pipeline.get("containment_matched", 0) + 1
+                            )
+                            page_matched_assets.add(asset_id)
+                            # Containment hits are explicitly NOT folded
+                            # into ``page_cache_assets``: page-cache replay
+                            # is meant to skip pages whose every asset has
+                            # already been confirmed by the strict per-
+                            # image stage. Containment is a softer signal
+                            # by design (Opus eyeballing a whole webpage)
+                            # and we do not want it to self-perpetuate via
+                            # the cache.
+                        except Exception as e:
+                            log.error(
+                                "[%s] containment fallback could not buffer match for asset %s on page %s: %s",
+                                base_url, asset_id, page_url, e,
+                            )
+                else:
+                    log.warning(
+                        "[%s] containment fallback found %d hit(s) on %s but the "
+                        "anchor discovered_image insert failed — matches dropped",
+                        base_url, len(hits), page_url,
+                    )
+        elif (
+            getattr(settings, "enable_containment_fallback", True)
+            and not page_matched_assets
+            and bool(evidence_url)
+        ):
+            # Visible reason for skipping so an operator looking at
+            # ``pipeline_stats`` knows whether the fallback ran.
+            page_pipeline["containment_skipped"] = (
+                page_pipeline.get("containment_skipped", 0) + 1
+            )
 
         # Fold this page's matches into the global early-stop set
         # (early-stop uses ALL matches, not just cache-quality ones —
@@ -1045,6 +1412,9 @@ async def _process_one_page(
         "pipeline_increments": page_pipeline,
         "matches_new": page_pipeline["matched_new"] - matches_new_before,
         "matches_confirmed": page_pipeline["matched_confirmed"] - matches_confirmed_before,
+        "extract_ms": extract_ms,
+        "analyze_ms": analyze_ms,
+        "images_in_flight": images_in_flight,
     }
 
 
@@ -1119,9 +1489,21 @@ async def _process_one_dealer(
             "filter_rejected": 0, "below_threshold": 0,
             "verification_rejected": 0, "matched_new": 0,
             "matched_confirmed": 0, "drift_detected": 0, "errors": 0,
+            # Phase-9 follow-up #3 — surface containment-fallback
+            # activity even on scans where it never fired.
+            "containment_called": 0, "containment_matched": 0,
+            "containment_skipped": 0,
         },
         "page_match_tracker": {},
         "block_details": [],
+        # Phase 9 telemetry — populated from per-page returns; used by
+        # `run_website_scan` to surface `slowest_page_ms` /
+        # `extract_ms_total` / `analyze_ms_total` in pipeline_stats.
+        "extract_ms_total": 0,
+        "analyze_ms_total": 0,
+        "images_in_flight_total": 0,
+        "slowest_page_ms": 0,
+        "slowest_page_url": None,
     }
 
     async def _run_page(page_url: str) -> Dict[str, Any]:
@@ -1129,7 +1511,8 @@ async def _process_one_dealer(
         # are live at once. Cross-dealer bounds are owned by the caller
         # via extract_sem (which only wraps the actual Playwright phase).
         async with page_sem:
-            return await _process_one_page(
+            page_timeout = float(getattr(settings, "page_hard_timeout_seconds", 0) or 0)
+            page_coro = _process_one_page(
                 base_url=base_url,
                 page_url=page_url,
                 distributor_id=distributor_id,
@@ -1150,6 +1533,55 @@ async def _process_one_dealer(
                 processed_buffer=local_processed,
                 settings=settings,
             )
+            # Phase-8 backstop: a wedged page (Playwright nav stall, BD
+            # unlocker hang, Anthropic SDK socket dead) is hard-capped
+            # per `settings.page_hard_timeout_seconds`. The cap exists
+            # because the matcher used to inherit the Anthropic SDK's
+            # 600s default × 5 retries and could legitimately freeze a
+            # page for 50 minutes — long enough to starve the heartbeat
+            # past `scan_idle_timeout_minutes` and trip auto-fail.
+            # 0 disables the cap (legacy behaviour).
+            if page_timeout > 0:
+                page_t0 = time.monotonic()
+                try:
+                    return await asyncio.wait_for(page_coro, timeout=page_timeout)
+                except asyncio.TimeoutError:
+                    elapsed_ms = int((time.monotonic() - page_t0) * 1000)
+                    log.error(
+                        "[%s] page %s exceeded hard timeout (%.1fs) — recording as failed",
+                        base_url, page_url, page_timeout,
+                    )
+                    return {
+                        "page_url": page_url,
+                        "skipped": False,
+                        "total_discovered": 0,
+                        "pages_scanned": 0,
+                        "pages_empty": 0,
+                        "pages_blocked": 0,
+                        "pages_failed": 1,
+                        "total_images": 0,
+                        "page_match_tracker": {},
+                        "block_details": [{
+                            "page_url": page_url,
+                            "outcome": "timeout",
+                            "reason": f"Page hard timeout ({page_timeout:.1f}s) exceeded",
+                            "elapsed_ms": elapsed_ms,
+                        }],
+                        "pipeline_increments": {
+                            "download_failed": 0, "hash_rejected": 0,
+                            "clip_rejected": 0, "filter_rejected": 0,
+                            "below_threshold": 0,
+                            "verification_rejected": 0,
+                            "matched_new": 0, "matched_confirmed": 0,
+                            "drift_detected": 0, "errors": 1,
+                        },
+                        "matches_new": 0,
+                        "matches_confirmed": 0,
+                        "extract_ms": 0,
+                        "analyze_ms": 0,
+                        "images_in_flight": 0,
+                    }
+            return await page_coro
 
     try:
         page_tasks = [
@@ -1165,6 +1597,17 @@ async def _process_one_dealer(
                 )
                 aggregate["pipeline_increments"]["errors"] += 1
                 aggregate["pages_failed"] += 1
+                # Phase-9 / Phase-3-of-fix-sprint: the previous version
+                # bumped `pages_failed` here without ever appending to
+                # `block_details`, which is why the 2026-05-08 validation
+                # scan recorded `pages_failed=11` but only 6 entries in
+                # `blocked_details`. Anyone debugging from JSONB had to
+                # read worker logs to figure out the gap.
+                aggregate["block_details"].append({
+                    "page_url": "<task-crash>",
+                    "outcome": "task_crashed",
+                    "reason": str(page_err)[:200],
+                })
                 continue
 
             if page_result.get("skipped"):
@@ -1184,6 +1627,19 @@ async def _process_one_dealer(
                 aggregate["page_match_tracker"].setdefault(url, set()).update(asset_ids)
             if page_result.get("block_details"):
                 aggregate["block_details"].extend(page_result["block_details"])
+
+            # Phase-9 telemetry rollup.
+            page_extract_ms = int(page_result.get("extract_ms", 0) or 0)
+            page_analyze_ms = int(page_result.get("analyze_ms", 0) or 0)
+            page_total_ms = page_extract_ms + page_analyze_ms
+            aggregate["extract_ms_total"] += page_extract_ms
+            aggregate["analyze_ms_total"] += page_analyze_ms
+            aggregate["images_in_flight_total"] += int(
+                page_result.get("images_in_flight", 0) or 0
+            )
+            if page_total_ms > aggregate["slowest_page_ms"]:
+                aggregate["slowest_page_ms"] = page_total_ms
+                aggregate["slowest_page_url"] = page_result.get("page_url")
 
             if progress_callback is not None:
                 try:
@@ -1234,6 +1690,11 @@ async def _process_one_dealer(
         "block_details": aggregate["block_details"],
         "dealer_status": dealer_status,
         "base_url": base_url,
+        "extract_ms_total": aggregate["extract_ms_total"],
+        "analyze_ms_total": aggregate["analyze_ms_total"],
+        "images_in_flight_total": aggregate["images_in_flight_total"],
+        "slowest_page_ms": aggregate["slowest_page_ms"],
+        "slowest_page_url": aggregate["slowest_page_url"],
         "distributor_id": str(distributor_id) if distributor_id else None,
     }
 
@@ -1497,26 +1958,123 @@ async def run_website_scan(
 
         per_dealer_pages: Dict[str, List[str]] = {}
         per_dealer_dist_id: Dict[str, Optional[str]] = {}
+        # Defensive init: referenced unconditionally in `pipeline_stats`
+        # below, but only populated in the `else` branch.
+        disco_failures: Dict[str, str] = {}
         if cache_early_stopped:
             total_pages = len(cached_pages)
             pages_from_discovery = 0
         else:
-            for base_url in website_urls:
-                try:
-                    discovered = await page_discovery_discover(base_url)
-                except Exception as e:
-                    log.error("Page discovery failed for %s: %s", base_url, e)
-                    discovered = [base_url]
+            # Phase-9 follow-up (2026-05-11): the previous serial loop here
+            # was the wedge point of the 11:42 EDT 45-dealer scan failure.
+            # `generaldeequipos.com` hung mid-`discover_pages`, no
+            # heartbeat fired, and 20 min later cleanup auto-failed the
+            # whole scan before extraction started.
+            #
+            # New design:
+            #   1. Run dealers in parallel, bounded by
+            #      ``settings.page_discovery_concurrency`` (default 8).
+            #      Page discovery is pure HTTP, no shared state — perfect
+            #      for ``asyncio.gather`` with a semaphore.
+            #   2. Wrap each dealer's discovery in ``asyncio.wait_for`` per
+            #      ``settings.page_discovery_per_dealer_timeout_seconds``
+            #      (default 60s). On timeout: fall back to scanning the
+            #      bare homepage so the dealer still gets *some* coverage.
+            #   3. Stamp a heartbeat after each dealer's discovery
+            #      completes (debounced via _heartbeat_throttled). With
+            #      8-way parallelism + 60s caps the worst case for a
+            #      45-dealer fan-out is ceil(45/8) * 60s = 6 * 60s = 360s,
+            #      vs. the old worst case of 45 * 15s avg = ~11 min plus
+            #      one bad dealer hanging the whole loop indefinitely.
+            disco_concurrency = max(
+                1, int(getattr(_settings, "page_discovery_concurrency", 8) or 8),
+            )
+            disco_timeout = float(
+                getattr(_settings, "page_discovery_per_dealer_timeout_seconds", 60) or 0
+            )
+            disco_sem = asyncio.Semaphore(disco_concurrency)
+            disco_completed = 0
+
+            async def _discover_one(base_url: str) -> Tuple[str, List[str], Optional[str]]:
+                """Discover one dealer's pages with cap + fallback.
+
+                Returns (base_url, pages, failure_reason). On any
+                failure or timeout, ``pages`` falls back to ``[base_url]``
+                so the dealer still gets at minimum a homepage scan.
+                """
+                async with disco_sem:
+                    try:
+                        if disco_timeout > 0:
+                            discovered = await asyncio.wait_for(
+                                page_discovery_discover(base_url),
+                                timeout=disco_timeout,
+                            )
+                        else:
+                            discovered = await page_discovery_discover(base_url)
+                        return (base_url, discovered, None)
+                    except asyncio.TimeoutError:
+                        log.warning(
+                            "Page discovery timed out for %s after %.1fs — "
+                            "falling back to homepage-only",
+                            base_url, disco_timeout,
+                        )
+                        return (base_url, [base_url], f"discovery_timeout_{int(disco_timeout)}s")
+                    except Exception as e:
+                        log.error(
+                            "Page discovery failed for %s: %s — "
+                            "falling back to homepage-only",
+                            base_url, e,
+                        )
+                        return (base_url, [base_url], f"discovery_error: {str(e)[:120]}")
+
+            # Stamp a heartbeat at the start of discovery so a 60s cap on
+            # the very first dealer can't push us past the 20m idle
+            # threshold by itself.
+            _heartbeat(scan_job_id)
+
+            disco_tasks = [
+                asyncio.create_task(_discover_one(u), name=f"discover:{u}")
+                for u in website_urls
+            ]
+            log.info(
+                "Phase-9 page discovery: %d dealer(s), concurrency=%d, per-dealer-cap=%.1fs",
+                len(disco_tasks), disco_concurrency, disco_timeout,
+            )
+
+            disco_failures: Dict[str, str] = {}
+            for coro in asyncio.as_completed(disco_tasks):
+                base_url, discovered, failure = await coro
+                if failure:
+                    disco_failures[base_url] = failure
                 pages_for_dealer = [u for u in discovered if u not in cached_set]
                 per_dealer_pages[base_url] = pages_for_dealer
                 per_dealer_dist_id[base_url] = extraction_service._match_distributor_by_domain(
                     base_url, distributor_mapping
                 )
+                disco_completed += 1
+                # Stream a heartbeat every dealer (throttled internally
+                # so a 45-dealer batch doesn't fire 45 UPDATEs).
+                _heartbeat_throttled(
+                    scan_job_id,
+                    min_interval=getattr(
+                        _settings, "heartbeat_min_interval_seconds", 10.0,
+                    ),
+                )
+                if disco_completed % 5 == 0 or disco_completed == len(disco_tasks):
+                    log.info(
+                        "Phase-9 page discovery: %d / %d dealer(s) discovered",
+                        disco_completed, len(disco_tasks),
+                    )
+
             pages_from_discovery = sum(len(p) for p in per_dealer_pages.values())
             total_pages = len(cached_pages) + pages_from_discovery
             log.info(
-                "Phase 2: %d additional page(s) across %d dealer(s) (after %d cached)",
-                pages_from_discovery, len(per_dealer_pages), len(cached_pages),
+                "Phase 2: %d additional page(s) across %d dealer(s) (after %d cached)%s",
+                pages_from_discovery,
+                len(per_dealer_pages),
+                len(cached_pages),
+                f" — {len(disco_failures)} discovery fallback(s)"
+                if disco_failures else "",
             )
             _heartbeat(scan_job_id)
 
@@ -1549,6 +2107,57 @@ async def run_website_scan(
             "cache_hit": cache_early_stopped,
             "cached_pages_used": len(cached_pages),
             "concurrent_dealers": _settings.max_concurrent_dealers,
+            # Phase 9 telemetry — populated as dealers complete; lets the
+            # operator distinguish "Playwright is slow" (extract_ms_total
+            # dominates) from "Anthropic is slow" (analyze_ms_total
+            # dominates) without reading worker logs. `slowest_page_ms`
+            # + `slowest_page_url` jointly point at the worst offender.
+            "extract_ms_total": 0,
+            "analyze_ms_total": 0,
+            "images_in_flight_total": 0,
+            "slowest_page_ms": 0,
+            "slowest_page_url": None,
+            "page_hard_timeout_seconds": int(
+                getattr(_settings, "page_hard_timeout_seconds", 0) or 0
+            ),
+            "page_extract_timeout_seconds": int(
+                getattr(_settings, "page_extract_timeout_seconds", 0) or 0
+            ),
+            "page_analyze_timeout_seconds": int(
+                getattr(_settings, "page_analyze_timeout_seconds", 0) or 0
+            ),
+            "dealer_hard_timeout_seconds": int(
+                getattr(_settings, "dealer_hard_timeout_seconds", 0) or 0
+            ),
+            # Phase-9 follow-up: dealers whose `discover_pages` exceeded
+            # the per-dealer cap (or crashed). They get a homepage-only
+            # fallback so they still scan, but the operator should see
+            # the list to know which sites are slow/blocked at the
+            # discovery layer.
+            "discovery_failures": disco_failures,
+            "page_discovery_concurrency": int(
+                getattr(_settings, "page_discovery_concurrency", 0) or 0
+            ),
+            "page_discovery_per_dealer_timeout_seconds": int(
+                getattr(_settings, "page_discovery_per_dealer_timeout_seconds", 0) or 0
+            ),
+            # Phase-9 follow-up #3: full-page containment fallback. These
+            # are pre-zeroed so they show up in `pipeline_stats` even on
+            # scans that never trigger the fallback. They get incremented
+            # by per-page returns rolling up through `aggregate
+            # ["pipeline_increments"]` into this dict.
+            "containment_called": 0,
+            "containment_matched": 0,
+            "containment_skipped": 0,
+            "enable_containment_fallback": bool(
+                getattr(_settings, "enable_containment_fallback", True)
+            ),
+            "containment_fallback_threshold": int(
+                getattr(_settings, "containment_fallback_threshold", 70) or 70
+            ),
+            "containment_fallback_max_assets": int(
+                getattr(_settings, "containment_fallback_max_assets", 10) or 10
+            ),
         }
 
         early_stopped = cache_early_stopped
@@ -1568,6 +2177,26 @@ async def run_website_scan(
             extract_sem = asyncio.Semaphore(
                 max(1, _settings.max_concurrent_dealers)
                 * max(1, getattr(_settings, "pages_per_dealer_concurrency", 4))
+            )
+
+            # Phase-8.1 fix: bind `max_concurrent_dealers` for real.
+            # Until this change, we only sized the *page-level* extractor
+            # semaphore by `max_concurrent_dealers * pages_per_dealer`,
+            # which capped concurrent Playwright extractions but did not
+            # cap how many dealer coroutines were live at once. The
+            # 2026-05-08 multi-dealer scan (45 dealers, 0 successes)
+            # showed the consequence: every dealer task started in the
+            # same instant via `asyncio.gather`, every dealer's
+            # `asyncio.wait_for(dealer_timeout)` clock began ticking
+            # together, and ~13 minutes of setup plus 46 minutes of
+            # starved CPU/network sharing meant *every* dealer hit the
+            # 2700 s cap before any one of them could finish. With this
+            # semaphore acquired *outside* the wait_for below, only N
+            # dealers truly run at once, each gets its full wall-clock
+            # budget, and queued dealers idle harmlessly until a slot
+            # opens — restoring the 99-100 % accuracy target.
+            dealer_sem = asyncio.Semaphore(
+                max(1, _settings.max_concurrent_dealers)
             )
 
             stream_progress = bool(getattr(_settings, "enable_progress_streaming", True))
@@ -1606,11 +2235,133 @@ async def run_website_scan(
                 except Exception as e:
                     log.debug("Streaming progress write failed: %s", e)
 
-            dealer_tasks = [
-                asyncio.create_task(
-                    _process_one_dealer(
+            # Phase-8: wrap each dealer in a per-dealer hard timeout so
+            # one pathological dealer cannot starve the rest of the scan.
+            # `asyncio.wait_for` cancels the inner task on timeout; the
+            # task's `finally` blocks (MatchBuffer flush, BrowserContext
+            # release) still run, so partial work is persisted. The
+            # timeout is configurable via
+            # `settings.dealer_hard_timeout_seconds` (0 disables).
+            dealer_timeout = float(getattr(_settings, "dealer_hard_timeout_seconds", 0) or 0)
+
+            # Phase-8.2: stream per-dealer outcomes to the DB live.
+            # Pre-populate `dealer_outcomes` with one "pending" stub per
+            # dealer so the frontend "X of N dealers complete" badge has
+            # a stable denominator from the very first paint, instead of
+            # appearing only after the first dealer finishes (which made
+            # operators think the badge was broken). As each dealer
+            # finishes, `_emit_dealer_outcome` replaces the matching
+            # stub by `base_url` and triggers a throttled write of the
+            # whole `pipeline_stats` JSONB.
+            dealer_base_urls = [b for b, p in per_dealer_pages.items() if p]
+            pipeline_stats["dealer_outcomes"] = [
+                {
+                    "base_url": b,
+                    "status": "pending",
+                    "error": None,
+                    "started_at": None,
+                    "duration_seconds": None,
+                }
+                for b in dealer_base_urls
+            ]
+            outcomes_index = {b: i for i, b in enumerate(dealer_base_urls)}
+            outcomes_lock = asyncio.Lock()
+            last_outcomes_write = {"t": 0.0}
+            outcomes_min_interval = float(getattr(
+                _settings, "dealer_outcome_stream_interval_seconds", 3.0,
+            ) or 0.0)
+
+            def _flush_pipeline_stats(force: bool = False) -> None:
+                """Throttled DB write of the current `pipeline_stats` JSONB.
+
+                Pulled out of `_emit_dealer_outcome` so the pre-populate
+                step (and any future code path that mutates
+                `pipeline_stats` mid-scan) can also force a flush. The
+                throttle is per-scan-job, gated by
+                `dealer_outcome_stream_interval_seconds`. `force=True`
+                bypasses the throttle and always writes — used after
+                pre-populating pending stubs so the UI badge appears
+                immediately, and at the end of fan-out so the last
+                dealer's outcome can't be lost in the throttle window.
+                """
+                now = time.monotonic()
+                throttled = (
+                    outcomes_min_interval > 0
+                    and (now - last_outcomes_write["t"])
+                        < outcomes_min_interval
+                )
+                if throttled and not force:
+                    return
+                last_outcomes_write["t"] = now
+                try:
+                    supabase.table("scan_jobs").update({
+                        "pipeline_stats": pipeline_stats,
+                        "last_heartbeat_at": _utc_now(),
+                    }).eq("id", str(scan_job_id)).execute()
+                except Exception as e:
+                    log.debug(
+                        "Streaming pipeline_stats write failed: %s", e,
+                    )
+
+            async def _emit_dealer_outcome(
+                outcome: Optional[Dict[str, Any]],
+                *,
+                force: bool = False,
+            ) -> None:
+                """Stream a per-dealer outcome to scan_jobs.pipeline_stats.
+
+                Called from `_run_one_dealer_with_timeout` whenever a
+                dealer finishes (success, partial, or timeout). Throttled
+                so a 45-dealer scan does ~one write per 3 s rather than
+                one write per dealer-completion event. The lock makes
+                concurrent dealer completions race-safe even though we
+                don't await across the supabase call (it's a sync REST
+                call from the supabase-py client).
+                """
+                if not outcome:
+                    return
+                async with outcomes_lock:
+                    idx = outcomes_index.get(outcome.get("base_url"))
+                    if idx is not None:
+                        pipeline_stats["dealer_outcomes"][idx] = outcome
+                    else:
+                        pipeline_stats["dealer_outcomes"].append(outcome)
+                    _flush_pipeline_stats(force=force)
+
+            # Phase-8.2 follow-up: flush the pre-populated pending
+            # stubs to the DB *before* fan-out kicks off. Without this,
+            # `pipeline_stats.dealer_outcomes` only lands in the row
+            # when the first dealer completes (5-10 min into a large
+            # scan), so the operator UI shows nothing for the first
+            # several minutes — exactly the symptom the operator
+            # screenshot at 11:29 AM on 2026-05-08 captured. With this
+            # explicit force-flush, the "0 of 45 dealers complete"
+            # badge appears within ~1 s of fan-out beginning.
+            try:
+                _flush_pipeline_stats(force=True)
+            except Exception as e:
+                log.debug("Initial pipeline_stats flush failed: %s", e)
+
+            async def _run_one_dealer_with_timeout(
+                base_url: str,
+                page_urls: List[str],
+            ) -> Dict[str, Any]:
+                # Phase-8.1: hold the dealer slot for the *entire* dealer
+                # lifetime, but acquire it *before* we record `started_at`
+                # or arm the wait_for clock. Two consequences:
+                #   1. The hard-timeout budget (`dealer_timeout`) only
+                #      ticks while the dealer is actively running, never
+                #      while it is queued behind earlier dealers.
+                #   2. `_dealer_outcome.duration_seconds` measures real
+                #      work, so the partial-success telemetry the UI
+                #      shows is meaningful instead of "everyone took
+                #      2777 s" like the 2026-05-08 incident.
+                async with dealer_sem:
+                    started_at = time.monotonic()
+                    started_iso = _utc_now()
+                    inner = _process_one_dealer(
                         base_url=base_url,
-                        page_urls=pages,
+                        page_urls=page_urls,
                         distributor_id=per_dealer_dist_id.get(base_url),
                         scan_job_id=scan_job_id,
                         campaign_assets=campaign_assets,
@@ -1626,7 +2377,79 @@ async def run_website_scan(
                         extract_sem=extract_sem,
                         settings=_settings,
                         progress_callback=_stream_page_progress,
-                    ),
+                    )
+                    try:
+                        if dealer_timeout > 0:
+                            result = await asyncio.wait_for(
+                                inner, timeout=dealer_timeout,
+                            )
+                        else:
+                            result = await inner
+                    except asyncio.TimeoutError:
+                        log.error(
+                            "[%s] dealer exceeded hard timeout (%.1fs) — "
+                            "partial work preserved, dealer marked failed",
+                            base_url, dealer_timeout,
+                        )
+                        timeout_outcome = {
+                            "base_url": base_url,
+                            "status": "failed",
+                            "error": (
+                                f"Dealer hard timeout ({dealer_timeout:.1f}s)"
+                            ),
+                            "started_at": started_iso,
+                            "duration_seconds": round(
+                                time.monotonic() - started_at, 1,
+                            ),
+                        }
+                        await _emit_dealer_outcome(timeout_outcome)
+                        return {
+                            "total_discovered": 0,
+                            "pages_scanned": 0,
+                            "pages_empty": 0,
+                            "pages_blocked": 0,
+                            "pages_failed": len(page_urls),
+                            "total_images": 0,
+                            "pages_skipped": 0,
+                            "pipeline_increments": {
+                                "errors": 1,
+                            },
+                            "page_match_tracker": {},
+                            "block_details": [{
+                                "page_url": base_url,
+                                "outcome": "timeout",
+                                "reason": (
+                                    f"Dealer hard timeout ({dealer_timeout:.1f}s) "
+                                    "exceeded — other dealers continued"
+                                ),
+                            }],
+                            "dealer_status": "failed",
+                            "base_url": base_url,
+                            "distributor_id": (
+                                str(per_dealer_dist_id.get(base_url))
+                                if per_dealer_dist_id.get(base_url) else None
+                            ),
+                            "_dealer_outcome": timeout_outcome,
+                        }
+                    result["_dealer_outcome"] = {
+                        "base_url": base_url,
+                        "status": result.get("dealer_status", "ok"),
+                        "error": None,
+                        "started_at": started_iso,
+                        "duration_seconds": round(
+                            time.monotonic() - started_at, 1,
+                        ),
+                        "pages_scanned": result.get("pages_scanned", 0),
+                        "matches_new": (
+                            result.get("pipeline_increments", {}) or {}
+                        ).get("matched_new", 0),
+                    }
+                    await _emit_dealer_outcome(result["_dealer_outcome"])
+                    return result
+
+            dealer_tasks = [
+                asyncio.create_task(
+                    _run_one_dealer_with_timeout(base_url, pages),
                     name=f"dealer:{base_url}",
                 )
                 for base_url, pages in per_dealer_pages.items()
@@ -1641,12 +2464,28 @@ async def run_website_scan(
             from urllib.parse import urlparse as _urlparse
             success_pages_by_host: Dict[str, int] = {}
 
+            # Phase-8: per-dealer outcome envelopes used to be appended
+            # here at end-of-scan. Phase-8.2 streams them live via
+            # `_emit_dealer_outcome` from inside each dealer wrapper, so
+            # `pipeline_stats["dealer_outcomes"]` is already populated
+            # by the time we get here. The exception branch below is
+            # the only path that bypasses the wrapper (because gather
+            # caught a BaseException from the task itself), so it still
+            # appends a stub here.
+
             for result in dealer_results:
                 if isinstance(result, BaseException):
                     log.error("Per-dealer task crashed: %s", result, exc_info=result)
                     pipeline_stats["errors"] += 1
                     pipeline_stats["dealers_failed"] += 1
                     pipeline_stats["dealers_total"] += 1
+                    pipeline_stats["dealer_outcomes"].append({
+                        "base_url": None,
+                        "status": "failed",
+                        "error": _normalize_scan_error(result),
+                        "started_at": None,
+                        "duration_seconds": None,
+                    })
                     continue
                 total_discovered += result["total_discovered"]
                 pipeline_stats["pages_scanned"] += result["pages_scanned"]
@@ -1664,6 +2503,25 @@ async def run_website_scan(
                 status = result.get("dealer_status", "ok")
                 key = f"dealers_{status}"
                 pipeline_stats[key] = pipeline_stats.get(key, 0) + 1
+
+                # Phase-9 telemetry: roll per-dealer phase timings up to
+                # the scan level so the next zero-match / hung-scan
+                # incident can be diagnosed straight from JSONB.
+                pipeline_stats["extract_ms_total"] += int(
+                    result.get("extract_ms_total", 0) or 0
+                )
+                pipeline_stats["analyze_ms_total"] += int(
+                    result.get("analyze_ms_total", 0) or 0
+                )
+                pipeline_stats["images_in_flight_total"] += int(
+                    result.get("images_in_flight_total", 0) or 0
+                )
+                dealer_slowest_ms = int(result.get("slowest_page_ms", 0) or 0)
+                if dealer_slowest_ms > pipeline_stats["slowest_page_ms"]:
+                    pipeline_stats["slowest_page_ms"] = dealer_slowest_ms
+                    pipeline_stats["slowest_page_url"] = (
+                        result.get("slowest_page_url")
+                    )
                 block_pages = result.get("block_details") or []
                 if block_pages:
                     pipeline_stats["blocked_details"].append({
@@ -1672,6 +2530,20 @@ async def run_website_scan(
                         "dealer_status": status,
                         "pages": block_pages,
                     })
+
+                outcome = result.get("_dealer_outcome")
+                if outcome:
+                    # Stamp the rolled-up status (success/partial/blocked
+                    # /failed) so the UI doesn't have to reconcile the
+                    # `dealer_status` key with the timing envelope. The
+                    # outcome itself is already in
+                    # `pipeline_stats["dealer_outcomes"]` from the
+                    # streaming write — we only refresh the status here
+                    # in case the post-gather rollup recomputed it.
+                    outcome.setdefault("status", status)
+                    idx = outcomes_index.get(outcome.get("base_url"))
+                    if idx is not None:
+                        pipeline_stats["dealer_outcomes"][idx] = outcome
 
                 # Tally per-host successful pages so host_policy_service can
                 # reset confidence on hosts that worked this scan even when
@@ -2027,6 +2899,241 @@ async def auto_analyze_scan(scan_job_id: UUID, campaign_id: UUID):
             log.error("Failed to update scan job status after analysis error: %s", db_err)
 
 
+async def match_existing_images_against_campaign(
+    scan_job_id: UUID,
+    campaign_id: UUID,
+    source_scan_job_id: Optional[UUID] = None,
+) -> int:
+    """Re-match an existing scan's already-discovered creatives against a
+    (possibly different) campaign — WITHOUT re-running the expensive
+    Apify / website discovery step.
+
+    This is the "scan a dealer once, audit many campaigns" path. The
+    creatives a scan pulled into ``discovered_images`` are keyed to the
+    dealer (``distributor_id`` / ``scan_job_id``), not to a campaign, so
+    they can be compared against any campaign's assets for the price of
+    the (cheap) matcher pass alone — no extra Apify spend.
+
+    Two scan-job ids are in play:
+
+      * ``scan_job_id`` — the **reuse tracking row**. Status, heartbeat,
+        cost, ``matches_count`` and ``pipeline_stats`` are written here.
+        Created fresh (``status='pending'``) by the HTTP layer so the
+        external worker can claim it like any other scan and so the
+        *original* scan's reported numbers are never clobbered.
+      * ``source_scan_job_id`` — where the creatives are READ from. The
+        matches that get created reference these source images. Defaults
+        to ``scan_job_id`` when omitted (legacy / direct call where the
+        tracking row and the source are the same).
+
+    Differences from :func:`auto_analyze_scan`:
+
+      * Uses the ``campaign_id`` argument, not the source scan's own
+        campaign.
+      * Ignores ``is_processed`` — the source images were already flagged
+        processed by the original scan's auto-analyse, but we want to
+        reconsider every one of them against the new campaign.
+      * Manages its own ``scan_jobs`` lifecycle + cost context (mirrors
+        :func:`_run_source_scan`) so it works under the worker-handoff
+        deploy (``DISABLE_INPROCESS_DISPATCH=true``) and records Anthropic
+        spend.
+      * Runs :func:`_prune_duplicate_matches` (against the SOURCE images)
+        afterwards so repeated reuse passes stay idempotent.
+      * Sends the normal completion email + integrations, but looks the
+        creatives up under the SOURCE scan and scopes the match counts to
+        ``campaign_id`` (so it never reports another campaign's matches on
+        the shared creatives). Skipped entirely when there was nothing to
+        match.
+
+    Idempotency: :func:`_analyze_single_image` UPDATEs an existing match
+    for a given ``(asset_id, source_url)`` instead of inserting a
+    duplicate, so re-running this against the same campaign refreshes
+    rather than multiplies match rows. Different campaigns own different
+    ``asset_id``s, so their match sets never collide — reusing one
+    dealer scan across N campaigns produces N independent match sets.
+
+    Returns the number of creatives analysed.
+    """
+    source_id = source_scan_job_id or scan_job_id
+    log.info(
+        "Reuse match: source scan %s creatives → campaign %s "
+        "(tracking job %s, no new discovery)",
+        source_id, campaign_id, scan_job_id,
+    )
+
+    with scan_cost_context(str(scan_job_id)) as tracker:
+        analysed = 0
+        did_analysis = False
+        try:
+            now = _utc_now()
+            supabase.table("scan_jobs").update({
+                "status": "running",
+                "started_at": now,
+                "last_heartbeat_at": now,
+            }).eq("id", str(scan_job_id)).execute()
+
+            # The SOURCE scan supplies the creatives and the source label
+            # used to filter campaign assets (a facebook scan must not be
+            # matched against website-only assets, etc.).
+            source_job = supabase.table("scan_jobs")\
+                .select("*")\
+                .eq("id", str(source_id))\
+                .single()\
+                .execute()
+            if not source_job.data:
+                raise ValueError(f"Source scan {source_id} not found")
+
+            org_id = source_job.data.get("organization_id")
+            scan_source = source_job.data.get("source")
+
+            # All discovered images for the SOURCE scan, regardless of
+            # is_processed — they were flagged processed by the original
+            # campaign's analysis, but we reconsider every one here.
+            images = supabase.table("discovered_images")\
+                .select("*")\
+                .eq("scan_job_id", str(source_id))\
+                .execute()
+            all_rows = images.data or []
+
+            # Drop full-page "evidence only" captures (same rule as
+            # auto_analyze_scan) so the matcher never compares a banner
+            # asset against a 1920x3000 page screenshot.
+            matchable_images = [
+                img for img in all_rows
+                if (img.get("metadata") or {}).get("capture_method")
+                != "blocked_evidence"
+            ]
+
+            # Campaign assets, restricted to those eligible for the source.
+            assets = supabase.table("assets")\
+                .select("*")\
+                .eq("campaign_id", str(campaign_id))\
+                .execute()
+            asset_rows = assets.data or []
+            if scan_source:
+                eligible = [
+                    r for r in asset_rows
+                    if not r.get("target_platforms")
+                    or scan_source in (r.get("target_platforms") or [])
+                ]
+                skipped = len(asset_rows) - len(eligible)
+                if skipped:
+                    log.info(
+                        "Reuse match: filtered to %d of %d asset(s) eligible "
+                        "for source=%s (%d skipped)",
+                        len(eligible), len(asset_rows), scan_source, skipped,
+                    )
+                asset_rows = eligible
+
+            _heartbeat(scan_job_id)
+
+            if not matchable_images:
+                log.info(
+                    "Reuse match: source scan %s has no matchable creatives",
+                    source_id,
+                )
+            elif not asset_rows:
+                log.warning(
+                    "Reuse match: campaign %s has no assets eligible for "
+                    "source=%s — nothing to match", campaign_id, scan_source,
+                )
+            else:
+                # Compliance rules for the org (same shape auto_analyze_scan
+                # builds).
+                brand_rules: Dict[str, Any] = {}
+                if org_id:
+                    rules = supabase.table("compliance_rules")\
+                        .select("*")\
+                        .eq("organization_id", org_id)\
+                        .eq("is_active", True)\
+                        .execute()
+                    for rule in (rules.data or []):
+                        if rule["rule_type"] == "required_element":
+                            brand_rules.setdefault(
+                                "required_elements", []
+                            ).append(rule["rule_config"].get("element"))
+                        elif rule["rule_type"] == "forbidden_element":
+                            brand_rules.setdefault(
+                                "forbidden_elements", []
+                            ).append(rule["rule_config"].get("element"))
+
+                log.info(
+                    "Reuse match: analysing %d creative(s) from scan %s "
+                    "against %d asset(s) of campaign %s",
+                    len(matchable_images), source_id, len(asset_rows),
+                    campaign_id,
+                )
+
+                # `run_image_analysis` writes matches_count + pipeline_stats
+                # (and the active cost tracker's summary) onto the tracking
+                # row we pass here — NOT the source scan.
+                await run_image_analysis(
+                    matchable_images, asset_rows, brand_rules,
+                    org_id, str(scan_job_id),
+                )
+                analysed = len(matchable_images)
+                did_analysis = True
+
+                # Keep reuse idempotent: collapse to the best match per asset
+                # per distributor. Prune is keyed off the SOURCE images,
+                # since that is where the match rows' discovered_image_id
+                # point. Cross-campaign safe — different campaigns own
+                # different asset_ids.
+                try:
+                    pruned = await _prune_duplicate_matches(source_id)
+                    if pruned:
+                        log.info(
+                            "Reuse match: pruned %d duplicate match(es)",
+                            pruned,
+                        )
+                except Exception as e:
+                    log.warning(
+                        "Reuse match: prune step failed (non-fatal): %s", e,
+                    )
+
+            _persist_cost(scan_job_id, tracker)
+            supabase.table("scan_jobs").update({
+                "status": "completed",
+                "completed_at": _utc_now(),
+                "total_items": len(matchable_images),
+                "processed_items": analysed,
+            }).eq("id", str(scan_job_id)).execute()
+
+            # Completion email + integrations. Only when an audit actually
+            # ran (skip the "nothing to match" no-ops). The notification
+            # reports on the TRACKING row (org / totals) but looks up the
+            # creatives under the SOURCE scan and scopes match counts to the
+            # target campaign — otherwise it would either find no images or
+            # over-count other campaigns' matches on the same creatives.
+            if did_analysis:
+                try:
+                    after = supabase.table("scan_jobs")\
+                        .select("pipeline_stats")\
+                        .eq("id", str(scan_job_id))\
+                        .single()\
+                        .execute()
+                    stats = (after.data or {}).get("pipeline_stats") or {}
+                except Exception:
+                    stats = {}
+                _send_scan_notifications(
+                    scan_job_id,
+                    scan_source=scan_source or "facebook",
+                    pipeline_stats=stats,
+                    image_scan_job_id=source_id,
+                    campaign_id=campaign_id,
+                )
+
+        except Exception as e:
+            log.error("Reuse match failed: %s", e, exc_info=True)
+            _persist_cost(scan_job_id, tracker)
+            supabase.table("scan_jobs").update({
+                "status": "failed",
+                "error_message": _normalize_scan_error(e),
+            }).eq("id", str(scan_job_id)).execute()
+
+        return analysed
+
+
 async def run_image_analysis(
     discovered_images: List[Dict],
     campaign_assets: List[Dict],
@@ -2038,7 +3145,19 @@ async def run_image_analysis(
 
     Used by Facebook / Google / manual analysis paths.
     Website scans use inline page-by-page analysis with early stopping instead.
+
+    Phase-8 (2026-05-08): parallelised via a bounded semaphore and
+    debounced heartbeats. Previously this loop was strictly sequential,
+    which meant a Facebook scan with 500 images took 8-16 min minimum
+    AND a single hung Anthropic call stalled every subsequent image
+    (no heartbeat advance → cleanup auto-fail at 20 min). The same
+    tunables that gate the website per-image fan-out apply here:
+    `settings.post_analysis_concurrency` bounds in-flight Claude calls,
+    `_heartbeat_throttled` keeps the cleanup job satisfied.
     """
+    from ..config import get_settings as _gs
+    _settings = _gs()
+
     log.info("Starting image analysis — %d images, %d assets, org=%s, job=%s",
              len(discovered_images), len(campaign_assets), organization_id, scan_job_id)
 
@@ -2064,19 +3183,36 @@ async def run_image_analysis(
     match_buffer = MatchBuffer()
     processed_buffer = ProcessedImageBuffer()
 
-    for idx, image in enumerate(discovered_images):
-        log.info("[%d/%d] Processing image %s — URL: %s, source: %s, channel: %s",
-                 idx + 1, len(discovered_images), image["id"],
-                 image["image_url"][:100], image.get("source_type", "unknown"),
-                 image.get("channel", "unknown"))
+    concurrency = max(1, int(getattr(_settings, "post_analysis_concurrency", 5)))
+    image_sem = asyncio.Semaphore(concurrency)
+    hb_interval = float(getattr(_settings, "heartbeat_min_interval_seconds", 10.0))
 
-        await _analyze_single_image(
-            image, campaign_assets, brand_rules,
-            organization_id, scan_job_id,
-            asset_hashes, asset_embeddings, pipeline_stats,
-            match_buffer=match_buffer,
-            processed_buffer=processed_buffer,
-        )
+    async def _analyze_one(idx: int, image: Dict[str, Any]) -> None:
+        async with image_sem:
+            log.info(
+                "[%d/%d] Processing image %s — URL: %s, source: %s, channel: %s",
+                idx + 1, len(discovered_images), image["id"],
+                image["image_url"][:100], image.get("source_type", "unknown"),
+                image.get("channel", "unknown"),
+            )
+            if scan_job_id:
+                _heartbeat_throttled(scan_job_id, min_interval=hb_interval)
+            await _analyze_single_image(
+                image, campaign_assets, brand_rules,
+                organization_id, scan_job_id,
+                asset_hashes, asset_embeddings, pipeline_stats,
+                match_buffer=match_buffer,
+                processed_buffer=processed_buffer,
+            )
+
+    # `gather(..., return_exceptions=True)` makes one wedged image only
+    # affect that image — the rest of the batch still completes. This is
+    # the FB/Google equivalent of the website runner's per-page wait_for
+    # cap.
+    await asyncio.gather(
+        *[_analyze_one(i, img) for i, img in enumerate(discovered_images)],
+        return_exceptions=True,
+    )
 
     flushed = match_buffer.flush_all()
     if flushed or match_buffer.total_failed:
