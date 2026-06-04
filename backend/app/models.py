@@ -1,5 +1,5 @@
 """Pydantic models for API requests and responses."""
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date
 from uuid import UUID
@@ -230,10 +230,30 @@ class ScanJob(BaseModel):
     pipeline_stats: Optional[Dict[str, Any]] = None
     cost_usd: Optional[float] = 0
     cost_breakdown: Optional[Dict[str, Any]] = None
+    # Per-dealer scan results, keyed by normalized page URL:
+    # {"<url>": {"status": "succeeded"|"timeout"|..., "ad_count": N}}.
+    # Lifted from metadata.dealer_outcomes so the UI can flag dealers
+    # that timed out / failed instead of showing a silent zero.
+    dealer_outcomes: Optional[Dict[str, Any]] = None
     created_at: datetime
 
     class Config:
         from_attributes = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def _lift_dealer_outcomes(cls, data):
+        """Surface metadata.dealer_outcomes as a top-level field.
+
+        Scan rows store this nested under the JSONB ``metadata`` column;
+        the public model doesn't expose raw metadata, so lift just the
+        per-dealer outcomes when present.
+        """
+        if isinstance(data, dict) and not data.get("dealer_outcomes"):
+            md = data.get("metadata")
+            if isinstance(md, dict) and md.get("dealer_outcomes"):
+                data = {**data, "dealer_outcomes": md["dealer_outcomes"]}
+        return data
 
 
 # ============================================

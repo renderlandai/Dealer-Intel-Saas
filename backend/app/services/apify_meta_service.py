@@ -130,6 +130,37 @@ def _is_curious_coder_active() -> bool:
     raw = _active_actor_id().strip().lower()
     return raw.replace("/", "~") == CURIOUS_CODER_ACTOR_ID
 
+def _outcome_key(url: str) -> str:
+    """Normalize a dealer page URL into the coverage key used by reuse.
+
+    Must match ``scanning._coverage_key``'s normalization (strip →
+    lower → drop trailing slash) so per-dealer outcomes recorded here
+    line up with the keys ``find_reusable_scan`` derives from the
+    distributor's stored ``facebook_url``.
+    """
+    return (url or "").strip().lower().rstrip("/")
+
+
+def _merge_scan_metadata(scan_job_id: UUID, patch: Dict[str, Any]) -> None:
+    """Shallow-merge ``patch`` into a scan job's JSONB ``metadata``.
+
+    Supabase updates replace the whole column, so we read-modify-write
+    to preserve sibling keys (e.g. the dispatch record). Best-effort:
+    metadata is diagnostic, so a failure here must never abort a scan.
+    """
+    try:
+        cur = supabase.table("scan_jobs").select("metadata")\
+            .eq("id", str(scan_job_id)).single().execute()
+        md = (cur.data or {}).get("metadata") or {}
+        if not isinstance(md, dict):
+            md = {}
+        md.update(patch)
+        supabase.table("scan_jobs").update({"metadata": md})\
+            .eq("id", str(scan_job_id)).execute()
+    except Exception as e:  # pragma: no cover - diagnostic only
+        log.warning("Failed to merge scan metadata for %s: %s", scan_job_id, e)
+
+
 # Apify run statuses we treat as terminal (the run will not progress
 # further, regardless of whether it succeeded).
 _TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
@@ -1283,7 +1314,7 @@ async def _run_actor_for_page(
     *,
     country: str = "US",
     active_status: str = "all",
-) -> Tuple[str, List[Dict[str, Any]], Optional[float], Optional[str]]:
+) -> Tuple[str, List[Dict[str, Any]], Optional[float], Optional[str], str]:
     """Run one actor invocation for one dealer using keyword search.
 
     The search query is the page's display name (preferred) or its
@@ -1291,10 +1322,18 @@ async def _run_actor_for_page(
     tokenises camelCase names ("YanceyRents" → "yancey rents"), and
     the post-filter step drops keyword-collision noise either way.
 
-    Returns ``(page_url, ads, usage_total_usd, run_id)``. Always
-    returns — actor / network failures degrade to an empty ad list
-    and a logged WARNING rather than raising, so one dealer's outage
-    doesn't fail the whole multi-dealer scan.
+    Returns ``(page_url, ads, usage_total_usd, run_id, outcome)``.
+    Always returns — actor / network failures degrade to an empty ad
+    list and a logged WARNING rather than raising, so one dealer's
+    outage doesn't fail the whole multi-dealer scan.
+
+    ``outcome`` records WHY the ad list is whatever it is, so callers
+    can tell a clean "this dealer simply has no live ads" result
+    (``"succeeded"`` with 0 ads) apart from a transient failure
+    (``"timeout"`` / ``"error"`` / ``"failed"`` / ``"no_dataset"`` /
+    ``"fetch_error"``) or an unscannable dealer (``"skipped"``). This
+    distinction powers reuse: a cleanly-scanned-empty dealer can be
+    reused (no re-scrape) while a timed-out one must be re-scanned.
 
     Post-filter: actor results are dropped when the ad's
     ``pageName`` doesn't plausibly match the dealer (see
@@ -1315,7 +1354,7 @@ async def _run_actor_for_page(
             "Refusing to run actor for %s: no search query "
             "(no page_name and no slug)", page_url,
         )
-        return page_url, [], None, None
+        return page_url, [], None, None, "skipped"
 
     try:
         run_info = await _start_actor_run(
@@ -1332,28 +1371,28 @@ async def _run_actor_for_page(
         completed = await _poll_run(run_id)
     except TimeoutError:
         log.error("Apify run for %s timed out", page_url)
-        return page_url, [], None, None
+        return page_url, [], None, None, "timeout"
     except Exception as e:
         log.warning("Apify run for %s failed to start/poll: %s", page_url, e)
-        return page_url, [], None, None
+        return page_url, [], None, None, "error"
 
     if completed.get("status") != "SUCCEEDED":
         log.warning(
             "Apify run for %s ended with status %s (run_id=%s)",
             page_url, completed.get("status"), completed.get("id"),
         )
-        return page_url, [], completed.get("usageTotalUsd"), completed.get("id")
+        return page_url, [], completed.get("usageTotalUsd"), completed.get("id"), "failed"
 
     dataset_id = completed.get("defaultDatasetId")
     if not dataset_id:
         log.warning("Run for %s succeeded but no dataset id returned", page_url)
-        return page_url, [], completed.get("usageTotalUsd"), completed.get("id")
+        return page_url, [], completed.get("usageTotalUsd"), completed.get("id"), "no_dataset"
 
     try:
         ads = await _fetch_dataset_items(dataset_id)
     except Exception as e:
         log.warning("Dataset fetch for %s failed: %s", page_url, e)
-        ads = []
+        return page_url, [], completed.get("usageTotalUsd"), completed.get("id"), "fetch_error"
 
     # Post-filter: drop keyword-collision noise. We compare each ad's
     # advertiser-name field against the dealer's resolved name AND
@@ -1425,6 +1464,7 @@ async def _run_actor_for_page(
         filtered_ads,
         completed.get("usageTotalUsd"),
         completed.get("id"),
+        "succeeded",
     )
 
 
@@ -2202,11 +2242,21 @@ async def scan_meta_ads(
     ads_by_source: List[Tuple[str, Dict[str, Any]]] = []
     total_actor_cost = 0.0
     successful_runs = 0
+    # Per-dealer outcome, keyed by normalized page URL (the same key
+    # reuse-coverage compares against). Lets the reuse flow tell a
+    # cleanly-scanned-empty dealer ("succeeded", 0 ads) apart from a
+    # transient failure, so we never re-scrape the former or wrongly
+    # skip the latter.
+    dealer_outcomes: Dict[str, Dict[str, Any]] = {}
     for result in fan_results:
         if isinstance(result, BaseException):
             log.warning("Fan-out task crashed: %s", result)
             continue
-        page_url, ads, cost_usd, run_id = result
+        page_url, ads, cost_usd, run_id, outcome = result
+        dealer_outcomes[_outcome_key(page_url)] = {
+            "status": outcome,
+            "ad_count": len(ads),
+        }
         if cost_usd is not None:
             try:
                 total_actor_cost += float(cost_usd)
@@ -2233,6 +2283,8 @@ async def scan_meta_ads(
         "%d ads total, $%.4f reported cost",
         successful_runs, len(page_urls), len(ads_by_source), total_actor_cost,
     )
+
+    _merge_scan_metadata(scan_job_id, {"dealer_outcomes": dealer_outcomes})
 
     if not ads_by_source:
         supabase.table("scan_jobs").update({

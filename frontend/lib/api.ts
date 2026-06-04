@@ -168,6 +168,7 @@ export interface ScanJob {
   error_message: string | null;
   apify_run_id: string | null;
   pipeline_stats: Record<string, unknown> | null;
+  dealer_outcomes?: Record<string, { status: string; ad_count: number }> | null;
   created_at: string;
 }
 

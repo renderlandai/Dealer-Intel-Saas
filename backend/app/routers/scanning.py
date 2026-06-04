@@ -238,7 +238,7 @@ async def find_reusable_scan(
 
     cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age)).isoformat()
     candidates = supabase.table("scan_jobs")\
-        .select("id, completed_at")\
+        .select("id, completed_at, metadata")\
         .eq("organization_id", str(org_id))\
         .eq("source", source)\
         .eq("status", "completed")\
@@ -261,6 +261,20 @@ async def find_reusable_scan(
             key = _coverage_key(d, source)
             if key:
                 covered_keys.add(key)
+
+        # A dealer that was *cleanly* scanned but returned no ads has no
+        # discovered_images, yet there's nothing left to scrape for it
+        # within the freshness window — so count it as covered too. We
+        # only trust the recorded outcome when the run actually finished
+        # (``status == "succeeded"``); timeouts / actor failures are
+        # deliberately NOT covered so they get re-scanned rather than
+        # silently reported clean. Outcome keys are already normalized to
+        # match ``_coverage_key`` (see ``apify_meta_service._outcome_key``).
+        outcomes = (job.get("metadata") or {}).get("dealer_outcomes") or {}
+        for okey, info in outcomes.items():
+            if isinstance(info, dict) and info.get("status") == "succeeded":
+                covered_keys.add(okey)
+
         if requested_keys <= covered_keys:
             return {
                 "job_id": job["id"],

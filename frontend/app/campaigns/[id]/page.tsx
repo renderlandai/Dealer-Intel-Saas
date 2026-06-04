@@ -111,6 +111,7 @@ interface ScanJob {
   matches_count: number;
   error_message: string | null;
   pipeline_stats: Record<string, unknown> | null;
+  dealer_outcomes?: Record<string, { status: string; ad_count: number }> | null;
   organization_id: string;
   campaign_id: string | null;
   apify_run_id: string | null;
@@ -1611,69 +1612,143 @@ export default function CampaignDetailPage() {
                   </div>
                 ) : (
                   <div className="space-y-3">
-                    {scans.map((scan) => (
+                    {scans.map((scan) => {
+                      // Roll up per-dealer outcomes (keyed by normalized page
+                      // URL) into name-labelled buckets so we can flag dealers
+                      // that timed out / couldn't be scraped instead of letting
+                      // them disappear into a silent zero.
+                      const outcomes = scan.dealer_outcomes || null;
+                      let withAds = 0;
+                      let noAds = 0;
+                      const problems: string[] = [];
+                      if (outcomes) {
+                        const nameByKey: Record<string, string> = {};
+                        for (const d of distributors) {
+                          const u = (d.facebook_url || "")
+                            .trim()
+                            .toLowerCase()
+                            .replace(/\/+$/, "");
+                          if (u) nameByKey[u] = d.name;
+                        }
+                        for (const [key, info] of Object.entries(outcomes)) {
+                          if (info?.status === "succeeded") {
+                            if ((info?.ad_count ?? 0) > 0) withAds++;
+                            else noAds++;
+                          } else {
+                            problems.push(
+                              nameByKey[key] ||
+                                key.replace(/^https?:\/\/(www\.)?facebook\.com\//, ""),
+                            );
+                          }
+                        }
+                      }
+                      const hasOutcomes =
+                        scan.status === "completed" &&
+                        withAds + noAds + problems.length > 0;
+                      const runningLabel =
+                        scan.source === "facebook" ? "Scanning Facebook..." :
+                        scan.source === "instagram" ? "Scanning Instagram..." :
+                        scan.source === "google_ads" ? "Scanning Google Ads..." :
+                        scan.source === "website" ? "Scanning websites..." :
+                        "Scanning...";
+                      return (
                       <div
                         key={scan.id}
-                        className={`flex items-center justify-between p-4 rounded-lg border bg-card ${
+                        className={`rounded-lg border bg-card ${
                           scan.status === "running" ? "border-blue-500/50 bg-blue-500/5" : ""
                         }`}
                       >
-                        <div className="flex items-center gap-4">
-                          {getStatusIcon(scan.status)}
-                          <div>
-                            <p className="font-medium capitalize">
-                              {scan.source.replace("_", " ")} Scan
-                            </p>
-                            <p className="text-sm text-muted-foreground">
-                              {formatDate(scan.created_at)}
-                            </p>
+                        <div className="flex items-center justify-between p-4">
+                          <div className="flex items-center gap-4">
+                            {getStatusIcon(scan.status)}
+                            <div>
+                              <p className="font-medium capitalize">
+                                {scan.source.replace("_", " ")} Scan
+                              </p>
+                              <p className="text-sm text-muted-foreground">
+                                {formatDate(scan.created_at)}
+                              </p>
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            {scan.status === "running" && (
+                              <div className="flex items-center gap-2 text-sm text-blue-500">
+                                <Loader2 className="h-3 w-3 animate-spin" />
+                                <span>{runningLabel}</span>
+                              </div>
+                            )}
+                            {scan.status === "analyzing" && (
+                              <div className="flex items-center gap-2 text-sm text-purple-500">
+                                <Sparkles className="h-3 w-3 animate-pulse" />
+                                <span>Analyzing images with AI...</span>
+                              </div>
+                            )}
+                            {scan.status === "completed" && scan.total_items > 0 && (
+                              <div className="text-right text-sm">
+                                <p className="font-medium">{scan.total_items} items found</p>
+                                {scan.processed_items > 0 && (
+                                  <p className="text-muted-foreground">{scan.processed_items} analyzed</p>
+                                )}
+                              </div>
+                            )}
+                            <Badge variant={
+                              scan.status === "completed" ? "default" :
+                              scan.status === "running" ? "secondary" :
+                              scan.status === "analyzing" ? "secondary" :
+                              scan.status === "failed" ? "destructive" : "outline"
+                            }>
+                              {scan.status}
+                            </Badge>
+                            {scan.status === "completed" && (
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  setActiveTab("results");
+                                  loadMatches();
+                                }}
+                              >
+                                <Eye className="h-3 w-3 mr-1" />
+                                View Results
+                              </Button>
+                            )}
                           </div>
                         </div>
-                        <div className="flex items-center gap-3">
-                          {scan.status === "running" && (
-                            <div className="flex items-center gap-2 text-sm text-blue-500">
-                              <Loader2 className="h-3 w-3 animate-spin" />
-                              <span>Scanning websites...</span>
-                            </div>
-                          )}
-                          {scan.status === "analyzing" && (
-                            <div className="flex items-center gap-2 text-sm text-purple-500">
-                              <Sparkles className="h-3 w-3 animate-pulse" />
-                              <span>Analyzing images with AI...</span>
-                            </div>
-                          )}
-                          {scan.status === "completed" && scan.total_items > 0 && (
-                            <div className="text-right text-sm">
-                              <p className="font-medium">{scan.total_items} items found</p>
-                              {scan.processed_items > 0 && (
-                                <p className="text-muted-foreground">{scan.processed_items} analyzed</p>
+                        {hasOutcomes && (
+                          <div className="px-4 pb-4 space-y-2">
+                            <div className="text-xs text-muted-foreground">
+                              Dealers:{" "}
+                              <span className="font-medium text-foreground">{withAds}</span> with ads
+                              {" · "}
+                              {noAds} no ads
+                              {problems.length > 0 && (
+                                <>
+                                  {" · "}
+                                  <span className="text-amber-500">
+                                    {problems.length} not fully scanned
+                                  </span>
+                                </>
                               )}
                             </div>
-                          )}
-                          <Badge variant={
-                            scan.status === "completed" ? "default" :
-                            scan.status === "running" ? "secondary" :
-                            scan.status === "analyzing" ? "secondary" :
-                            scan.status === "failed" ? "destructive" : "outline"
-                          }>
-                            {scan.status}
-                          </Badge>
-                          {scan.status === "completed" && (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => {
-                                setActiveTab("results");
-                                loadMatches();
-                              }}
-                            >
-                              <Eye className="h-3 w-3 mr-1" />
-                              View Results
-                            </Button>
-                          )}
-                        </div>
+                            {problems.length > 0 && (
+                              <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-2.5">
+                                <div className="flex items-center gap-1.5 text-xs font-medium text-amber-500">
+                                  <AlertTriangle className="h-3.5 w-3.5" />
+                                  Timed out or couldn&apos;t be scraped — re-run to check these:
+                                </div>
+                                <p className="mt-1 text-xs text-muted-foreground">
+                                  {problems.slice(0, 12).join(", ")}
+                                  {problems.length > 12
+                                    ? `, +${problems.length - 12} more`
+                                    : ""}
+                                </p>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </CardContent>

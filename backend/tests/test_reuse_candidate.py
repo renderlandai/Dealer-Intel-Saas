@@ -166,6 +166,80 @@ class TestFindReusableScan:
         assert result is not None
         assert result["job_id"] == J_NEW
 
+    def test_succeeded_empty_dealer_counts_as_covered(self):
+        from app.routers import scanning
+
+        # Dealer was cleanly scanned but had no live ads: no discovered
+        # images, but a recorded "succeeded" outcome. Reuse should still
+        # be offered so we don't pay to re-scrape a known-empty dealer.
+        store = {
+            "distributors": [
+                {"id": D1, "status": "active", "facebook_url": "https://fb.com/d1"},
+            ],
+            "scan_jobs": [{
+                "id": J_NEW, "completed_at": "2026-06-03T00:00:00Z",
+                "metadata": {"dealer_outcomes": {
+                    "https://fb.com/d1": {"status": "succeeded", "ad_count": 0},
+                }},
+            }],
+            "discovered_images": [],
+        }
+        with _patched(store):
+            result = _run(scanning.find_reusable_scan(ORG_A_ID, "facebook", [D1]))
+
+        assert result is not None
+        assert result["job_id"] == J_NEW
+        assert result["image_count"] == 0
+
+    def test_timeout_dealer_not_covered(self):
+        from app.routers import scanning
+
+        # A timed-out (or otherwise failed) dealer must NOT count as
+        # covered — we want it re-scanned, not silently reported clean.
+        for bad in ("timeout", "error", "failed", "no_dataset", "skipped"):
+            store = {
+                "distributors": [
+                    {"id": D1, "status": "active", "facebook_url": "https://fb.com/d1"},
+                ],
+                "scan_jobs": [{
+                    "id": J_NEW, "completed_at": "2026-06-03T00:00:00Z",
+                    "metadata": {"dealer_outcomes": {
+                        "https://fb.com/d1": {"status": bad, "ad_count": 0},
+                    }},
+                }],
+                "discovered_images": [],
+            }
+            with _patched(store):
+                result = _run(scanning.find_reusable_scan(ORG_A_ID, "facebook", [D1]))
+            assert result is None, f"{bad!r} should not be covered"
+
+    def test_mixed_images_and_succeeded_empty_coverage(self):
+        from app.routers import scanning
+
+        # D1 yielded ads (images); D2 was cleanly scanned but empty.
+        # Both requested -> full coverage via the two different signals.
+        store = {
+            "distributors": [
+                {"id": D1, "status": "active", "facebook_url": "https://fb.com/d1"},
+                {"id": D2, "status": "active", "facebook_url": "https://fb.com/d2"},
+            ],
+            "scan_jobs": [{
+                "id": J_NEW, "completed_at": "2026-06-03T00:00:00Z",
+                "metadata": {"dealer_outcomes": {
+                    "https://fb.com/d2": {"status": "succeeded", "ad_count": 0},
+                }},
+            }],
+            "discovered_images": [
+                {"scan_job_id": J_NEW, "distributor_id": D1},
+            ],
+        }
+        with _patched(store):
+            result = _run(scanning.find_reusable_scan(ORG_A_ID, "facebook", [D1, D2]))
+
+        assert result is not None
+        assert result["job_id"] == J_NEW
+        assert result["dealer_count"] == 2
+
     def test_none_on_partial_coverage(self):
         from app.routers import scanning
 
