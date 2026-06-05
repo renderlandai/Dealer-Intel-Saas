@@ -543,9 +543,21 @@ async def _localize_and_crop_assets(
         full_img = full_img.convert("RGB")
     page_w, page_h = full_img.size
 
+    # Cost guardrail: CV-match at most N assets per page. matchTemplate is run
+    # once per asset against the full-page screenshot, so an unbounded asset
+    # list on a tall page is what blew the per-page extract budget.
+    max_assets = settings.cv_localize_max_assets_per_page
+    assets_to_match = campaign_assets
+    if max_assets and len(campaign_assets) > max_assets:
+        log.info(
+            "CV localization: capping %d assets to %d for this page",
+            len(campaign_assets), max_assets,
+        )
+        assets_to_match = campaign_assets[:max_assets]
+
     cropped: List[Dict[str, Any]] = []
 
-    for asset in campaign_assets:
+    for asset in assets_to_match:
         asset_url = asset.get("file_url", "")
         asset_name = asset.get("name", "unnamed")
         if not asset_url:
@@ -558,7 +570,15 @@ async def _localize_and_crop_assets(
             continue
 
         log.debug("Searching for '%s' on page (%dx%d)", asset_name, page_w, page_h)
-        matches = cv_matching.find_asset_on_page(screenshot_bytes, asset_bytes)
+        # Offload the synchronous OpenCV work to a worker thread so it does not
+        # block the event loop (which froze every other concurrent dealer) and
+        # so the per-page extract sub-cap can actually cancel the await.
+        matches = await asyncio.to_thread(
+            cv_matching.find_asset_on_page,
+            screenshot_bytes,
+            asset_bytes,
+            max_match_dim=settings.cv_localize_max_screenshot_dim,
+        )
 
         if not matches:
             log.info("'%s' not found on page", asset_name)

@@ -239,6 +239,18 @@ class Settings(BaseSettings):
     # (eval/) and the operator has manually inspected at least 50
     # crop-derived matches without finding a false positive.
     cv_localize_screenshot_crops_enabled: bool = Field(default=False, description="Crop campaign assets out of blocked-page screenshots via CV and re-feed them through the matcher (DANGEROUS — produces confirmation-bias false positives)")
+    # 2026-06-05: per-page CV localization (`_localize_and_crop_assets`) runs
+    # synchronous OpenCV (multi-scale matchTemplate + ORB) for every campaign
+    # asset against the page's full-page screenshot. On tall rental/catalog
+    # pages the screenshot is enormous (e.g. 1920x20000) and matchTemplate cost
+    # scales with screenshot AREA × asset-scale-steps, so a single page could
+    # burn minutes of CPU. Worse, the call was made inline on the event loop,
+    # so it (a) overran the per-page extract sub-cap (the cancel can't preempt a
+    # blocking C call — pages ran ~186s under a 120s cap) and (b) froze every
+    # other concurrent dealer. These two knobs bound the worst case; the call is
+    # now also offloaded to a worker thread so the cap can actually cancel it.
+    cv_localize_max_assets_per_page: int = Field(default=12, description="Cap on how many campaign assets are CV-matched against a single page screenshot (cost guardrail)")
+    cv_localize_max_screenshot_dim: int = Field(default=4000, description="Downscale the page screenshot so its longest side is at most this many px before OpenCV matching; bbox coords are scaled back to full-page space (0 disables the cap)")
     
     # Page Discovery
     enable_page_discovery: bool = Field(default=True, description="Auto-discover subpages on dealer sites")
@@ -351,7 +363,14 @@ class Settings(BaseSettings):
     #     don't have to read worker logs.
     # 0 disables the corresponding sub-cap (legacy behaviour — falls
     # back to the outer `page_hard_timeout_seconds`).
-    page_extract_timeout_seconds: int = Field(default=120, description="Cancel a single page's Playwright extraction after this many seconds (0 = no inner cap)")
+    # 2026-06-05: raised 120 → 240. Tall rental/catalog pages (the sector the
+    # client explicitly wants scanned) legitimately need more than 120s to load,
+    # scroll, screenshot, and CV-localize. Combined with the same-day CV fix
+    # (OpenCV offloaded off the event loop + screenshot downscaled before
+    # matching), 240s gives heavy pages room to finish and return images instead
+    # of being abandoned at 0. Stays under `page_hard_timeout_seconds` (480) so
+    # the per-dealer budget math is unchanged.
+    page_extract_timeout_seconds: int = Field(default=240, description="Cancel a single page's Playwright extraction after this many seconds (0 = no inner cap)")
     page_analyze_timeout_seconds: int = Field(default=300, description="Cancel a single page's per-image AI analysis after this many seconds (0 = no inner cap)")
     # Hard cap on a single dealer (all its pages, plus prep / teardown).
     # The `_process_one_dealer` task is wrapped in `asyncio.wait_for` so a

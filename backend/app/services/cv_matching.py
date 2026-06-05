@@ -45,6 +45,36 @@ def _bytes_to_gray(img_bytes: bytes) -> np.ndarray:
     return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 
+# 2026-06-05: default cap on the longest side of the screenshot fed into
+# matchTemplate. matchTemplate cost scales with screenshot AREA, so tall
+# rental/catalog pages (1920x20000+) cost 10-25x a normal page and routinely
+# blew the per-page extract budget. ``find_asset_on_page`` downscales the
+# screenshot (and the asset, to preserve relative scale) below this cap, runs
+# the match, and scales the resulting bounding boxes back to full-page space.
+DEFAULT_MAX_MATCH_DIM = 4000
+
+
+def _downscale_factor(gray: np.ndarray, max_dim: int) -> float:
+    """Return a <=1.0 factor that brings the longest side to ``max_dim``."""
+    if not max_dim or max_dim <= 0:
+        return 1.0
+    longest = max(gray.shape[:2])
+    if longest <= max_dim:
+        return 1.0
+    return max_dim / float(longest)
+
+
+def _resize_gray(gray: np.ndarray, factor: float) -> np.ndarray:
+    if factor >= 1.0:
+        return gray
+    h, w = gray.shape[:2]
+    return cv2.resize(
+        gray,
+        (max(1, int(w * factor)), max(1, int(h * factor))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 def template_match(
     screenshot_bytes: bytes,
     asset_bytes: bytes,
@@ -74,11 +104,22 @@ def template_match(
     cleanly will simply produce zero crops — preferable to producing
     junk crops that publish as STRONG MATCH.
     """
-    screenshot = _bytes_to_cv(screenshot_bytes)
-    asset = _bytes_to_cv(asset_bytes)
-    ss_gray = cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
-    asset_gray = cv2.cvtColor(asset, cv2.COLOR_BGR2GRAY)
+    ss_gray = _bytes_to_gray(screenshot_bytes)
+    asset_gray = _bytes_to_gray(asset_bytes)
+    return _template_match_gray(
+        ss_gray, asset_gray,
+        scale_range=scale_range, scale_steps=scale_steps, threshold=threshold,
+    )
 
+
+def _template_match_gray(
+    ss_gray: np.ndarray,
+    asset_gray: np.ndarray,
+    scale_range: Tuple[float, float] = (0.10, 1.8),
+    scale_steps: int = 50,
+    threshold: float = 0.70,
+) -> List[Dict[str, Any]]:
+    """Template-match on pre-decoded grayscale arrays (see ``template_match``)."""
     ss_h, ss_w = ss_gray.shape[:2]
     a_h, a_w = asset_gray.shape[:2]
 
@@ -142,11 +183,21 @@ def feature_match(
     Returns a list of match dicts (usually 0 or 1 items).
     Each dict: {x, y, width, height, confidence, method, good_matches}.
     """
-    screenshot = _bytes_to_cv(screenshot_bytes)
-    asset = _bytes_to_cv(asset_bytes)
-    ss_gray = cv2.cvtColor(screenshot, cv2.COLOR_BGR2GRAY)
-    asset_gray = cv2.cvtColor(asset, cv2.COLOR_BGR2GRAY)
+    ss_gray = _bytes_to_gray(screenshot_bytes)
+    asset_gray = _bytes_to_gray(asset_bytes)
+    return _feature_match_gray(
+        ss_gray, asset_gray,
+        min_good_matches=min_good_matches, ratio_thresh=ratio_thresh,
+    )
 
+
+def _feature_match_gray(
+    ss_gray: np.ndarray,
+    asset_gray: np.ndarray,
+    min_good_matches: int = 18,
+    ratio_thresh: float = 0.72,
+) -> List[Dict[str, Any]]:
+    """Feature-match on pre-decoded grayscale arrays (see ``feature_match``)."""
     orb = cv2.ORB_create(nfeatures=2000)
 
     kp_asset, desc_asset = orb.detectAndCompute(asset_gray, None)
@@ -236,29 +287,50 @@ def find_asset_on_page(
     asset_bytes: bytes,
     template_threshold: float = 0.70,
     feature_min_matches: int = 18,
+    max_match_dim: int = DEFAULT_MAX_MATCH_DIM,
 ) -> List[Dict[str, Any]]:
     """
     Combined matching: try template matching first (faster, more precise
     for exact renders), fall back to feature matching (handles more
     visual variation).
 
+    The screenshot is decoded once and downscaled so its longest side is at
+    most ``max_match_dim`` px before matching (the asset is downscaled by the
+    same factor to preserve relative scale). This bounds OpenCV cost on tall
+    catalog pages; resulting bounding boxes are scaled back to full-page space.
+    Pass ``max_match_dim=0`` to disable downscaling.
+
     Returns all found locations sorted by confidence.
     """
     results: List[Dict[str, Any]] = []
 
     try:
-        t_matches = template_match(
-            screenshot_bytes, asset_bytes,
-            threshold=template_threshold,
+        ss_gray_full = _bytes_to_gray(screenshot_bytes)
+        asset_gray_full = _bytes_to_gray(asset_bytes)
+    except Exception as e:
+        log.error("CV decode error: %s", e)
+        return []
+
+    factor = _downscale_factor(ss_gray_full, max_match_dim)
+    ss_gray = _resize_gray(ss_gray_full, factor)
+    asset_gray = _resize_gray(asset_gray_full, factor)
+    if factor < 1.0:
+        log.debug(
+            "Downscaled screenshot %dx%d by %.3f for CV matching",
+            ss_gray_full.shape[1], ss_gray_full.shape[0], factor,
+        )
+
+    try:
+        t_matches = _template_match_gray(
+            ss_gray, asset_gray, threshold=template_threshold,
         )
         results.extend(t_matches)
     except Exception as e:
         log.error("Template matching error: %s", e)
 
     try:
-        f_matches = feature_match(
-            screenshot_bytes, asset_bytes,
-            min_good_matches=feature_min_matches,
+        f_matches = _feature_match_gray(
+            ss_gray, asset_gray, min_good_matches=feature_min_matches,
         )
         for fm in f_matches:
             overlaps = False
@@ -274,6 +346,16 @@ def find_asset_on_page(
                 results.extend(f_matches)
     except Exception as e:
         log.error("Feature matching error: %s", e)
+
+    # Map bounding boxes from the downscaled match space back to full-page
+    # screenshot coordinates so the caller crops the right region.
+    if factor < 1.0 and results:
+        inv = 1.0 / factor
+        for r in results:
+            r["x"] = int(r["x"] * inv)
+            r["y"] = int(r["y"] * inv)
+            r["width"] = int(r["width"] * inv)
+            r["height"] = int(r["height"] * inv)
 
     results.sort(key=lambda r: r["confidence"], reverse=True)
     return results
