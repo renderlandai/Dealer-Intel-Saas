@@ -137,14 +137,64 @@ def _mark_failed(job_id: str, message: str) -> None:
         log.error("Could not mark %s failed: %s", job_id, e, exc_info=True)
 
 
+# Grace re-check budget for the insert→dispatch-persist race (see
+# `_await_dispatch`). 5 × 1.5s = 7.5s, comfortably longer than the API request
+# that inserts the row and then persists `metadata.dispatch`, yet trivial next
+# to the 20-minute idle cleanup window.
+_DISPATCH_GRACE_ATTEMPTS = 5
+_DISPATCH_GRACE_SLEEP_SECONDS = 1.5
+
+
+async def _await_dispatch(job_id: str) -> Optional[Dict[str, Any]]:
+    """Re-read a claimed row's dispatch payload a few times before giving up.
+
+    Closes a write-after-claim race: a scan row is inserted with
+    ``status='pending'`` (immediately claimable) a beat BEFORE the API writes
+    ``metadata.dispatch`` (the create flow is insert → build args →
+    ``dispatch_task`` → ``_persist_dispatch_args``). A fast worker can win the
+    claim in that window and see no dispatch yet, even though one lands
+    milliseconds later. Re-reading the row with a short grace lets the
+    slightly-late persist arrive. Only a row that *truly* never gets a
+    dispatch (e.g. the persist itself failed) returns None here and is then
+    hard-failed by the caller.
+    """
+    for attempt in range(1, _DISPATCH_GRACE_ATTEMPTS + 1):
+        await asyncio.sleep(_DISPATCH_GRACE_SLEEP_SECONDS)
+        try:
+            refreshed = supabase.table("scan_jobs") \
+                .select("id, source, metadata") \
+                .eq("id", job_id) \
+                .single() \
+                .execute()
+        except Exception as e:
+            log.warning(
+                "Dispatch re-read failed for %s (attempt %d/%d): %s",
+                job_id, attempt, _DISPATCH_GRACE_ATTEMPTS, e,
+            )
+            continue
+        dispatch = _extract_dispatch(refreshed.data or {})
+        if dispatch is not None:
+            log.info(
+                "Dispatch payload for %s landed after grace (attempt %d/%d)",
+                job_id, attempt, _DISPATCH_GRACE_ATTEMPTS,
+            )
+            return dispatch
+    return None
+
+
 async def _process_one_job(job: Dict[str, Any]) -> None:
     """Run a single claimed job to completion (success OR failure)."""
     job_id = job["id"]
     source = job.get("source") or "unknown"
     dispatch = _extract_dispatch(job)
     if dispatch is None:
+        # Possible insert→dispatch-persist race — give the late write a
+        # brief window to land before treating the row as unrunnable.
+        dispatch = await _await_dispatch(job_id)
+    if dispatch is None:
         log.error(
-            "Claimed %s but it has no replayable dispatch payload — failing",
+            "Claimed %s but it still has no replayable dispatch payload "
+            "after grace — failing",
             job_id,
         )
         _mark_failed(job_id, "Worker: no dispatch args on row")
