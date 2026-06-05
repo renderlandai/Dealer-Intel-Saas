@@ -242,7 +242,15 @@ class Settings(BaseSettings):
     
     # Page Discovery
     enable_page_discovery: bool = Field(default=True, description="Auto-discover subpages on dealer sites")
-    max_pages_per_site: int = Field(default=15, description="Max pages to scan per dealer website")
+    # 2026-06-05: dropped 15 → 8. Campaign creative lives on the homepage
+    # and a handful of promo/landing pages (/specials, /deals, /offers,
+    # /promotions); it does NOT live on deep catalog / fleet / inventory
+    # listing pages. Since `discover_pages` fills promo paths FIRST and
+    # truncates to this cap, a smaller budget biases the scan toward the
+    # ad-bearing pages and drops the heavy catalog tail — which also slashes
+    # the per-scan CPU load on the 2-vCPU worker (those catalog pages were
+    # the ones blowing past `page_extract_timeout_seconds`).
+    max_pages_per_site: int = Field(default=8, description="Max pages to scan per dealer website")
     # Phase-9 follow-up (2026-05-11): the previous design ran
     # `discover_pages` for every dealer SERIALLY in a single loop with
     # no heartbeat inside it. A single hung dealer (e.g. generaldeequipos.com
@@ -261,20 +269,30 @@ class Settings(BaseSettings):
     # Phase 5-minimal: how many dealers `run_website_scan` processes in
     # parallel. Each dealer owns its own MatchBuffer / ProcessedImageBuffer
     # and a per-dealer pipeline_stats dict; the runner aggregates after the
-    # gather. Browser memory is the practical ceiling — Chromium contexts
-    # are cheap, but each concurrent dealer also keeps a hash + embedding
-    # working set in flight. 4 fits comfortably on a 4 GB worker; bump to
-    # 6–8 if you move the worker to professional-l (8 GB).
-    max_concurrent_dealers: int = Field(default=4, description="Max dealers processed in parallel inside run_website_scan")
+    # gather.
+    #
+    # 2026-06-05: dropped 4 → 2. The REAL ceiling is CPU, not RAM. Playwright
+    # extraction (render + scroll + full-page screenshot + image decode) is
+    # CPU-bound, and the production worker has only 2 dedicated vCPUs. The
+    # extract semaphore is sized `max_concurrent_dealers * pages_per_dealer`,
+    # so 4×4=16 simultaneous Chromium renders on 2 cores = 8× oversubscription,
+    # which stretched ~25s pages past the 120s extract sub-cap and got them
+    # discarded with zero images. 2×2=4 keeps it at a sane 2× and lets pages
+    # finish under the cap. Bump these back up only on a worker with more
+    # dedicated vCPUs (rule of thumb: keep extract_sem ≲ 2 × vCPUs).
+    max_concurrent_dealers: int = Field(default=2, description="Max dealers processed in parallel inside run_website_scan")
     # Inner-loop concurrency added in the Phase-7 throughput pass:
     # within each dealer task we now fan pages out instead of walking them
     # serially, and within each page we fan the per-image AI pipeline out
     # instead of awaiting one image at a time. The two semaphores are
-    # multiplicative — at default (4 dealers × 4 pages × 5 images) you'll
-    # see at most ~80 in-flight image-analysis coroutines per worker, which
+    # multiplicative — at default (2 dealers × 2 pages × 5 images) you'll
+    # see at most ~20 in-flight image-analysis coroutines per worker, which
     # comfortably stays under Anthropic tier-2 limits (50 concurrent Opus
     # calls + ample Haiku headroom). Drop these if you ever see 429 storms.
-    pages_per_dealer_concurrency: int = Field(default=4, description="Max pages scanned in parallel within a single dealer")
+    # 2026-06-05: dropped 4 → 2 alongside `max_concurrent_dealers` so the
+    # extract semaphore (max_concurrent_dealers × this) stays at 4 on the
+    # 2-vCPU worker instead of 16. See the note on `max_concurrent_dealers`.
+    pages_per_dealer_concurrency: int = Field(default=2, description="Max pages scanned in parallel within a single dealer")
     images_per_page_concurrency: int = Field(default=5, description="Max images analysed in parallel within a single extracted page")
     # Concurrency for the post-scan analyse pass that Facebook / Google /
     # Instagram / manual analyse paths use. Previously sequential, which
@@ -341,10 +359,10 @@ class Settings(BaseSettings):
     #
     # Phase-9 (2026-05-11): dropped from 2700 → 1500 once the per-page
     # sub-caps lowered the worst-case page time. New math at default
-    # settings (`max_pages_per_site=15`, `pages_per_dealer_concurrency=4`,
+    # settings (`max_pages_per_site=8`, `pages_per_dealer_concurrency=2`,
     # worst-case page = `page_hard_timeout_seconds=480`):
-    #     ceil(15/4) * 480s = 4 * 480s = 1920s   (theoretical max)
-    # Real dealers don't run 4 worst-case pages in parallel — typical
+    #     ceil(8/2) * 480s = 4 * 480s = 1920s   (theoretical max)
+    # Real dealers don't run worst-case pages back to back — typical
     # mix is 3-4 fast pages per slow one, so 1500s gives the typical
     # dealer huge headroom and kills only the truly pathological one.
     # That is exactly the desired behaviour for 40-dealer batches:
