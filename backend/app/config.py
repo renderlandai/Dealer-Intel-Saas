@@ -251,6 +251,20 @@ class Settings(BaseSettings):
     # now also offloaded to a worker thread so the cap can actually cancel it.
     cv_localize_max_assets_per_page: int = Field(default=12, description="Cap on how many campaign assets are CV-matched against a single page screenshot (cost guardrail)")
     cv_localize_max_screenshot_dim: int = Field(default=4000, description="Downscale the page screenshot so its longest side is at most this many px before OpenCV matching; bbox coords are scaled back to full-page space (0 disables the cap)")
+    # 2026-06-05: CV localization is best-effort enrichment that runs AFTER the
+    # directly-extracted <img> creatives are already persisted, so it gets its
+    # own wall-clock cap. On timeout we keep the saved images and skip the crops
+    # rather than letting CV consume the whole per-page extract budget (which
+    # used to discard a page's real images when the sub-cap cancelled mid-CV).
+    cv_localize_timeout_seconds: int = Field(default=60, description="Per-page wall-clock cap on CV localization; on timeout the directly-extracted images are kept and crops are skipped (0 = no cap)")
+    # Cap on the full-page evidence screenshot so a slow capture on a tall page
+    # can't blow the extract budget before the extracted images are flushed.
+    website_screenshot_timeout_seconds: int = Field(default=45, description="Per-page cap on the full-page evidence screenshot (0 = no cap)")
+    # 2026-06-05: dropped the implicit 20-scroll default. On infinite-scroll
+    # catalog/fleet pages, 20 scrolls balloon the DOM and the resulting
+    # full-page screenshot, which is what pushed heavy pages past the extract
+    # sub-cap. Campaign creative sits near the top; 6 scrolls is plenty.
+    website_scroll_max_steps: int = Field(default=6, description="Max scroll steps when loading a dealer website page before extracting images")
     
     # Page Discovery
     enable_page_discovery: bool = Field(default=True, description="Auto-discover subpages on dealer sites")

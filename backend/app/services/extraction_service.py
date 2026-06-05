@@ -871,7 +871,7 @@ async def _attempt_extraction(
 
         await asyncio.sleep(2)
         await _dismiss_overlays(page)
-        await _scroll_to_bottom(page)
+        await _scroll_to_bottom(page, max_scrolls=settings.website_scroll_max_steps)
         try:
             await page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
@@ -885,26 +885,30 @@ async def _attempt_extraction(
                 images.append(img)
 
         page_height = await page.evaluate("document.body.scrollHeight")
-        screenshot_bytes = await page.screenshot(full_page=True, type="png")
-        evidence_url = await _upload_screenshot(
-            screenshot_bytes, scan_job_id, f"{url}#_{viewport_label}",
-        )
 
-        if campaign_assets:
-            localized = await _localize_and_crop_assets(
-                screenshot_bytes, scan_job_id, campaign_assets,
+        # Best-effort evidence screenshot, bounded so a slow full-page capture
+        # on a tall page cannot, on its own, blow the per-page extract budget
+        # before we persist the real images below.
+        screenshot_bytes: Optional[bytes] = None
+        shot_timeout = float(getattr(settings, "website_screenshot_timeout_seconds", 0) or 0)
+        try:
+            shot_coro = page.screenshot(full_page=True, type="png")
+            screenshot_bytes = (
+                await asyncio.wait_for(shot_coro, timeout=shot_timeout)
+                if shot_timeout > 0 else await shot_coro
             )
-            images.extend(localized)
-            log.info("CV localization added %d cropped creative(s)", len(localized))
+            evidence_url = await _upload_screenshot(
+                screenshot_bytes, scan_job_id, f"{url}#_{viewport_label}",
+            )
+        except Exception as e:
+            log.warning(
+                "Evidence screenshot failed/timed out for %s (%s): %s",
+                url, viewport_label, e,
+            )
 
-        log.info(
-            "Found %d images+sections (%s) on %s",
-            len(images), viewport_label, url,
-        )
-
-        for img in images:
+        def _buffer_image(img: Dict[str, Any]) -> bool:
             if img["src"] in seen_srcs:
-                continue
+                return False
             seen_srcs.add(img["src"])
             location = _classify_location(img["y"], page_height)
             img_buffer.add({
@@ -927,7 +931,54 @@ async def _attempt_extraction(
                     "evidence_screenshot_url": evidence_url,
                 },
             })
-            added += 1
+            return True
+
+        # Persist the directly-extracted <img>/section creatives IMMEDIATELY.
+        # flush() is a synchronous DB write, so even if the per-page extract
+        # sub-cap cancels us during the CV-localization step below, these rows
+        # are already in `discovered_images` and get analysed (the analyse phase
+        # reads by scan_job_id). 2026-06-05: fixes pages full of large images
+        # returning 0 on timeout — the images were found but discarded because
+        # buffering happened only after the slow screenshot + CV phase.
+        for img in images:
+            if _buffer_image(img):
+                added += 1
+        img_buffer.flush()
+
+        log.info(
+            "Persisted %d direct images (%s) on %s",
+            added, viewport_label, url,
+        )
+
+        # CV localization is best-effort enrichment ON TOP of the saved images.
+        # It is bounded by its own timeout (the OpenCV work itself already runs
+        # in a worker thread) so it can never consume the page's extract budget.
+        if campaign_assets and screenshot_bytes is not None:
+            cv_timeout = float(getattr(settings, "cv_localize_timeout_seconds", 0) or 0)
+            try:
+                cv_coro = _localize_and_crop_assets(
+                    screenshot_bytes, scan_job_id, campaign_assets,
+                )
+                localized = (
+                    await asyncio.wait_for(cv_coro, timeout=cv_timeout)
+                    if cv_timeout > 0 else await cv_coro
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "CV localization exceeded %.0fs on %s — keeping %d direct images, skipping crops",
+                    cv_timeout, url, added,
+                )
+                localized = []
+            except Exception as e:
+                log.warning("CV localization failed for %s: %s", url, e)
+                localized = []
+            cv_added = 0
+            for img in localized:
+                if _buffer_image(img):
+                    added += 1
+                    cv_added += 1
+            if cv_added:
+                log.info("CV localization added %d cropped creative(s) on %s", cv_added, url)
 
     except Exception as e:
         outcome, reason = _classify_playwright_error(e)
