@@ -311,7 +311,19 @@ class Settings(BaseSettings):
     # ad-bearing pages and drops the heavy catalog tail — which also slashes
     # the per-scan CPU load on the 2-vCPU worker (those catalog pages were
     # the ones blowing past `page_extract_timeout_seconds`).
-    max_pages_per_site: int = Field(default=8, description="Max pages to scan per dealer website")
+    # 2026-06-08: dropped 8 → 4. At 8 the worst-case per-dealer wall-clock
+    # (`ceil(8/2) * page_hard_timeout_seconds` = 4 * 480 = 1920s) *exceeded*
+    # the 1500s `dealer_hard_timeout_seconds` cap, so a dealer running
+    # back-to-back slow pages could trip its own hard kill before finishing.
+    # At 4 the worst case is `ceil(4/2) * 480` = 960s, comfortably under the
+    # 1500s cap, which removes the entire dealer-level-timeout failure mode
+    # and roughly halves per-scan cost (fewer extractions + Anthropic calls).
+    # The pages dropped are the lower-priority promo tail (`discover_pages`
+    # keeps the homepage + top promo paths first), so coverage of ad-bearing
+    # pages is largely preserved. Note: this does NOT change peak CPU load —
+    # that is bound by concurrency (`max_concurrent_dealers` ×
+    # `pages_per_dealer_concurrency`), not page count.
+    max_pages_per_site: int = Field(default=4, description="Max pages to scan per dealer website")
     # Phase-9 follow-up (2026-05-11): the previous design ran
     # `discover_pages` for every dealer SERIALLY in a single loop with
     # no heartbeat inside it. A single hung dealer (e.g. generaldeequipos.com
@@ -426,10 +438,14 @@ class Settings(BaseSettings):
     # pathological dealer cannot starve the rest of the scan. 0 disables.
     #
     # Phase-9 (2026-05-11): dropped from 2700 → 1500 once the per-page
-    # sub-caps lowered the worst-case page time. New math at default
-    # settings (`max_pages_per_site=8`, `pages_per_dealer_concurrency=2`,
+    # sub-caps lowered the worst-case page time.
+    # 2026-06-08: with `max_pages_per_site` lowered 8 → 4 the worst-case
+    # math now sits safely inside this cap. At default settings
+    # (`max_pages_per_site=4`, `pages_per_dealer_concurrency=2`,
     # worst-case page = `page_hard_timeout_seconds=480`):
-    #     ceil(8/2) * 480s = 4 * 480s = 1920s   (theoretical max)
+    #     ceil(4/2) * 480s = 2 * 480s = 960s   (theoretical max)
+    # That is < 1500s, so the dealer cap is now a true backstop rather
+    # than something a merely-slow (not pathological) dealer can trip.
     # Real dealers don't run worst-case pages back to back — typical
     # mix is 3-4 fast pages per slow one, so 1500s gives the typical
     # dealer huge headroom and kills only the truly pathological one.
@@ -440,7 +456,21 @@ class Settings(BaseSettings):
     # Heartbeat freshness threshold the cleanup job uses to decide a scan
     # is truly stuck. Was hard-coded to 4h; making it configurable so a
     # tenant scanning hundreds of dealers can give scans more leash.
-    scan_idle_timeout_minutes: int = Field(default=20, description="Mark a running scan failed if its heartbeat is older than this many minutes")
+    #
+    # 2026-06-08: raised 20 → 30. INVARIANT: this MUST stay strictly
+    # greater than `dealer_hard_timeout_seconds` (1500s = 25min), with
+    # margin. The cleanup job stamps a heartbeat at each page-extraction
+    # start and each page completion, but a single legitimately-slow
+    # rental/catalog dealer can work right up to its 25-min per-dealer
+    # hard cap. At the old 20-min idle threshold the cleanup could
+    # pre-empt a dealer that was still inside its own budget — observed
+    # in the 2026-06-05 40-dealer scan (eb448f94): 35/40 dealers done,
+    # the slowest at 1453s (24.2min, grazing the cap), 5 still pending,
+    # and the whole scan was idle-killed with "heartbeat older than 20m"
+    # even though every dealer-level backstop was working. 30min sits
+    # safely above the 25-min dealer cap so the per-dealer timeout — not
+    # the global idle sweep — is what bounds a pathological dealer.
+    scan_idle_timeout_minutes: int = Field(default=30, description="Mark a running scan failed if its heartbeat is older than this many minutes (MUST be > dealer_hard_timeout_seconds)")
     
     # ===========================================
     # Reports
