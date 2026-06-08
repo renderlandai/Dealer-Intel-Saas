@@ -250,7 +250,7 @@ def _check_score_drift(report, runner, m, bl, cfg):
     Option-B-style prompt restructure that doesn't change verdicts but
     poisons your adaptive thresholds.
     """
-    if runner not in ("opus_detect", "verify"):
+    if runner not in ("opus_detect", "opus_compare", "multi_asset", "verify"):
         return
     drifted_count = 0
     for case_id, current_per in m.per_case.items():

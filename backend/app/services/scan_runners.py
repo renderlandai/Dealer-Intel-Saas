@@ -52,6 +52,7 @@ from .bulk_writers import (
     ProcessedImageBuffer,
     bulk_mark_images_processed,
 )
+from . import cost_tracker
 from .cost_tracker import scan_cost_context, ScanCostTracker
 from .notification_service import (
     notify_scan_complete,
@@ -651,6 +652,24 @@ async def _analyze_single_image(
     should self-perpetuate); both callers happily accept the tuple.
     """
     try:
+        # Cost circuit-breaker: once this scan's tracked spend crosses the
+        # configured cap (settings.scan_cost_cap_usd), stop feeding images
+        # into the expensive Opus pipeline. This bounds runaway spend to
+        # roughly the cap plus whatever is already in flight, instead of
+        # letting a pathological multi-asset scan bill unbounded comparison
+        # calls (the 2026-06-08 $275 incident). Skipped images are counted
+        # under the "cost_capped" funnel stage rather than silently dropped.
+        if cost_tracker.cap_exceeded():
+            if pipeline_stats.get("cost_capped", 0) == 0:
+                log.warning(
+                    "Cost cap reached (tracked $%.2f) — short-circuiting "
+                    "remaining images for scan %s. Raise settings.scan_cost_cap_usd "
+                    "if this scan is legitimately large.",
+                    cost_tracker.current_total_usd(), scan_job_id,
+                )
+            pipeline_stats["cost_capped"] = pipeline_stats.get("cost_capped", 0) + 1
+            return None
+
         # Surface the upstream extraction method so the AI pipeline
         # can apply stricter pre-filters to CV-localized crops (which
         # have already been geometrically pre-selected for asset-
@@ -1244,6 +1263,7 @@ async def _process_one_page(
             getattr(settings, "enable_containment_fallback", True)
             and not page_matched_assets
             and not analyze_timed_out
+            and not cost_tracker.cap_exceeded()
             and bool(evidence_url)
             and total_images_in_page > 0
             and len(campaign_assets) <= int(

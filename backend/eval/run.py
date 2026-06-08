@@ -106,9 +106,21 @@ async def _run_async(args) -> int:
     print(f"Report written to {report_path}")
 
     if args.update_baseline:
-        new_baseline = Baseline.from_metrics(metrics_by_runner, git_sha=_git_sha())
+        # Merge into any existing baseline so a partial run (e.g.
+        # `--stage opus_compare`) only refreshes the runners it actually
+        # executed instead of wiping the baselines for every other stage.
+        existing = Baseline.load(cfg.baseline_path)
+        merged = dict(existing.runner_metrics) if existing else {}
+        for runner_name, m in metrics_by_runner.items():
+            merged[runner_name] = m.as_dict()
+        new_baseline = Baseline(
+            captured_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            git_sha=_git_sha(),
+            runner_metrics=merged,
+        )
         new_baseline.save(cfg.baseline_path)
-        print(f"Baseline updated → {cfg.baseline_path}")
+        updated = ", ".join(sorted(metrics_by_runner))
+        print(f"Baseline updated ({updated}) → {cfg.baseline_path}")
         return 0
 
     if diff.gate_failed:

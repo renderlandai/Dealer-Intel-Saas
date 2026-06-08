@@ -164,7 +164,7 @@ def compute_metrics(result: RunnerResult, manifest: Manifest) -> Metrics:
             tp, fp, tn, fn = _bump_confusion(tp, fp, tn, fn, expected_pos, actual_pos)
             per_case["expected"] = {"is_relevant": expected_pos}
             per_case["actual"] = {"is_relevant": actual_pos}
-        elif result.runner in ("opus_detect", "verify"):
+        elif result.runner in ("opus_detect", "opus_compare", "multi_asset", "verify"):
             expected_pos = case.category in _DETECT_POSITIVE_CATEGORIES
             actual_pos = bool(case_result.is_match)
             tp, fp, tn, fn = _bump_confusion(tp, fp, tn, fn, expected_pos, actual_pos)
@@ -248,7 +248,7 @@ def _evaluate_case(runner: str, case: FixtureCase, result: CaseResult,
         )
         return bool(result.is_relevant) == bool(expected)
 
-    if runner in ("opus_detect", "verify"):
+    if runner in ("opus_detect", "opus_compare", "multi_asset", "verify"):
         if exp.is_match is None:
             # Fall back to category mapping when the manifest didn't
             # explicitly set is_match.

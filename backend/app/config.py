@@ -207,6 +207,41 @@ class Settings(BaseSettings):
     
     # Filter model — use a fast/cheap model for the relevance yes/no check
     filter_model: str = Field(default="claude-haiku-4-5-20251001", description="Cheap model for image relevance filtering")
+
+    # ===========================================
+    # Cost controls (2026-06-08 — runaway-spend guardrails)
+    # ===========================================
+    #
+    # Per-scan hard cost cap. Background: a 21-asset, 40-dealer website scan
+    # fanned out to 17,067 uncached Opus comparison calls and billed $275 —
+    # ~50× a normal scan — before an idle heartbeat auto-failed it. This cap
+    # is a circuit-breaker: once a single scan's tracked Anthropic+vendor cost
+    # crosses the threshold, the per-image pipeline short-circuits (returns
+    # "cost_capped" without making further Opus calls) so spend is bounded to
+    # roughly the cap plus whatever was already in flight. Normal scans
+    # historically cost <$20, so the $50 default gives generous headroom while
+    # catching the pathological case early. Raise it for large multi-asset
+    # business/enterprise sweeps; set to 0 to disable the breaker entirely.
+    scan_cost_cap_usd: float = Field(default=50.0, description="Abort the per-image pipeline once one scan's tracked vendor cost exceeds this many USD (0 = no cap)")
+
+    # ===========================================
+    # Multi-asset single-call matcher (EXPERIMENTAL — eval-gated, default OFF)
+    # ===========================================
+    #
+    # The legacy matcher compares each discovered image against every campaign
+    # asset in a SEPARATE Opus call (cost scales with images × assets). When a
+    # campaign has many creatives this multiplies cost dramatically and the
+    # repeated asset images never benefit from prompt caching. This flag swaps
+    # the non-screenshot comparison stage for a SINGLE Opus call per discovered
+    # image that sends ALL assets as one cacheable prefix and asks which asset
+    # (if any) matches — collapsing images × assets calls into images calls and
+    # letting the asset prefix cache across the whole scan.
+    #
+    # This CHANGES matcher reasoning (1:N instead of 1:1) and drops the
+    # per-pair perceptual-hash ensemble/veto, so it MUST clear backend/eval/
+    # (no recall/precision regression) before being enabled in production.
+    # Default OFF — the legacy per-asset path is unchanged when this is False.
+    enable_multi_asset_matching: bool = Field(default=False, description="EXPERIMENTAL: compare each image against ALL assets in one cached Opus call instead of one call per asset (eval-gate before enabling)")
     
     # ===========================================
     # Image Extraction (Playwright)

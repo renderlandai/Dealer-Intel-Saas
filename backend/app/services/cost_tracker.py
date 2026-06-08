@@ -84,6 +84,21 @@ def _pricing_from_env() -> Dict[str, float]:
     return out
 
 
+def _cost_cap_from_settings() -> Optional[float]:
+    """Read the configured per-scan cost cap, tolerating a missing settings env.
+
+    Kept lazy and guarded so unit tests can construct a tracker without a
+    fully-populated Settings environment (the tracker is dependency-light by
+    design — see module docstring).
+    """
+    try:
+        from ..config import get_settings
+
+        return float(get_settings().scan_cost_cap_usd)
+    except Exception:
+        return None
+
+
 def _anthropic_rate(model: str) -> Dict[str, float]:
     """Return (input, output) per-MTok USD rates for a model slug."""
     if not model:
@@ -127,10 +142,22 @@ class _LineItem:
 class ScanCostTracker:
     """Mutable bag of cost line items for one scan."""
 
-    def __init__(self, scan_job_id: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        scan_job_id: Optional[str] = None,
+        cost_cap_usd: Optional[float] = None,
+    ) -> None:
         self.scan_job_id = str(scan_job_id) if scan_job_id else None
         self._items: List[_LineItem] = []
         self._pricing = _pricing_from_env()
+        # Per-scan hard cost cap (circuit-breaker). When None we lazily read
+        # the configured default so existing call sites need no change.
+        if cost_cap_usd is None:
+            cost_cap_usd = _cost_cap_from_settings()
+        self.cost_cap_usd = cost_cap_usd
+        # Latches True once the cap is first crossed so we keep short-circuiting
+        # even if a rounding refund nudges total_usd back under the line.
+        self._cap_tripped = False
 
     # -- low-level ---------------------------------------------------------
 
@@ -269,6 +296,22 @@ class ScanCostTracker:
     def total_usd(self) -> float:
         return round(sum(li.cost_usd for li in self._items), 4)
 
+    @property
+    def cap_exceeded(self) -> bool:
+        """True once this scan's tracked spend has crossed its cost cap.
+
+        Returns False when no cap is configured (``cost_cap_usd`` is None/0).
+        Latches: once tripped it stays tripped for the life of the tracker.
+        """
+        if self._cap_tripped:
+            return True
+        cap = self.cost_cap_usd
+        if not cap or cap <= 0:
+            return False
+        if self.total_usd >= cap:
+            self._cap_tripped = True
+        return self._cap_tripped
+
     def by_vendor(self) -> Dict[str, float]:
         agg: Dict[str, float] = {}
         for li in self._items:
@@ -296,6 +339,22 @@ _current: contextvars.ContextVar[Optional[ScanCostTracker]] = contextvars.Contex
 def get_tracker() -> Optional[ScanCostTracker]:
     """Return the tracker bound to the current async context, if any."""
     return _current.get()
+
+
+def cap_exceeded() -> bool:
+    """True if the active scan's tracker has crossed its cost cap.
+
+    No-op safe: returns False when there is no tracker bound to the current
+    context (e.g. ad-hoc analyse calls outside a scan).
+    """
+    t = _current.get()
+    return bool(t is not None and t.cap_exceeded)
+
+
+def current_total_usd() -> float:
+    """Tracked spend for the active scan (0.0 when no tracker is bound)."""
+    t = _current.get()
+    return t.total_usd if t is not None else 0.0
 
 
 def record_anthropic(
@@ -363,8 +422,12 @@ class scan_cost_context:
             persist(tracker.to_summary())
     """
 
-    def __init__(self, scan_job_id: Optional[str] = None) -> None:
-        self.tracker = ScanCostTracker(scan_job_id)
+    def __init__(
+        self,
+        scan_job_id: Optional[str] = None,
+        cost_cap_usd: Optional[float] = None,
+    ) -> None:
+        self.tracker = ScanCostTracker(scan_job_id, cost_cap_usd=cost_cap_usd)
         self._token: Optional[contextvars.Token] = None
 
     def __enter__(self) -> ScanCostTracker:

@@ -17,11 +17,61 @@ Each runner subclasses :class:`BaseRunner` and implements two methods:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ..manifest import FixtureCase, Manifest
+
+
+# Concurrency-safe fixture-download override.
+#
+# Runners feed on-disk fixture bytes into the production ``ai_service``
+# functions, which fetch images via the module-global ``download_image``.
+# Swapping that global per-case is racy under ``--concurrency > 1`` (one
+# case's ``finally`` restores the original while a sibling case is still
+# mid-flight, so its ``eval://`` URL escapes to the real downloader).
+#
+# Instead we install a single dispatcher ONCE that consults a
+# :class:`contextvars.ContextVar`. Each case runs in its own asyncio task
+# (``gather`` copies the context), so the per-case URL→bytes map is isolated
+# and concurrent cases never clobber one another. When no map is set the
+# dispatcher is a transparent pass-through to the real downloader.
+_eval_url_bytes: contextvars.ContextVar[Optional[Dict[str, bytes]]] = (
+    contextvars.ContextVar("eval_url_bytes", default=None)
+)
+
+
+def _install_download_dispatcher() -> None:
+    from app.services import ai_service
+
+    if getattr(ai_service.download_image, "_eval_wrapped", False):
+        return
+
+    real_download = ai_service.download_image
+
+    async def _dispatch(url: str) -> bytes:
+        mapping = _eval_url_bytes.get()
+        if mapping is not None and url in mapping:
+            return mapping[url]
+        return await real_download(url)
+
+    _dispatch._eval_wrapped = True  # type: ignore[attr-defined]
+    ai_service.download_image = _dispatch  # type: ignore[assignment]
+
+
+@contextlib.contextmanager
+def fixture_downloads(url_to_bytes: Dict[str, bytes]):
+    """Serve the given URL→bytes map to ``ai_service.download_image`` for the
+    duration of the block, isolated to the current asyncio task."""
+    _install_download_dispatcher()
+    token = _eval_url_bytes.set(url_to_bytes)
+    try:
+        yield
+    finally:
+        _eval_url_bytes.reset(token)
 
 
 @dataclass

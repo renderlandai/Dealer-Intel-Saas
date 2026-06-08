@@ -743,6 +743,76 @@ Return JSON with:
 - analysis: explain what visual elements match and what differs"""
 
 
+def get_multi_asset_comparison_prompt(asset_count: int) -> str:
+    """Comparison prompt for the EXPERIMENTAL single-call multi-asset matcher.
+
+    Shows ``asset_count`` approved creatives (IMAGE 1..N) followed by ONE
+    discovered image (IMAGE N+1, the LAST image) and asks the model to pick
+    which creative — if any — is the SAME visual artwork as the discovered
+    image. Keeps the exact SAME-creative-vs-SAME-promotion philosophy and
+    scoring bands as :func:`get_comparison_prompt` so the verdict semantics
+    match the legacy 1:1 path; only the fan-in shape changes.
+    """
+    last = asset_count + 1
+    return f"""You are a CAMPAIGN CREATIVE AUDITOR for a dealer/distributor marketing monitoring platform.
+
+IMAGE 1 through IMAGE {asset_count}: APPROVED campaign creatives — the specific visual assets provided to dealers. They are numbered in order (Image 1 is creative #1, Image {asset_count} is creative #{asset_count}).
+IMAGE {last} (THE LAST IMAGE): An image discovered on a dealer's website or ad platform.
+
+YOUR TASK: Determine whether the discovered image (Image {last}) is the SAME VISUAL CREATIVE as ANY ONE of the approved creatives (Images 1-{asset_count}). If several could match, pick the single BEST match.
+
+CRITICAL DISTINCTION — SAME CREATIVE vs SAME PROMOTION:
+You are checking whether the dealer used one of these SPECIFIC VISUAL ASSETS, not whether they are
+running the same promotion. Two images can advertise the SAME offer (same discount, same promo code,
+same product) but be COMPLETELY DIFFERENT CREATIVES with different layouts, photos, typography, and
+visual design. That is NOT a match.
+
+A MATCH requires the discovered image to be visually derived from one approved creative —
+the same layout, the same imagery/photos, the same design composition. It must be
+recognizably the SAME VISUAL ARTWORK, not merely the same marketing message.
+
+SAME CREATIVE (is a match):
+- Same visual layout and composition
+- Same product photo/render in the same arrangement
+- Same background, graphic elements, and design structure
+- Acceptable differences: resolution, slight cropping, font rendering, aspect ratio,
+  dealer name/logo inserted into template placeholders
+
+NOT THE SAME CREATIVE (NOT a match, even if same promotion):
+- Different layout or composition (e.g. horizontal vs vertical, different arrangement)
+- Different product photo or imagery (even if same product category)
+- Different background, color scheme, or graphic design
+- Dealer-created banner that advertises the same offer but with their own design
+- Same promo code, same discount percentage, but different visual artwork
+
+TEMPLATE CREATIVES — EXPECTED DEALER CUSTOMIZATION:
+An approved asset may be a TEMPLATE with placeholder fields. These substitutions are
+normal and should NOT reduce the score: dealer name/branding/logo dropped into placeholders,
+placeholder phone/address/URL replaced with dealer info, generic CTA customized.
+
+SCORING RUBRIC (for the BEST matching creative only):
+- 90-100: Same creative — identical or near-identical rendering (incl. template customization)
+- 75-89:  Same creative — clearly the same artwork with minor rendering differences
+- 65-74:  Same creative — recognizably the same artwork but with modifications
+- 40-64:  Ambiguous — shares elements but may be different. DO NOT call this a match.
+- 0-39:   Different creative — different visual design, layout, or imagery
+
+AUTOMATIC SCORE 0-20: different brand; same promotion but different visual design; same product
+but different photo/layout; different product or offer entirely.
+
+Compare the discovered image against EVERY approved creative before deciding. Choose the ONE
+creative with the strongest visual-artwork match. If NONE of them is the same creative, return
+best_match_index 0.
+
+Return JSON with:
+- best_match_index: integer 1-{asset_count} for the best-matching creative, or 0 if none match
+- similarity_score: 0-100 for that best match (0 when best_match_index is 0)
+- is_match: true ONLY if similarity_score >= 70
+- match_type: "exact"/"strong"/"partial"/"weak"/"none"
+- modifications: array of detected modifications (exclude expected template customizations)
+- analysis: explain which visual elements match the chosen creative and what differs"""
+
+
 def get_detection_prompt() -> str:
     """Get prompt for detecting a campaign creative within a screenshot or page section."""
     return """You are a CAMPAIGN CREATIVE AUDITOR scanning a webpage for a specific visual asset.
@@ -1157,8 +1227,18 @@ async def compare_images(
             }
         
         prompt = get_comparison_prompt()
-        
-        response_text = await call_anthropic_with_retry(prompt, [source_bytes, target_bytes], model=ENSEMBLE_MODEL)
+
+        # Cache the prompt + asset image (the stable prefix). The same asset is
+        # compared against many different discovered images in a tight per-asset
+        # fan-out, so caching the leading asset block earns the ~90% input
+        # discount on every repeat within the 5-min TTL. Result-preserving:
+        # cache_control only changes billing, never the model's output. (Assets
+        # are optimised up to 1024×1024 ≈ 1.4k tokens, clearing Opus's 1024-tok
+        # minimum cacheable-prefix bar; smaller assets simply don't cache.)
+        response_text = await call_anthropic_with_retry(
+            prompt, [source_bytes, target_bytes],
+            model=ENSEMBLE_MODEL, cache_prefix_images=1,
+        )
         return extract_json_from_response(response_text)
         
     except Exception as e:
@@ -1839,6 +1919,116 @@ async def ensemble_match(
     }
 
 
+async def match_image_against_assets(
+    campaign_assets: List[Dict[str, Any]],
+    discovered_url: str,
+) -> tuple:
+    """EXPERIMENTAL single-call matcher: compare ONE discovered image against
+    ALL campaign assets in a single Opus request.
+
+    The asset images form a cacheable prefix (prompt + every asset), and the
+    discovered image is the lone uncached suffix — so within a scan the asset
+    prefix is written once and read for every subsequent image, instead of
+    re-sending one asset per call uncached. Collapses ``images × assets`` Opus
+    calls into ``images`` calls.
+
+    Returns ``(best_match, best_score)`` where ``best_match`` is
+    ``{"asset": <campaign asset dict>, "comparison": <dict>}`` shaped exactly
+    like the legacy :func:`ensemble_match` consumer expects, or ``(None, 0)``
+    when nothing matched / inputs were unusable (caller treats that as
+    "below_threshold", identical to the legacy no-match path).
+
+    NOTE: gated behind ``settings.enable_multi_asset_matching`` (default OFF).
+    This path does NOT run the per-pair perceptual-hash ensemble/veto, so it
+    must be validated via backend/eval/ before being enabled in production.
+    """
+    try:
+        target_bytes = await download_image(discovered_url)
+        target_bytes = optimize_image_for_api(target_bytes, "default")
+    except Exception as e:
+        log.warning("Multi-asset match: discovered image download/optimize failed: %s", e)
+        return None, 0
+    if target_bytes is None:
+        return None, 0
+
+    # Download + optimise every asset, tracking which campaign_assets entry
+    # each surviving image maps back to (downloads can fail individually).
+    asset_images: List[bytes] = []
+    index_map: List[int] = []
+    for i, asset in enumerate(campaign_assets):
+        url = asset.get("file_url")
+        if not url:
+            continue
+        try:
+            ab = await download_image(url)
+            ab = optimize_image_for_api(ab, "asset")
+        except Exception as e:
+            log.warning("Multi-asset match: asset %s download failed: %s", asset.get("id"), e)
+            ab = None
+        if ab is not None:
+            asset_images.append(ab)
+            index_map.append(i)
+
+    if not asset_images:
+        log.warning("Multi-asset match: no usable asset images — falling back to no-match")
+        return None, 0
+
+    prompt = get_multi_asset_comparison_prompt(len(asset_images))
+    # cache_prefix_images = all asset images → the prompt + every asset becomes
+    # the cached prefix; only the trailing discovered image is billed uncached.
+    try:
+        response_text = await call_anthropic_with_retry(
+            prompt, asset_images + [target_bytes],
+            model=ENSEMBLE_MODEL, cache_prefix_images=len(asset_images),
+        )
+        result = extract_json_from_response(response_text)
+    except Exception as e:
+        log.error("Multi-asset match Opus call failed: %s", e)
+        return None, 0
+
+    raw_index = result.get("best_match_index", 0)
+    try:
+        raw_index = int(raw_index)
+    except (TypeError, ValueError):
+        raw_index = 0
+
+    # 0 (or out of range) means the model found no matching creative.
+    if raw_index < 1 or raw_index > len(asset_images):
+        return None, 0
+
+    matched_asset = campaign_assets[index_map[raw_index - 1]]
+    score = result.get("similarity_score", 0) or 0
+    try:
+        score = int(round(float(score)))
+    except (TypeError, ValueError):
+        score = 0
+    score = max(0, min(100, score))
+
+    # Re-derive match_type from the score so it stays consistent with the
+    # legacy ensemble bands regardless of what the model labelled it.
+    if score >= settings.exact_match_threshold:
+        match_type = "exact"
+    elif score >= settings.strong_match_threshold:
+        match_type = "strong"
+    elif score >= settings.partial_match_threshold:
+        match_type = "partial"
+    elif score >= settings.weak_match_threshold:
+        match_type = "weak"
+    else:
+        match_type = "none"
+
+    comparison = {
+        "similarity_score": score,
+        "is_match": score >= settings.regular_image_match_threshold,
+        "asset_found": False,
+        "match_type": match_type,
+        "method_scores": {"visual": score, "detection": 0, "hash": 0},
+        "modifications": result.get("modifications", []) or [],
+        "analysis": result.get("analysis", "") or "",
+    }
+    return {"asset": matched_asset, "comparison": comparison}, score
+
+
 async def calibrate_confidence(
     raw_score: int,
     source_type: str,
@@ -2134,36 +2324,51 @@ async def process_discovered_image(
     # parallelises its sub-calls (visual + hash) so this is purely a
     # latency win, no extra tokens or different inputs. Same prompts,
     # same model, same scoring — only the await order changes.
-    log.debug("Stage 4: ensemble matching against %d assets (parallel)", len(campaign_assets))
-    comparisons = await asyncio.gather(
-        *[
-            ensemble_match(
-                asset["file_url"],
-                image_url,
-                is_screenshot=is_screenshot,
-            )
-            for asset in campaign_assets
-        ],
-        return_exceptions=True,
+    # EXPERIMENTAL (default OFF): collapse the per-asset Opus fan-out into a
+    # single call that compares the image against ALL assets at once, with the
+    # asset images sent as one cacheable prefix. Only applies to regular images
+    # with >1 asset; screenshots keep the per-asset detection path (its scoring
+    # is tile/detection-specific) and single-asset campaigns gain nothing here.
+    use_multi_asset = (
+        settings.enable_multi_asset_matching
+        and not is_screenshot
+        and len(campaign_assets) > 1
     )
 
-    best_match = None
-    best_score = 0
-    for asset, comparison in zip(campaign_assets, comparisons):
-        if isinstance(comparison, BaseException):
-            log.warning(
-                "Ensemble match raised for asset %s: %s",
-                asset.get("name", asset.get("id")), comparison,
-            )
-            continue
-        score = comparison.get("similarity_score", 0)
-        log.debug(
-            "Asset %s ensemble score: %d",
-            asset.get("name", asset.get("id")), score,
+    if use_multi_asset:
+        log.debug("Stage 4: multi-asset single-call matching against %d assets", len(campaign_assets))
+        best_match, best_score = await match_image_against_assets(campaign_assets, image_url)
+    else:
+        log.debug("Stage 4: ensemble matching against %d assets (parallel)", len(campaign_assets))
+        comparisons = await asyncio.gather(
+            *[
+                ensemble_match(
+                    asset["file_url"],
+                    image_url,
+                    is_screenshot=is_screenshot,
+                )
+                for asset in campaign_assets
+            ],
+            return_exceptions=True,
         )
-        if score > best_score:
-            best_score = score
-            best_match = {"asset": asset, "comparison": comparison}
+
+        best_match = None
+        best_score = 0
+        for asset, comparison in zip(campaign_assets, comparisons):
+            if isinstance(comparison, BaseException):
+                log.warning(
+                    "Ensemble match raised for asset %s: %s",
+                    asset.get("name", asset.get("id")), comparison,
+                )
+                continue
+            score = comparison.get("similarity_score", 0)
+            log.debug(
+                "Asset %s ensemble score: %d",
+                asset.get("name", asset.get("id")), score,
+            )
+            if score > best_score:
+                best_score = score
+                best_match = {"asset": asset, "comparison": comparison}
     
     threshold = adaptive_threshold
     
